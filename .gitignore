@@ -1,0 +1,16 @@
+# Environment & Secrets
+.env
+*.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Databases (optional: include or exclude local SQLite DBs)
+*.db-journal
+
+# Local Zip Backups
+backups/
+

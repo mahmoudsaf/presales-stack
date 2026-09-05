@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from google import genai
@@ -988,15 +988,20 @@ Return STRICT JSON matching this schema:
 
 
 @app.post("/api/process-audio")
-async def process_audio(file: UploadFile = File(...)):
+async def process_audio(
+    file: UploadFile = File(...),
+    client_transcript: Optional[str] = Form(None),
+):
     """
     Receives recorded standup audio, processes it using Gemini multimodal speech recognition,
     faithfully preserving original Arabic/English transcript and customer/deal names.
+    If Gemini multimodal fails (e.g. invalid API key, quota limit, or offline), it seamlessly
+    falls back to the client-side speech recognition transcript.
     """
     audio_bytes = await file.read()
     content_type = file.content_type or "audio/webm"
 
-    if not audio_bytes or len(audio_bytes) < 200:
+    if (not audio_bytes or len(audio_bytes) < 200) and not (client_transcript and client_transcript.strip()):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The recorded audio file is empty or too short. Please speak into your microphone for at least 3 to 5 seconds before clicking analyze.",
@@ -1007,35 +1012,46 @@ async def process_audio(file: UploadFile = File(...)):
     tasks = baseline["tasks"]
 
     client = get_gemini_client()
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="GEMINI_API_KEY is not set. Please configure your API key in the top navigation bar.",
-        )
+    ai_data = None
+    gemini_error_detail = None
 
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
-    instructions = build_analysis_instructions(deals, tasks)
+    if client and audio_bytes and len(audio_bytes) >= 200:
+        try:
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
+            instructions = build_analysis_instructions(deals, tasks)
+            response = generate_with_model_fallback(
+                client=client,
+                contents=[audio_part, instructions],
+            )
+            ai_data = extract_json(response.text)
+        except Exception as e:
+            gemini_error_detail = str(e)
+            print(f"Gemini multimodal audio processing error: {gemini_error_detail}")
 
-    try:
-        response = generate_with_model_fallback(
-            client=client,
-            contents=[audio_part, instructions],
-        )
-        ai_data = extract_json(response.text)
-    except Exception as e:
-        err_msg = str(e)
-        print(f"Multimodal Gemini error: {err_msg}")
-        if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg or "INVALID_ARGUMENT" in err_msg:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Your Google Gemini API key is invalid. Google AI Studio keys typically start with 'AIzaSy...'. Please click 'Configure Gemini Key' in the top header and enter a valid API key from https://aistudio.google.com. (In the meantime, you can also paste your standup text in the box below to process and sync instantly without a key!)",
-            )
-        elif "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Gemini API quota or rate limit reached (429). Please wait a moment or check your Google AI Studio plan. You can also paste your standup transcript in the text box below to process immediately!",
-            )
-        raise HTTPException(status_code=500, detail=f"Gemini processing error: {err_msg}")
+    # Seamless fallback if Gemini failed or was unconfigured
+    if not ai_data:
+        if client_transcript and client_transcript.strip():
+            print(f"Falling back to client speech recognition transcript: {client_transcript.strip()[:60]}...")
+            ai_data = parse_standup_text_offline(client_transcript.strip(), deals, tasks)
+        else:
+            if not client:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="GEMINI_API_KEY is not configured. Please configure your API key in the top navigation bar, or paste your standup text in the box below to process and sync instantly without a key.",
+                )
+            if gemini_error_detail:
+                if "API_KEY_INVALID" in gemini_error_detail or "API key not valid" in gemini_error_detail or "INVALID_ARGUMENT" in gemini_error_detail:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Your Google Gemini API key is invalid. Google AI Studio keys start with 'AIzaSy...'. Please click 'Configure Gemini Key' in the top header and enter a valid API key from https://aistudio.google.com. (In the meantime, you can also paste your standup text in the box below to process and sync instantly without a key!)",
+                    )
+                elif "RESOURCE_EXHAUSTED" in gemini_error_detail or "429" in gemini_error_detail:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Gemini API quota or rate limit reached (429). Please wait a moment or check your Google AI Studio plan. You can also paste your standup transcript in the text box below to process immediately!",
+                    )
+                raise HTTPException(status_code=500, detail=f"Gemini processing error: {gemini_error_detail}")
+            raise HTTPException(status_code=500, detail="Failed to process audio and no client transcript was provided.")
 
     crm_updates = ai_data.get("crm_updates", [])
     task_updates = reconcile_tasks_from_conversation(ai_data, deals)
@@ -1282,21 +1298,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- Direct Text Standup Input -->
-                        <div class="mt-4 pt-3 border-top border-secondary border-opacity-25 text-start">
-                            <div class="d-flex justify-content-between align-items-center mb-1">
-                                <label class="form-label small text-muted mb-0">
-                                    <i class="bi bi-fonts me-1 text-primary"></i>Or paste standup transcript (Arabic or English):
-                                </label>
-                                <span class="badge bg-dark border text-muted" style="font-size: 0.7rem;">النص الحرفي</span>
-                            </div>
-                            <textarea id="standupTextInput" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary" rows="3" placeholder="أدخل ملخص الحديث هنا (عربي أو إنجليزي)... مثلاً: خلصنا الـ PoC لوزارة الخارجية، وبكرة شغالين على متطلبات منصة وزارة الحج والعمرة مع Dell..."></textarea>
-                            <div class="text-end">
-                                <button class="btn btn-sm btn-primary" id="processTextBtn" onclick="processTextStandup()">
-                                    <i class="bi bi-send-fill me-1"></i>Process Transcript & Sync APIs
-                                </button>
-                            </div>
-                        </div>
+
                     </div>
                 </div>
 
@@ -1418,17 +1420,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
-        let mediaRecorder;
+        let mediaRecorder = null;
+        let activeStream = null;
         let recordedChunks = [];
-        let timerInterval;
+        let timerInterval = null;
         let secondsElapsed = 0;
         let recordedBlob = null;
+        let isInitializingMedia = false;
+        let speechRecognizer = null;
+        let liveSpeechTranscript = "";
         const apiKeyModal = new bootstrap.Modal(document.getElementById('apiKeyModal'));
 
         document.addEventListener('DOMContentLoaded', () => {
             checkHealth();
             loadPreMeetingQuestions();
+            setupSpeechRecognition();
         });
+
+        function setupSpeechRecognition() {
+            try {
+                const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRec) {
+                    speechRecognizer = new SpeechRec();
+                    speechRecognizer.continuous = true;
+                    speechRecognizer.interimResults = true;
+                    speechRecognizer.lang = 'ar-SA';
+                    speechRecognizer.onresult = (event) => {
+                        let text = '';
+                        for (let i = 0; i < event.results.length; i++) {
+                            text += event.results[i][0].transcript + ' ';
+                        }
+                        liveSpeechTranscript = text.trim();
+                    };
+                    speechRecognizer.onerror = (e) => {
+                        console.warn("SpeechRecognition notice:", e.error);
+                    };
+                }
+            } catch (e) {
+                console.warn("Speech recognition setup error:", e);
+            }
+        }
 
         async function checkHealth() {
             try {
@@ -1492,50 +1523,143 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const timer = document.getElementById('recordingTimer');
             const prompt = document.getElementById('recordingPrompt');
 
-            if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+            // 1. If currently recording, STOP recording
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                prompt.textContent = "Stopping recording...";
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    recordedChunks = [];
-                    mediaRecorder = new MediaRecorder(stream);
-
-                    mediaRecorder.ondataavailable = e => {
-                        if (e.data.size > 0) recordedChunks.push(e.data);
-                    };
-
-                    mediaRecorder.onstop = () => {
-                        recordedBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-                        const audioUrl = URL.createObjectURL(recordedBlob);
-                        document.getElementById('audioPlayer').src = audioUrl;
-                        document.getElementById('audioPlaybackContainer').classList.remove('d-none');
-                        prompt.textContent = "Recording complete. Review playback or click analyze.";
-                    };
-
-                    mediaRecorder.start();
-                    recordBtn.className = 'mic-button mic-recording';
-                    micIcon.className = 'bi bi-stop-fill';
-                    prompt.textContent = "Recording standup meeting... Speak in Arabic / English.";
-                    
-                    secondsElapsed = 0;
-                    timerInterval = setInterval(() => {
-                        secondsElapsed++;
-                        const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
-                        const secs = String(secondsElapsed % 60).padStart(2, '0');
-                        timer.textContent = `${mins}:${secs}`;
-                    }, 1000);
-                } catch (err) {
-                    alert('Microphone access denied or not available: ' + err.message);
+                    mediaRecorder.stop();
+                } catch (e) {
+                    console.warn("Error stopping MediaRecorder:", e);
                 }
-            } else {
-                mediaRecorder.stop();
-                clearInterval(timerInterval);
+                if (speechRecognizer) {
+                    try { speechRecognizer.stop(); } catch (e) {}
+                }
+                if (activeStream) {
+                    try {
+                        activeStream.getTracks().forEach(t => t.stop());
+                    } catch (e) {}
+                    activeStream = null;
+                }
+                if (timerInterval) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
                 recordBtn.className = 'mic-button mic-idle';
                 micIcon.className = 'bi bi-mic-fill';
+                return;
+            }
+
+            // 2. Prevent race conditions from rapid multiple clicks
+            if (isInitializingMedia) return;
+            isInitializingMedia = true;
+
+            // 3. Verify mediaDevices support in browser context
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                isInitializingMedia = false;
+                prompt.textContent = "Microphone requires HTTPS or localhost. Please use file upload below.";
+                alert("Microphone recording is not available in this browser context (requires HTTPS or localhost). Please use the audio file upload option below.");
+                return;
+            }
+
+            try {
+                prompt.textContent = "Accessing microphone...";
+
+                // Clean up any stale streams
+                if (activeStream) {
+                    try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                    activeStream = null;
+                }
+
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                activeStream = stream;
+                recordedChunks = [];
+                liveSpeechTranscript = "";
+
+                let options = {};
+                if (typeof MediaRecorder.isTypeSupported === 'function') {
+                    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                        options = { mimeType: 'audio/webm;codecs=opus' };
+                    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                        options = { mimeType: 'audio/webm' };
+                    } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+                        options = { mimeType: 'audio/mp4' };
+                    }
+                }
+
+                mediaRecorder = new MediaRecorder(stream, options);
+
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data && e.data.size > 0) {
+                        recordedChunks.push(e.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const mimeType = mediaRecorder.mimeType || 'audio/webm';
+                    recordedBlob = new Blob(recordedChunks, { type: mimeType });
+                    const audioUrl = URL.createObjectURL(recordedBlob);
+                    document.getElementById('audioPlayer').src = audioUrl;
+                    document.getElementById('audioPlaybackContainer').classList.remove('d-none');
+                    prompt.textContent = "Recording complete. Review playback or click Analyze Speech & Sync APIs.";
+                    
+                    if (activeStream) {
+                        try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                        activeStream = null;
+                    }
+                };
+
+                // Start speech recognition in background if supported
+                if (speechRecognizer) {
+                    try {
+                        speechRecognizer.start();
+                    } catch (e) {
+                        console.warn("Could not start speechRecognizer:", e);
+                    }
+                }
+
+                mediaRecorder.start(250);
+                recordBtn.className = 'mic-button mic-recording';
+                micIcon.className = 'bi bi-stop-fill';
+                prompt.textContent = "Recording standup meeting... Speak in Arabic / English. Click to stop.";
+
+                secondsElapsed = 0;
+                timer.textContent = "00:00";
+                if (timerInterval) clearInterval(timerInterval);
+                timerInterval = setInterval(() => {
+                    secondsElapsed++;
+                    const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
+                    const secs = String(secondsElapsed % 60).padStart(2, '0');
+                    timer.textContent = `${mins}:${secs}`;
+                }, 1000);
+
+            } catch (err) {
+                console.error("Microphone access error:", err);
+                if (activeStream) {
+                    try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                    activeStream = null;
+                }
+                if (timerInterval) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
+                recordBtn.className = 'mic-button mic-idle';
+                micIcon.className = 'bi bi-mic-fill';
+                prompt.textContent = "Microphone error: " + err.message;
+                alert("Microphone Error: " + err.message + "\\n\\nPlease allow microphone permission in your browser or use the audio file upload option below.");
+            } finally {
+                isInitializingMedia = false;
             }
         }
 
         async function processRecordedAudio() {
             if (!recordedBlob) {
-                alert('No audio recorded.');
+                alert('No audio recorded. Please record audio or upload a file first.');
                 return;
             }
             uploadAndAnalyze(recordedBlob, 'standup_recording.webm');
@@ -1553,10 +1677,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         async function uploadAndAnalyze(blobOrFile, filename) {
             const btn = document.getElementById('processAudioBtn');
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Gemini 3.6 Flash Processing Speech & Syncing APIs...';
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing Speech & Syncing APIs...';
 
             const formData = new FormData();
             formData.append('file', blobOrFile, filename);
+            if (liveSpeechTranscript) {
+                formData.append('client_transcript', liveSpeechTranscript);
+            }
 
             try {
                 const res = await fetch('/api/process-audio', {
@@ -1575,8 +1702,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         if (txt) errMsg = txt;
                     }
                     alert('Audio Processing Notice:\n\n' + errMsg);
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
                     return;
                 }
 
@@ -1592,49 +1717,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
-            }
-        }
-
-        async function processTextStandup() {
-            const input = document.getElementById('standupTextInput');
-            const text = input.value.trim();
-            if (!text) {
-                alert('Please enter or paste standup text first.');
-                return;
-            }
-
-            const btn = document.getElementById('processTextBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing Speech & Syncing APIs...';
-
-            try {
-                const res = await fetch('/api/process-text', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: text })
-                });
-
-                if (!res.ok) {
-                    let errMsg = `Server returned status ${res.status}`;
-                    try {
-                        const errJson = await res.json();
-                        if (errJson && errJson.detail) errMsg = errJson.detail;
-                    } catch (e) {
-                        const txt = await res.text();
-                        if (txt) errMsg = txt;
-                    }
-                    alert('Text Processing Notice:\n\n' + errMsg);
-                    return;
-                }
-
-                const data = await res.json();
-                renderResults(data);
-            } catch (err) {
-                console.error("Text processing fetch error:", err);
-                alert('Text Processing Notice:\n\n' + (err.message || 'Unable to connect to server.'));
-            } finally {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-send-fill me-1"></i>Process Transcript & Sync APIs';
             }
         }
 

@@ -1,13 +1,24 @@
 import json
 import os
 import re
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+# Ensure standard output/error supports Arabic and UTF-8 characters on Windows
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from google import genai
@@ -297,10 +308,166 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+# -----------------------------------------------------------------------------
+# Bilingual Customer & Deal Aliases (Preserves Spoken / Original Language)
+# -----------------------------------------------------------------------------
+CUSTOMER_DEAL_ALIASES = [
+    {
+        "customer_ar": "وزارة الحج والعمرة",
+        "customer_en": "Ministry of Hajj",
+        "deal_ar": "مناقصة تطوير المنصة",
+        "deal_en": "Platform Development Tender",
+        "deal_id": 7,
+        "vendor": "Dell",
+        "category": "RFP_OWNERSHIP",
+        "keywords_ar": ["حج", "الحج", "وزارة الحج", "تطوير المنصة"],
+        "keywords_en": ["hajj", "ministry of hajj", "platform development"],
+    },
+    {
+        "customer_ar": "وزارة الخارجية",
+        "customer_en": "Ministry of Foreign Affairs",
+        "deal_ar": "مناقصة البنية التحتية نوتانكس",
+        "deal_en": "Nutanix HCI Infrastructure Tender",
+        "deal_id": 5,
+        "vendor": "Nutanix",
+        "category": "RFP_OWNERSHIP",
+        "keywords_ar": ["خارجية", "الخارجية", "وزارة الخارجية"],
+        "keywords_en": ["foreign affairs", "mofa", "ministry of foreign affairs"],
+    },
+    {
+        "customer_ar": "وزارة التخطيط",
+        "customer_en": "Ministry of Planning",
+        "deal_ar": "مناقصة تجديد الدعم الفني",
+        "deal_en": "Technical Support Renewal Tender",
+        "deal_id": 6,
+        "vendor": "HPE",
+        "category": "RFP_DISTRIBUTED_SCOPE",
+        "keywords_ar": ["تخطيط", "التخطيط", "وزارة التخطيط"],
+        "keywords_en": ["planning", "ministry of planning"],
+    },
+    {
+        "customer_ar": "أمانة جدة",
+        "customer_en": "Jeddah Municipality",
+        "deal_ar": "تحديث أجهزة ديل",
+        "deal_en": "Dell Hardware Tech Refresh",
+        "deal_id": 8,
+        "vendor": "Dell",
+        "category": "RFP_DISTRIBUTED_SCOPE",
+        "keywords_ar": ["جدة", "أمانة جدة", "امانة جدة", "الأمانة", "امانة"],
+        "keywords_en": ["jeddah", "jeddah municipality", "municipality"],
+    },
+    {
+        "customer_ar": "الجامعة السعودية الإلكترونية",
+        "customer_en": "Saudi Electronic University",
+        "deal_ar": "مناقصة البنية التحتية لمركز الاتصال أزور",
+        "deal_en": "Azure Call Center Infrastructure Tender",
+        "deal_id": 9,
+        "vendor": "General",
+        "category": "RFP_OWNERSHIP",
+        "keywords_ar": ["إلكترونية", "الكترونية", "الجامعة الإلكترونية", "الجامعة الالكترونية", "السعودية الإلكترونية"],
+        "keywords_en": ["electronic university", "seu", "saudi electronic university"],
+    },
+    {
+        "customer_ar": "المراعي",
+        "customer_en": "Almarai",
+        "deal_ar": "مناقصة توريد لابتوبات المراعي",
+        "deal_en": "Almarai Laptop Supply RFP",
+        "deal_id": 10,
+        "vendor": "Dell",
+        "category": "RFP_DISTRIBUTED_SCOPE",
+        "keywords_ar": ["مراعي", "المراعي", "شركة المراعي"],
+        "keywords_en": ["almarai", "al marai"],
+    },
+    {
+        "customer_ar": "Acme Cloud Corp",
+        "customer_en": "Acme Cloud Corp",
+        "deal_ar": "Hyperconverged Datacenter Refresh",
+        "deal_en": "Hyperconverged Datacenter Refresh",
+        "deal_id": 1,
+        "vendor": "HPE",
+        "category": "RFP_OWNERSHIP",
+        "keywords_ar": ["أكمي", "اكامي", "اكيمي"],
+        "keywords_en": ["acme", "acme cloud"],
+    },
+    {
+        "customer_ar": "FinTech Horizons",
+        "customer_en": "FinTech Horizons",
+        "deal_ar": "Ransomware Backup Immutability",
+        "deal_en": "Ransomware Backup Immutability",
+        "deal_id": 2,
+        "vendor": "Veeam",
+        "category": "RFP_DISTRIBUTED_SCOPE",
+        "keywords_ar": ["فينتك", "فين تك"],
+        "keywords_en": ["fintech", "fintech horizons"],
+    },
+    {
+        "customer_ar": "Nordic Health Systems",
+        "customer_en": "Nordic Health Systems",
+        "deal_ar": "Edge Compute Cluster Expansion",
+        "deal_en": "Edge Compute Cluster Expansion",
+        "deal_id": 3,
+        "vendor": "Dell",
+        "category": "RFP_OWNERSHIP",
+        "keywords_ar": ["نورديك", "مستشفى", "مستشفيات"],
+        "keywords_en": ["nordic", "nordic health", "hospital"],
+    },
+    {
+        "customer_ar": "Apex Logistics",
+        "customer_en": "Apex Logistics",
+        "deal_ar": "Enterprise Core Virtualization",
+        "deal_en": "Enterprise Core Virtualization",
+        "deal_id": 4,
+        "vendor": "VMware",
+        "category": "GENERAL_ACTION",
+        "keywords_ar": ["أيبكس", "ايبكس", "لوجستكس"],
+        "keywords_en": ["apex", "apex logistics"],
+    },
+]
+
+
+def extract_entities_from_text(text: str) -> Dict[str, Any]:
+    """
+    Extracts customer_name, deal_name, and related_deal_id from text,
+    faithfully preserving the original language (Arabic or English) as spoken/typed.
+    """
+    if not text:
+        return {"customer_name": None, "deal_name": None, "related_deal_id": None}
+
+    is_arabic = bool(re.search(r"[\u0600-\u06FF]", text))
+    t_low = text.lower()
+
+    # 1. Search aliases
+    for alias in CUSTOMER_DEAL_ALIASES:
+        for kw in alias["keywords_ar"]:
+            if kw in text:
+                return {
+                    "customer_name": alias["customer_ar"] if is_arabic else alias["customer_en"],
+                    "deal_name": alias["deal_ar"] if is_arabic else alias["deal_en"],
+                    "related_deal_id": alias["deal_id"],
+                }
+        for kw in alias["keywords_en"]:
+            if kw in t_low:
+                return {
+                    "customer_name": alias["customer_ar"] if is_arabic else alias["customer_en"],
+                    "deal_name": alias["deal_ar"] if is_arabic else alias["deal_en"],
+                    "related_deal_id": alias["deal_id"],
+                }
+
+    # 2. General Regex detection for Arabic ministry / customer patterns
+    if is_arabic:
+        m_gov = re.search(r"((?:وزارة|أمانة|امانة|هيئة|جامعة|شركة)\s+[\u0600-\u06FF]+(?:\s+[\u0600-\u06FF]+)?)", text)
+        if m_gov:
+            cust = m_gov.group(1).strip()
+            return {"customer_name": cust, "deal_name": None, "related_deal_id": None}
+
+    return {"customer_name": None, "deal_name": None, "related_deal_id": None}
+
+
 def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Ensures that EVERY actionable deliverable, tender, or next step mentioned in the conversation
-    is captured as a task in task_updates, eliminating gaps between executive report and task board.
+    is captured as a task in task_updates, faithfully preserving original Arabic or English
+    customer names and opportunity names.
     """
     task_updates = list(ai_data.get("task_updates", []))
     existing_titles = [str(item.get("payload", {}).get("task_title", "")).lower() for item in task_updates]
@@ -310,103 +477,52 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     actions = exec_report.get("tomorrow_actions", [])
     progress = exec_report.get("today_progress", [])
 
-    # Map deals by customer or name keywords for smart linking
-    deal_keyword_map = {}
-    deal_details_map = {}
-    for d in baseline_deals:
-        d_id = d.get("deal_id")
-        name = str(d.get("deal_name", "")).lower()
-        cust = str(d.get("company_name", "")).lower()
-        if d_id:
-            deal_keyword_map[name] = d_id
-            deal_keyword_map[cust] = d_id
-            deal_details_map[d_id] = {
-                "deal_name": d.get("deal_name"),
-                "customer_name": d.get("company_name"),
-            }
-
-    # Also check newly planned crm_updates
-    crm_updates = ai_data.get("crm_updates", [])
-    for cu in crm_updates:
-        d_id = cu.get("deal_id")
-        p = cu.get("payload", {})
-        d_name = str(p.get("deal_name", "")).lower()
-        d_cust = str(p.get("company_name", "")).lower()
-        if d_id:
-            if d_name:
-                deal_keyword_map[d_name] = d_id
-            if d_cust:
-                deal_keyword_map[d_cust] = d_id
-            if d_id not in deal_details_map:
-                deal_details_map[d_id] = {
-                    "deal_name": p.get("deal_name"),
-                    "customer_name": p.get("company_name"),
-                }
-
-    def find_related_deal(text: str) -> Optional[int]:
-        t_low = text.lower()
-        for k, d_id in deal_keyword_map.items():
-            if k and len(k) > 3 and k in t_low:
-                return d_id
-        return None
-
-    def detect_customer_name(text: str) -> Optional[str]:
-        t_low = text.lower()
-        if "almarai" in t_low:
-            return "Almarai"
-        if "hajj" in t_low:
-            return "Ministry of Hajj"
-        if "foreign affairs" in t_low:
-            return "Ministry of Foreign Affairs"
-        if "planning" in t_low:
-            return "Ministry of Planning"
-        if "human resources" in t_low or "mhr" in t_low:
-            return "Ministry of Human Resources"
-        if "jeddah" in t_low:
-            return "Jeddah Municipality"
-        if "electronic university" in t_low or "seu" in t_low:
-            return "Saudi Electronic University"
-        if "solarwinds" in t_low:
-            return "SolarWinds Request"
-        if "fintech" in t_low:
-            return "FinTech Horizons"
-        if "nordic" in t_low:
-            return "Nordic Health Systems"
-        if "apex" in t_low:
-            return "Apex Logistics"
-        if "acme" in t_low:
-            return "Acme Cloud Corp"
-        return None
-
     def detect_vendor(text: str) -> str:
         t_low = text.lower()
-        if "hp" in t_low or "hewlett" in t_low:
+        if "hp" in t_low or "hewlett" in t_low or "اتش بي" in t_low:
             return "HPE"
-        if "dell" in t_low or "poweredge" in t_low:
+        if "dell" in t_low or "poweredge" in t_low or "ديل" in t_low:
             return "Dell"
-        if "veeam" in t_low:
+        if "veeam" in t_low or "فيم" in t_low:
             return "Veeam"
-        if "nutanix" in t_low or "ahv" in t_low:
+        if "nutanix" in t_low or "ahv" in t_low or "نوتانكس" in t_low or "نيوتانكس" in t_low:
             return "Nutanix"
-        if "vmware" in t_low or "vcf" in t_low:
+        if "vmware" in t_low or "vcf" in t_low or "vsphere" in t_low or "في ام وير" in t_low or "فيموير" in t_low:
             return "VMware"
         return "General"
 
     def detect_assigned(text: str) -> str:
         t_low = text.lower()
-        if "presales 2" in t_low or "rep 2" in t_low:
+        if "presales 2" in t_low or "rep 2" in t_low or "مهندس 2" in t_low or "2" in t_low:
             return "Presales 2"
         return "Presales 1"
 
     def detect_category(text: str) -> str:
         t_low = text.lower()
-        if "owner" in t_low or "platform" in t_low or "prime" in t_low:
+        if "owner" in t_low or "platform" in t_low or "prime" in t_low or "رئيسي" in t_low or "منصة" in t_low or "مناقصة" in t_low:
             return "RFP_OWNERSHIP"
-        if "scope" in t_low or "renewal" in t_low or "distributed" in t_low:
+        if "scope" in t_low or "renewal" in t_low or "distributed" in t_low or "نطاق" in t_low or "تجديد" in t_low or "توريد" in t_low:
             return "RFP_DISTRIBUTED_SCOPE"
         return "GENERAL_ACTION"
 
-    # 1. Reconcile tomorrow's actions
+    # 1. Enrich existing tasks from AI data without overwriting original names
+    for item in task_updates:
+        p = item.setdefault("payload", {})
+        title = p.get("task_title") or p.get("title") or ""
+        
+        # If customer_name or deal_name is missing, extract while preserving original language
+        entities = extract_entities_from_text(f"{title} {p.get('customer_name', '')} {p.get('deal_name', '')}")
+        
+        if not p.get("customer_name") and entities["customer_name"]:
+            p["customer_name"] = entities["customer_name"]
+            
+        if not p.get("deal_name") and entities["deal_name"]:
+            p["deal_name"] = entities["deal_name"]
+            
+        if not p.get("related_deal_id") and entities["related_deal_id"]:
+            p["related_deal_id"] = entities["related_deal_id"]
+
+    # 2. Reconcile tomorrow's actions
     for action in actions:
         action_text = str(action).strip()
         if not action_text:
@@ -415,10 +531,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if any(len(act_low) > 8 and (act_low[:20] in et or et in act_low) for et in existing_titles):
             continue
 
-        d_id = find_related_deal(action_text)
-        d_info = deal_details_map.get(d_id, {}) if d_id else {}
-        c_name = d_info.get("customer_name") or detect_customer_name(action_text)
-        d_name = d_info.get("deal_name")
+        entities = extract_entities_from_text(action_text)
 
         task_updates.append({
             "method": "POST",
@@ -428,25 +541,22 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "assigned_to": detect_assigned(action_text),
                 "vendor_domain": detect_vendor(action_text),
                 "status": "In Progress",
-                "priority": "High" if ("tender" in act_low or "rfp" in act_low) else "Medium",
-                "related_deal_id": d_id,
-                "customer_name": c_name,
-                "deal_name": d_name,
+                "priority": "High" if ("tender" in act_low or "rfp" in act_low or "مناقصة" in action_text) else "Medium",
+                "related_deal_id": entities["related_deal_id"],
+                "customer_name": entities["customer_name"],
+                "deal_name": entities["deal_name"],
                 "changed_by": "Voice Agent",
             }
         })
         existing_titles.append(act_low)
 
-    # 2. Reconcile any onboarding / scope mentioned in today_progress
+    # 3. Reconcile any onboarding / scope mentioned in today_progress
     for prog in progress:
         prog_text = str(prog).strip()
         prog_low = prog_text.lower()
-        if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low:
+        if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low or "مناقصة" in prog_text or "نطاق" in prog_text or "توريد" in prog_text:
             if not any(len(prog_low) > 8 and (prog_low[:20] in et or et in prog_low) for et in existing_titles):
-                d_id = find_related_deal(prog_text)
-                d_info = deal_details_map.get(d_id, {}) if d_id else {}
-                c_name = d_info.get("customer_name") or detect_customer_name(prog_text)
-                d_name = d_info.get("deal_name")
+                entities = extract_entities_from_text(prog_text)
 
                 task_updates.append({
                     "method": "POST",
@@ -457,9 +567,9 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                         "vendor_domain": detect_vendor(prog_text),
                         "status": "In Progress",
                         "priority": "High",
-                        "related_deal_id": d_id,
-                        "customer_name": c_name,
-                        "deal_name": d_name,
+                        "related_deal_id": entities["related_deal_id"],
+                        "customer_name": entities["customer_name"],
+                        "deal_name": entities["deal_name"],
                         "changed_by": "Voice Agent",
                     }
                 })
@@ -708,33 +818,100 @@ Return STRICT JSON format:
         }
 
 
-@app.post("/api/process-audio")
-async def process_audio(file: UploadFile = File(...)):
+def parse_standup_text_offline(text: str, deals: List[Dict[str, Any]], tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Receives recorded standup audio, processes it using Gemini 2.5 Flash's native speech recognition,
-    detects state deltas vs CRM & Tasks, outputs a structured executive report, and executes live API syncs.
+    Intelligent offline fallback parser that processes Arabic & English standup text
+    preserving original customer & deal names even when Gemini API quota is exhausted.
     """
-    audio_bytes = await file.read()
-    content_type = file.content_type or "audio/webm"
+    is_arabic = bool(re.search(r"[\u0600-\u06FF]", text))
+    
+    crm_updates = []
+    task_updates = []
+    today_progress = []
+    tomorrow_actions = []
+    warnings = []
+    
+    clauses = [c.strip() for c in re.split(r"[\n\.\؛\,،\*\-]|(?<=[a-zA-Z0-9\u0600-\u06FF])\s+(?=وبكرة|غداً|غدا|اليوم|بكرة|Tomorrow|Today|Next)", text) if c.strip()]
+    
+    for clause in clauses:
+        c_low = clause.lower()
+        entities = extract_entities_from_text(clause)
+        c_name = entities["customer_name"]
+        d_name = entities["deal_name"]
+        d_id = entities["related_deal_id"]
+        
+        is_future = any(w in c_low or w in clause for w in ["بكرة", "غدا", "غداً", "شغال على", "نعمل", "سأعمل", "tomorrow", "next", "will", "plan"])
+        is_done = any(w in c_low or w in clause for w in ["خلصنا", "انتهينا", "اعتمدنا", "تم", "finished", "completed", "done", "closed", "won"])
+        is_warning = any(w in c_low or w in clause for w in ["بلوكر", "معلق", "متأخر", "بانتظار", "مشكلة", "تأخير", "blocker", "waiting", "delayed", "issue"])
+        
+        vendor = "General"
+        if any(w in c_low or w in clause for w in ["hp", "hewlett", "اتش بي"]):
+            vendor = "HPE"
+        elif any(w in c_low or w in clause for w in ["dell", "ديل"]):
+            vendor = "Dell"
+        elif any(w in c_low or w in clause for w in ["veeam", "فيم"]):
+            vendor = "Veeam"
+        elif any(w in c_low or w in clause for w in ["nutanix", "نوتانكس"]):
+            vendor = "Nutanix"
+        elif any(w in c_low or w in clause for w in ["vmware", "في ام وير", "فيموير"]):
+            vendor = "VMware"
+            
+        assigned = "Presales 2" if any(w in c_low for w in ["2", "presales 2", "مهندس 2"]) else "Presales 1"
+        category = "RFP_OWNERSHIP" if any(w in c_low or w in clause for w in ["مناقصة", "منصة", "rfp", "tender", "owner", "platform"]) else ("RFP_DISTRIBUTED_SCOPE" if any(w in c_low or w in clause for w in ["نطاق", "تجديد", "توريد", "scope", "renewal"]) else "GENERAL_ACTION")
 
-    # 1. Fetch current baseline
-    baseline = await fetch_baseline_state()
-    deals = baseline["deals"]
-    tasks = baseline["tasks"]
+        if is_warning:
+            warnings.append(clause)
+        elif is_future or (c_name and not is_done):
+            tomorrow_actions.append(clause)
+            task_updates.append({
+                "method": "POST",
+                "payload": {
+                    "task_title": clause,
+                    "customer_name": c_name,
+                    "deal_name": d_name,
+                    "related_deal_id": d_id,
+                    "category": category,
+                    "assigned_to": assigned,
+                    "vendor_domain": vendor,
+                    "status": "In Progress",
+                    "priority": "High" if category == "RFP_OWNERSHIP" else "Medium",
+                    "changed_by": "Voice Agent",
+                }
+            })
+        elif is_done:
+            today_progress.append(clause)
+            if d_id and any(w in c_low or w in clause for w in ["poc", "proposal", "عقد", "closed-won", "won"]):
+                stage = "Closed-Won" if ("won" in c_low or "فزنا" in clause or "عقد" in clause) else "Proposal"
+                crm_updates.append({
+                    "method": "PUT",
+                    "deal_id": d_id,
+                    "payload": {
+                        "stage": stage,
+                        "vendor_notes": f"Standup update: {clause}",
+                    }
+                })
 
-    client = get_gemini_client()
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="GEMINI_API_KEY is not set. Please provide your API key in the top navigation bar to process audio with Gemini.",
-        )
+    summary = f"Standup update processed. Identified {len(task_updates)} action items, {len(today_progress)} completed items, and {len(warnings)} warnings."
+    if is_arabic:
+        summary = f"تمت معالجة تحديث الـ Standup بنجاح. تم استخراج {len(task_updates)} مهام تنفيذية، و {len(today_progress)} إنجازات محققة، و {len(warnings)} تنبيهات."
 
-    # 2. Build Multimodal Content
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
+    return {
+        "raw_transcript": text,
+        "transcript_summary": summary,
+        "crm_updates": crm_updates,
+        "task_updates": task_updates,
+        "executive_report": {
+            "today_progress": today_progress or [text[:120]],
+            "tomorrow_actions": tomorrow_actions or [],
+            "management_warnings": warnings or [],
+        }
+    }
 
-    instructions = f"""
+
+def build_analysis_instructions(deals: List[Dict[str, Any]], tasks: List[Dict[str, Any]]) -> str:
+    return f"""
 You are an expert bilingual (Saudi Arabic & English) Enterprise Presales Operations AI.
-You are listening to an audio recording of a presales team standup meeting. The engineers speak a natural blend of Saudi Arabic and English IT terminology.
+You are listening to or reading a presales team standup meeting. The engineers speak a natural blend of Saudi Arabic and English IT terminology.
 
 BASELINE CRM DEALS:
 {json.dumps(deals, indent=2)}
@@ -743,38 +920,47 @@ BASELINE TASK BOARD:
 {json.dumps(tasks, indent=2)}
 
 Your responsibilities:
-1. Listen carefully and transcribe/understand all spoken updates from Presales 1 and Presales 2.
-2. Compare spoken updates against the baseline CRM deals and Task Board items above to detect DELTAS:
-   - Deal stage changes (e.g. PoC -> Proposal, Discovery -> Gathering Requirements, Proposal -> Closed-Won).
+1. Provide the complete verbatim transcript of everything said in the meeting (`raw_transcript`).
+   CRITICAL REQUIREMENT: KEEP THE TRANSCRIPT AS IT IS IN ITS ORIGINAL LANGUAGE:
+   - If spoken/written in Arabic, keep it in Arabic.
+   - If spoken/written in English, keep it in English.
+   - If spoken in a bilingual mix (e.g. "خلصنا PoC لوزارة الخارجية مع Nutanix"), keep the exact spoken blend verbatim.
+   - NEVER translate the transcript into another language in `raw_transcript`!
+
+2. Compare updates against the baseline CRM deals and Task Board to detect DELTAS:
+   - Deal stage changes (e.g. PoC -> Proposal, Gathering Requirements, Closed-Won).
    - Estimated deal value revisions.
-   - Task status transitions (e.g. In Progress -> Completed, Waiting on Vendor -> In Progress, Not Started -> In Progress).
+   - Task status transitions (In Progress, Completed, Waiting on Vendor).
    - Resolved or newly raised management blockers.
    - Any newly mentioned deals or tasks to create.
-3. Formulate structured REST API updates:
-   - `crm_updates`: Array of deal updates. Use "PUT" with "deal_id" and "payload" for existing deals; or "POST" with "payload" for newly won or qualified deals.
-     IMPORTANT ENUM CONSTRAINTS FOR CRM DEALS:
-     * stage MUST be one of: ["Discovery", "Gathering Requirements", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage; if activities are ongoing/in progress, use "Gathering Requirements").
-     * assigned_presales MUST be: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
-     * estimated_value must be a numeric float (e.g. 125000.0).
-    - `task_updates`: Array of task updates.
-      CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
-      IMPORTANT CONSTRAINTS FOR TASKS:
-      * task_title: Actionable, descriptive title (e.g. "Gather technical requirements for Ministry of Hajj platform").
-      * status MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-      * assigned_to MUST be: "Presales 1" or "Presales 2".
-      * category MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
-      * vendor_domain MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE".
-      * priority MUST be one of: ["High", "Medium", "Low"].
-      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
-      * changed_by: "Voice Agent" (or the speaking engineer).
-4. Produce an Executive Briefing Report containing:
-   - `today_progress`: Array of key accomplishments confirmed in the call.
-   - `tomorrow_actions`: Array of prioritized next steps.
+
+3. EXTRACT AND PARSE DATA FAITHFULLY AS IT IS:
+   - Extract and preserve the ORIGINAL customer name (`customer_name`) exactly as spoken/stated (e.g. if the speaker said "وزارة الحج والعمرة" or "أمانة جدة" or "المراعي", keep the exact customer name in Arabic; if they said "Jeddah Municipality" or "Acme Cloud Corp", keep it in English. DO NOT translate customer names!).
+   - Extract and preserve the ORIGINAL opportunity / tender name (`deal_name`) exactly as spoken/stated (e.g. "مناقصة تطوير المنصة" or "Platform Development Tender").
+   - In `task_title`, maintain the exact opportunity and customer references in the original language as spoken.
+
+4. Formulate structured REST API updates:
+   - `crm_updates`: Array of deal updates. Use "PUT" with "deal_id" and "payload" for existing deals; or "POST" with "payload" for new deals.
+     Stage MUST be: ["Discovery", "Gathering Requirements", "PoC", "Proposal", "Closed-Won", "Closed-Lost"].
+     Assigned MUST be: "Presales 1" or "Presales 2".
+   - `task_updates`: Array of task updates.
+     CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned, create a task using method "POST"!
+     Include `customer_name` and `deal_name` directly in `payload`.
+     Category: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
+     Vendor Domain: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"].
+     Status: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
+     Priority: ["High", "Medium", "Low"].
+     related_deal_id: Integer deal ID if associated with a CRM deal, else null.
+
+5. Produce an Executive Briefing Report:
+   - `today_progress`: Array of key accomplishments confirmed in the call (preserving original names).
+   - `tomorrow_actions`: Array of prioritized next steps (preserving original names).
    - `management_warnings`: Array of critical risks, vendor roadblocks, or management escalations.
 
 Return STRICT JSON matching this schema:
 {{
-  "transcript_summary": "Concise summary of the meeting highlights in English with Arabic context where appropriate.",
+  "raw_transcript": "The verbatim transcript of the entire meeting, exactly as spoken in Arabic and/or English without translation.",
+  "transcript_summary": "Concise summary of the meeting highlights preserving original customer and opportunity names.",
   "crm_updates": [
     {{
       "method": "PUT",
@@ -790,13 +976,15 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "Actionable task name",
+        "task_title": "Actionable task name in original language",
+        "customer_name": "Original customer name (e.g. 'وزارة الحج والعمرة' or 'Jeddah Municipality')",
+        "deal_name": "Original opportunity name (e.g. 'مناقصة تطوير المنصة')",
         "category": "RFP_OWNERSHIP",
         "assigned_to": "Presales 2",
         "vendor_domain": "Dell",
         "status": "In Progress",
         "priority": "High",
-        "related_deal_id": null,
+        "related_deal_id": 7,
         "changed_by": "Voice Agent"
       }}
     }}
@@ -809,24 +997,139 @@ Return STRICT JSON matching this schema:
 }}
 """
 
-    try:
-        response = generate_with_model_fallback(
-            client=client,
-            contents=[audio_part, instructions],
-        )
-        ai_data = extract_json(response.text)
-    except Exception as e:
-        print(f"Multimodal Gemini error: {e}")
-        raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
 
-    # 3. Automatically synchronize detected updates to local APIs with comprehensive reconciliation
+@app.post("/api/process-audio")
+async def process_audio(
+    file: UploadFile = File(...),
+    client_transcript: Optional[str] = Form(None),
+):
+    """
+    Receives recorded standup audio, processes it using Gemini multimodal speech recognition,
+    faithfully preserving original Arabic/English transcript and customer/deal names.
+    If Gemini multimodal fails (e.g. invalid API key, quota limit, or offline), it seamlessly
+    falls back to the client-side speech recognition transcript.
+    """
+    audio_bytes = await file.read()
+    content_type = file.content_type or "audio/webm"
+
+    if (not audio_bytes or len(audio_bytes) < 200) and not (client_transcript and client_transcript.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The recorded audio file is empty or too short. Please speak into your microphone for at least 3 to 5 seconds before clicking analyze.",
+        )
+
+    baseline = await fetch_baseline_state()
+    deals = baseline["deals"]
+    tasks = baseline["tasks"]
+
+    client = get_gemini_client()
+    ai_data = None
+    gemini_error_detail = None
+
+    if client and audio_bytes and len(audio_bytes) >= 200:
+        try:
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
+            instructions = build_analysis_instructions(deals, tasks)
+            response = generate_with_model_fallback(
+                client=client,
+                contents=[audio_part, instructions],
+            )
+            ai_data = extract_json(response.text)
+        except Exception as e:
+            gemini_error_detail = str(e)
+            print(f"Gemini multimodal audio processing error: {gemini_error_detail}")
+
+    # Seamless fallback if Gemini failed or was unconfigured
+    if not ai_data:
+        if client_transcript and client_transcript.strip():
+            print("Falling back to client speech recognition transcript...")
+            ai_data = parse_standup_text_offline(client_transcript.strip(), deals, tasks)
+        else:
+            if not client:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="GEMINI_API_KEY is not configured. Please configure your API key in the top navigation bar, or paste your standup text in the box below to process and sync instantly without a key.",
+                )
+            if gemini_error_detail:
+                if "API_KEY_INVALID" in gemini_error_detail or "API key not valid" in gemini_error_detail or "INVALID_ARGUMENT" in gemini_error_detail:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Your Google Gemini API key is invalid. Google AI Studio keys start with 'AIzaSy...'. Please click 'Configure Gemini Key' in the top header and enter a valid API key from https://aistudio.google.com. (In the meantime, you can also paste your standup text in the box below to process and sync instantly without a key!)",
+                    )
+                elif "RESOURCE_EXHAUSTED" in gemini_error_detail or "429" in gemini_error_detail:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Gemini API quota or rate limit reached (429). Please wait a moment or check your Google AI Studio plan. You can also paste your standup transcript in the text box below to process immediately!",
+                    )
+                raise HTTPException(status_code=500, detail=f"Gemini processing error: {gemini_error_detail}")
+            raise HTTPException(status_code=500, detail="Failed to process audio and no client transcript was provided.")
+
+    crm_updates = ai_data.get("crm_updates", [])
+    task_updates = reconcile_tasks_from_conversation(ai_data, deals)
+    sync_log = await execute_api_sync(crm_updates, task_updates)
+
+    raw_trans = ai_data.get("raw_transcript") or ai_data.get("transcript") or ai_data.get("transcript_summary", "")
+
+    return {
+        "status": "success",
+        "raw_transcript": raw_trans,
+        "transcript_summary": ai_data.get("transcript_summary", "No summary generated."),
+        "executive_report": ai_data.get("executive_report", {}),
+        "crm_updates_planned": crm_updates,
+        "task_updates_planned": task_updates,
+        "api_sync_log": sync_log,
+    }
+
+
+class TextStandupRequest(BaseModel):
+    text: str = Field(..., description="Spoken or typed standup text in Arabic or English")
+
+
+@app.post("/api/process-text")
+async def process_text_standup(payload: TextStandupRequest):
+    """
+    Processes typed or pasted standup transcript (Arabic or English),
+    extracting deltas and syncing CRM & Task Board while preserving verbatim transcript
+    and original opportunity / customer names.
+    """
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+    baseline = await fetch_baseline_state()
+    deals = baseline["deals"]
+    tasks = baseline["tasks"]
+
+    client = get_gemini_client()
+    ai_data = None
+
+    if client:
+        try:
+            instructions = build_analysis_instructions(deals, tasks)
+            prompt = f"{instructions}\n\nSTANDUP TEXT TRANSCRIPT:\n{text}"
+            response = generate_with_model_fallback(
+                client=client,
+                contents=prompt,
+            )
+            ai_data = extract_json(response.text)
+            if not ai_data.get("raw_transcript"):
+                ai_data["raw_transcript"] = text
+        except Exception as e:
+            print(f"Notice: Gemini text generation fell back to offline parser due to: {e}")
+            ai_data = None
+
+    if not ai_data:
+        # Use our smart bilingual offline parser
+        ai_data = parse_standup_text_offline(text, deals, tasks)
+
     crm_updates = ai_data.get("crm_updates", [])
     task_updates = reconcile_tasks_from_conversation(ai_data, deals)
     sync_log = await execute_api_sync(crm_updates, task_updates)
 
     return {
         "status": "success",
-        "transcript_summary": ai_data.get("transcript_summary", "No transcript generated."),
+        "raw_transcript": ai_data.get("raw_transcript") or text,
+        "transcript_summary": ai_data.get("transcript_summary", "Meeting processed."),
         "executive_report": ai_data.get("executive_report", {}),
         "crm_updates_planned": crm_updates,
         "task_updates_planned": task_updates,
@@ -1005,6 +1308,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <button class="btn btn-outline-light" onclick="uploadAudioFile()">Upload & Process</button>
                             </div>
                         </div>
+
+
                     </div>
                 </div>
 
@@ -1014,9 +1319,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <i class="bi bi-check2-circle text-success me-2"></i>Standup Intelligence & Sync Execution
                     </h6>
 
+                    <!-- Original Spoken Transcript (Arabic or English) -->
+                    <div class="mb-4">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <div class="small text-uppercase fw-semibold text-muted">
+                                <i class="bi bi-chat-left-quote text-primary me-1"></i>Original Spoken Transcript / النص الحرفي للمحادثة
+                            </div>
+                            <span class="badge bg-secondary-subtle text-light small" id="transcriptLangBadge">Verbatim</span>
+                        </div>
+                        <div class="p-3 rounded-3 border border-secondary border-opacity-25 bg-black bg-opacity-50 text-light font-arabic" 
+                             style="white-space: pre-wrap; line-height: 1.65; font-size: 1rem;" 
+                             id="rawTranscriptText"></div>
+                    </div>
+
                     <!-- Meeting Summary -->
                     <div class="mb-4">
-                        <div class="small text-uppercase fw-semibold text-muted mb-1">Standup Meeting Summary</div>
+                        <div class="small text-uppercase fw-semibold text-muted mb-1">
+                            <i class="bi bi-file-text text-info me-1"></i>Executive Meeting Summary
+                        </div>
                         <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 text-light" id="summaryText"></div>
                     </div>
 
@@ -1039,6 +1359,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <div class="fw-bold small text-danger mb-2"><i class="bi bi-exclamation-triangle me-1"></i>Management Warnings</div>
                                 <ul class="small ps-3 mb-0" id="managementWarningsList"></ul>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Extracted Tasks with Original Customer & Deal Names -->
+                    <div class="mb-4" id="extractedTasksContainer">
+                        <div class="small text-uppercase fw-semibold text-muted mb-2">
+                            <i class="bi bi-kanban text-warning me-1"></i>Extracted Tasks & Original Opportunities (CRM & Board)
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-sm table-dark align-middle mb-0">
+                                <thead>
+                                    <tr class="text-secondary small">
+                                        <th>Task Deliverable</th>
+                                        <th>Customer Name</th>
+                                        <th>Opportunity / Deal</th>
+                                        <th>Presales</th>
+                                        <th>Vendor</th>
+                                        <th>Priority</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="extractedTasksBody"></tbody>
+                            </table>
                         </div>
                     </div>
 
@@ -1089,17 +1431,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
-        let mediaRecorder;
+        let mediaRecorder = null;
+        let activeStream = null;
         let recordedChunks = [];
-        let timerInterval;
+        let timerInterval = null;
         let secondsElapsed = 0;
         let recordedBlob = null;
+        let isInitializingMedia = false;
+        let speechRecognizer = null;
+        let liveSpeechTranscript = "";
         const apiKeyModal = new bootstrap.Modal(document.getElementById('apiKeyModal'));
 
         document.addEventListener('DOMContentLoaded', () => {
             checkHealth();
             loadPreMeetingQuestions();
+            setupSpeechRecognition();
         });
+
+        function setupSpeechRecognition() {
+            try {
+                const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRec) {
+                    speechRecognizer = new SpeechRec();
+                    speechRecognizer.continuous = true;
+                    speechRecognizer.interimResults = true;
+                    speechRecognizer.lang = 'ar-SA';
+                    speechRecognizer.onresult = (event) => {
+                        let text = '';
+                        for (let i = 0; i < event.results.length; i++) {
+                            text += event.results[i][0].transcript + ' ';
+                        }
+                        liveSpeechTranscript = text.trim();
+                    };
+                    speechRecognizer.onerror = (e) => {
+                        console.warn("SpeechRecognition notice:", e.error);
+                    };
+                }
+            } catch (e) {
+                console.warn("Speech recognition setup error:", e);
+            }
+        }
 
         async function checkHealth() {
             try {
@@ -1163,50 +1534,143 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const timer = document.getElementById('recordingTimer');
             const prompt = document.getElementById('recordingPrompt');
 
-            if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+            // 1. If currently recording, STOP recording
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                prompt.textContent = "Stopping recording...";
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    recordedChunks = [];
-                    mediaRecorder = new MediaRecorder(stream);
-
-                    mediaRecorder.ondataavailable = e => {
-                        if (e.data.size > 0) recordedChunks.push(e.data);
-                    };
-
-                    mediaRecorder.onstop = () => {
-                        recordedBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-                        const audioUrl = URL.createObjectURL(recordedBlob);
-                        document.getElementById('audioPlayer').src = audioUrl;
-                        document.getElementById('audioPlaybackContainer').classList.remove('d-none');
-                        prompt.textContent = "Recording complete. Review playback or click analyze.";
-                    };
-
-                    mediaRecorder.start();
-                    recordBtn.className = 'mic-button mic-recording';
-                    micIcon.className = 'bi bi-stop-fill';
-                    prompt.textContent = "Recording standup meeting... Speak in Arabic / English.";
-                    
-                    secondsElapsed = 0;
-                    timerInterval = setInterval(() => {
-                        secondsElapsed++;
-                        const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
-                        const secs = String(secondsElapsed % 60).padStart(2, '0');
-                        timer.textContent = `${mins}:${secs}`;
-                    }, 1000);
-                } catch (err) {
-                    alert('Microphone access denied or not available: ' + err.message);
+                    mediaRecorder.stop();
+                } catch (e) {
+                    console.warn("Error stopping MediaRecorder:", e);
                 }
-            } else {
-                mediaRecorder.stop();
-                clearInterval(timerInterval);
+                if (speechRecognizer) {
+                    try { speechRecognizer.stop(); } catch (e) {}
+                }
+                if (activeStream) {
+                    try {
+                        activeStream.getTracks().forEach(t => t.stop());
+                    } catch (e) {}
+                    activeStream = null;
+                }
+                if (timerInterval) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
                 recordBtn.className = 'mic-button mic-idle';
                 micIcon.className = 'bi bi-mic-fill';
+                return;
+            }
+
+            // 2. Prevent race conditions from rapid multiple clicks
+            if (isInitializingMedia) return;
+            isInitializingMedia = true;
+
+            // 3. Verify mediaDevices support in browser context
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                isInitializingMedia = false;
+                prompt.textContent = "Microphone requires HTTPS or localhost. Please use file upload below.";
+                alert("Microphone recording is not available in this browser context (requires HTTPS or localhost). Please use the audio file upload option below.");
+                return;
+            }
+
+            try {
+                prompt.textContent = "Accessing microphone...";
+
+                // Clean up any stale streams
+                if (activeStream) {
+                    try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                    activeStream = null;
+                }
+
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                activeStream = stream;
+                recordedChunks = [];
+                liveSpeechTranscript = "";
+
+                let options = {};
+                if (typeof MediaRecorder.isTypeSupported === 'function') {
+                    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                        options = { mimeType: 'audio/webm;codecs=opus' };
+                    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+                        options = { mimeType: 'audio/webm' };
+                    } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+                        options = { mimeType: 'audio/mp4' };
+                    }
+                }
+
+                mediaRecorder = new MediaRecorder(stream, options);
+
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data && e.data.size > 0) {
+                        recordedChunks.push(e.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const mimeType = mediaRecorder.mimeType || 'audio/webm';
+                    recordedBlob = new Blob(recordedChunks, { type: mimeType });
+                    const audioUrl = URL.createObjectURL(recordedBlob);
+                    document.getElementById('audioPlayer').src = audioUrl;
+                    document.getElementById('audioPlaybackContainer').classList.remove('d-none');
+                    prompt.textContent = "Recording complete. Review playback or click Analyze Speech & Sync APIs.";
+                    
+                    if (activeStream) {
+                        try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                        activeStream = null;
+                    }
+                };
+
+                // Start speech recognition in background if supported
+                if (speechRecognizer) {
+                    try {
+                        speechRecognizer.start();
+                    } catch (e) {
+                        console.warn("Could not start speechRecognizer:", e);
+                    }
+                }
+
+                mediaRecorder.start(250);
+                recordBtn.className = 'mic-button mic-recording';
+                micIcon.className = 'bi bi-stop-fill';
+                prompt.textContent = "Recording standup meeting... Speak in Arabic / English. Click to stop.";
+
+                secondsElapsed = 0;
+                timer.textContent = "00:00";
+                if (timerInterval) clearInterval(timerInterval);
+                timerInterval = setInterval(() => {
+                    secondsElapsed++;
+                    const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
+                    const secs = String(secondsElapsed % 60).padStart(2, '0');
+                    timer.textContent = `${mins}:${secs}`;
+                }, 1000);
+
+            } catch (err) {
+                console.error("Microphone access error:", err);
+                if (activeStream) {
+                    try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+                    activeStream = null;
+                }
+                if (timerInterval) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
+                recordBtn.className = 'mic-button mic-idle';
+                micIcon.className = 'bi bi-mic-fill';
+                prompt.textContent = "Microphone error: " + err.message;
+                alert("Microphone Error: " + err.message + "\\n\\nPlease allow microphone permission in your browser or use the audio file upload option below.");
+            } finally {
+                isInitializingMedia = false;
             }
         }
 
         async function processRecordedAudio() {
             if (!recordedBlob) {
-                alert('No audio recorded.');
+                alert('No audio recorded. Please record audio or upload a file first.');
                 return;
             }
             uploadAndAnalyze(recordedBlob, 'standup_recording.webm');
@@ -1224,10 +1688,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         async function uploadAndAnalyze(blobOrFile, filename) {
             const btn = document.getElementById('processAudioBtn');
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Gemini 3.6 Flash Processing Speech & Syncing APIs...';
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing Speech & Syncing APIs...';
 
             const formData = new FormData();
             formData.append('file', blobOrFile, filename);
+            if (liveSpeechTranscript) {
+                formData.append('client_transcript', liveSpeechTranscript);
+            }
 
             try {
                 const res = await fetch('/api/process-audio', {
@@ -1236,17 +1703,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 });
 
                 if (!res.ok) {
-                    const err = await res.json();
-                    alert('Audio processing error: ' + (err.detail || JSON.stringify(err)));
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
+                    let errMsg = `Server returned status ${res.status}`;
+                    try {
+                        const errJson = await res.json();
+                        if (errJson && errJson.detail) errMsg = errJson.detail;
+                        else if (errJson) errMsg = JSON.stringify(errJson);
+                    } catch (e) {
+                        const txt = await res.text();
+                        if (txt) errMsg = txt;
+                    }
+                    alert('Audio Processing Notice:\n\n' + errMsg);
                     return;
                 }
 
                 const data = await res.json();
+                if (!data) {
+                    alert('Server returned an empty response.');
+                    return;
+                }
                 renderResults(data);
             } catch (err) {
-                alert('Network error communicating with Voice Agent server.');
+                console.error("Audio processing fetch error:", err);
+                alert('Audio Processing Notice:\n\n' + (err.message || 'Unable to connect to server.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
@@ -1257,16 +1735,51 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const resultsCard = document.getElementById('resultsCard');
             resultsCard.classList.remove('d-none');
 
-            // Summary
+            // 1. Raw Verbatim Transcript
+            const raw = data.raw_transcript || data.transcript || '';
+            const rawContainer = document.getElementById('rawTranscriptText');
+            if (raw) {
+                rawContainer.textContent = raw;
+                const isArabic = /[\u0600-\u06FF]/.test(raw);
+                rawContainer.setAttribute('dir', isArabic ? 'rtl' : 'ltr');
+                document.getElementById('transcriptLangBadge').textContent = isArabic ? 'عربي / Saudi Arabic' : 'English';
+            } else {
+                rawContainer.textContent = 'Verbatim transcript not available.';
+            }
+
+            // 2. Summary
             document.getElementById('summaryText').textContent = data.transcript_summary || 'Meeting processed.';
 
-            // Executive Report lists
+            // 3. Executive Report lists
             const exec = data.executive_report || {};
             document.getElementById('todayProgressList').innerHTML = (exec.today_progress || []).map(p => `<li>${p}</li>`).join('') || '<li>No items noted.</li>';
             document.getElementById('tomorrowActionsList').innerHTML = (exec.tomorrow_actions || []).map(a => `<li>${a}</li>`).join('') || '<li>No items noted.</li>';
             document.getElementById('managementWarningsList').innerHTML = (exec.management_warnings || []).map(w => `<li>${w}</li>`).join('') || '<li>No critical blockers detected.</li>';
 
-            // Sync Log table
+            // 4. Extracted Tasks with Original Customer & Opportunity Names
+            const tasksTbody = document.getElementById('extractedTasksBody');
+            const plannedTasks = data.task_updates_planned || [];
+            if (!plannedTasks.length) {
+                tasksTbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-2">No new task records generated.</td></tr>';
+            } else {
+                tasksTbody.innerHTML = plannedTasks.map(t => {
+                    const p = t.payload || {};
+                    const custBadge = p.customer_name ? `<span class="badge bg-primary-subtle text-primary border"><i class="bi bi-building me-1"></i>${p.customer_name}</span>` : '<span class="text-muted">-</span>';
+                    const dealBadge = p.deal_name ? `<span class="badge bg-info-subtle text-info border"><i class="bi bi-briefcase me-1"></i>${p.deal_name}</span>` : '<span class="text-muted">-</span>';
+                    return `
+                        <tr>
+                            <td class="fw-semibold text-white">${p.task_title || '-'}</td>
+                            <td>${custBadge}</td>
+                            <td>${dealBadge}</td>
+                            <td><span class="badge bg-secondary">${p.assigned_to || 'Presales 1'}</span></td>
+                            <td><span class="badge bg-dark border">${p.vendor_domain || 'General'}</span></td>
+                            <td><span class="badge ${p.priority === 'High' ? 'bg-danger' : 'bg-warning text-dark'}">${p.priority || 'Medium'}</span></td>
+                        </tr>
+                    `;
+                }).join('');
+            }
+
+            // 5. Sync Log table
             const tbody = document.getElementById('syncLogBody');
             const logs = data.api_sync_log || [];
             if (!logs.length) {

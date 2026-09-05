@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -378,11 +378,11 @@ def get_customers():
 
 
 @app.get("/api/deals", response_model=List[DealOut], tags=["Deals"])
-def get_deals():
-    """Returns all deals with joined customer information."""
+def get_deals(vendor: Optional[str] = Query(None, description="Filter deals by primary vendor (e.g. HPE, Dell)")):
+    """Returns all deals with joined customer information, optionally filtered by vendor."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
+    query = """
         SELECT 
             d.deal_id,
             d.customer_id,
@@ -400,8 +400,14 @@ def get_deals():
             d.updated_at
         FROM deals d
         JOIN customers c ON d.customer_id = c.customer_id
-        ORDER BY d.updated_at DESC, d.deal_id DESC;
-    """)
+    """
+    params = []
+    if vendor:
+        query += " WHERE LOWER(d.primary_vendors) LIKE ? "
+        params.append(f"%{vendor.lower()}%")
+
+    query += " ORDER BY d.updated_at DESC, d.deal_id DESC;"
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
@@ -790,11 +796,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                 <!-- Filter & Search Controls -->
                 <div class="d-flex flex-wrap align-items-center gap-2" id="filterControls">
-                    <div class="input-group input-group-sm" style="width: 220px;">
+                    <div class="input-group input-group-sm" style="width: 210px;">
                         <span class="input-group-text bg-light"><i class="bi bi-search"></i></span>
                         <input type="text" id="searchInput" class="form-control" placeholder="Search deals or accounts..." oninput="applyFilters()">
                     </div>
-                    <select id="stageFilter" class="form-select form-select-sm" style="width: 170px;" onchange="applyFilters()">
+                    <select id="stageFilter" class="form-select form-select-sm" style="width: 150px;" onchange="applyFilters()">
                         <option value="">All Stages</option>
                         <option value="Discovery">Discovery</option>
                         <option value="Gathering Requirements">Gathering Req.</option>
@@ -803,7 +809,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <option value="Closed-Won">Closed-Won</option>
                         <option value="Closed-Lost">Closed-Lost</option>
                     </select>
-                    <select id="presalesFilter" class="form-select form-select-sm" style="width: 140px;" onchange="applyFilters()">
+                    <select id="vendorFilter" class="form-select form-select-sm" style="width: 140px;" onchange="applyFilters()">
+                        <option value="">All Vendors</option>
+                        <option value="HPE">HPE</option>
+                        <option value="Dell">Dell</option>
+                        <option value="Veeam">Veeam</option>
+                        <option value="Nutanix">Nutanix</option>
+                        <option value="VMware">VMware</option>
+                    </select>
+                    <select id="presalesFilter" class="form-select form-select-sm" style="width: 130px;" onchange="applyFilters()">
                         <option value="">All Presales</option>
                         <option value="Presales 1">Presales 1</option>
                         <option value="Presales 2">Presales 2</option>
@@ -1168,6 +1182,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         function applyFilters() {
             const search = document.getElementById('searchInput').value.toLowerCase().trim();
             const stage = document.getElementById('stageFilter').value;
+            const vendor = document.getElementById('vendorFilter').value.toLowerCase();
             const presales = document.getElementById('presalesFilter').value;
 
             const filtered = allDeals.filter(d => {
@@ -1178,9 +1193,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     (d.vendor_notes && d.vendor_notes.toLowerCase().includes(search));
                 
                 const matchStage = !stage || d.stage === stage;
+                const matchVendor = !vendor || (d.primary_vendors && d.primary_vendors.toLowerCase().includes(vendor));
                 const matchPresales = !presales || d.assigned_presales === presales;
 
-                return matchSearch && matchStage && matchPresales;
+                return matchSearch && matchStage && matchVendor && matchPresales;
             });
 
             renderDealsTable(filtered);

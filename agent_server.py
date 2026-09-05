@@ -1,9 +1,20 @@
 import json
 import os
 import re
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+# Ensure standard output/error supports Arabic and UTF-8 characters on Windows
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import httpx
 import uvicorn
@@ -1031,7 +1042,7 @@ async def process_audio(
     # Seamless fallback if Gemini failed or was unconfigured
     if not ai_data:
         if client_transcript and client_transcript.strip():
-            print(f"Falling back to client speech recognition transcript: {client_transcript.strip()[:60]}...")
+            print("Falling back to client speech recognition transcript...")
             ai_data = parse_standup_text_offline(client_transcript.strip(), deals, tasks)
         else:
             if not client:

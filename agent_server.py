@@ -807,27 +807,6 @@ Return STRICT JSON format:
         }
 
 
-@app.post("/api/process-audio")
-async def process_audio(file: UploadFile = File(...)):
-    """
-    Receives recorded standup audio, processes it using Gemini 2.5 Flash's native speech recognition,
-    detects state deltas vs CRM & Tasks, outputs a structured executive report, and executes live API syncs.
-    """
-    audio_bytes = await file.read()
-    content_type = file.content_type or "audio/webm"
-
-    # 1. Fetch current baseline
-    baseline = await fetch_baseline_state()
-    deals = baseline["deals"]
-    tasks = baseline["tasks"]
-
-    client = get_gemini_client()
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="GEMINI_API_KEY is not set. Please provide your API key in the top navigation bar to process audio with Gemini.",
-        )
-
 def parse_standup_text_offline(text: str, deals: List[Dict[str, Any]], tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Intelligent offline fallback parser that processes Arabic & English standup text
@@ -1017,6 +996,12 @@ async def process_audio(file: UploadFile = File(...)):
     audio_bytes = await file.read()
     content_type = file.content_type or "audio/webm"
 
+    if not audio_bytes or len(audio_bytes) < 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The recorded audio file is empty or too short. Please speak into your microphone for at least 3 to 5 seconds before clicking analyze.",
+        )
+
     baseline = await fetch_baseline_state()
     deals = baseline["deals"]
     tasks = baseline["tasks"]
@@ -1038,8 +1023,19 @@ async def process_audio(file: UploadFile = File(...)):
         )
         ai_data = extract_json(response.text)
     except Exception as e:
-        print(f"Multimodal Gemini error: {e}")
-        raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
+        err_msg = str(e)
+        print(f"Multimodal Gemini error: {err_msg}")
+        if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg or "INVALID_ARGUMENT" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your Google Gemini API key is invalid. Google AI Studio keys typically start with 'AIzaSy...'. Please click 'Configure Gemini Key' in the top header and enter a valid API key from https://aistudio.google.com. (In the meantime, you can also paste your standup text in the box below to process and sync instantly without a key!)",
+            )
+        elif "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Gemini API quota or rate limit reached (429). Please wait a moment or check your Google AI Studio plan. You can also paste your standup transcript in the text box below to process immediately!",
+            )
+        raise HTTPException(status_code=500, detail=f"Gemini processing error: {err_msg}")
 
     crm_updates = ai_data.get("crm_updates", [])
     task_updates = reconcile_tasks_from_conversation(ai_data, deals)
@@ -1569,17 +1565,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 });
 
                 if (!res.ok) {
-                    const err = await res.json();
-                    alert('Audio processing error: ' + (err.detail || JSON.stringify(err)));
+                    let errMsg = `Server returned status ${res.status}`;
+                    try {
+                        const errJson = await res.json();
+                        if (errJson && errJson.detail) errMsg = errJson.detail;
+                        else if (errJson) errMsg = JSON.stringify(errJson);
+                    } catch (e) {
+                        const txt = await res.text();
+                        if (txt) errMsg = txt;
+                    }
+                    alert('Audio Processing Notice:\n\n' + errMsg);
                     btn.disabled = false;
                     btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
                     return;
                 }
 
                 const data = await res.json();
+                if (!data) {
+                    alert('Server returned an empty response.');
+                    return;
+                }
                 renderResults(data);
             } catch (err) {
-                alert('Network error communicating with Voice Agent server.');
+                console.error("Audio processing fetch error:", err);
+                alert('Audio Processing Notice:\n\n' + (err.message || 'Unable to connect to server.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
@@ -1606,15 +1615,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 });
 
                 if (!res.ok) {
-                    const err = await res.json();
-                    alert('Processing error: ' + (err.detail || JSON.stringify(err)));
+                    let errMsg = `Server returned status ${res.status}`;
+                    try {
+                        const errJson = await res.json();
+                        if (errJson && errJson.detail) errMsg = errJson.detail;
+                    } catch (e) {
+                        const txt = await res.text();
+                        if (txt) errMsg = txt;
+                    }
+                    alert('Text Processing Notice:\n\n' + errMsg);
                     return;
                 }
 
                 const data = await res.json();
                 renderResults(data);
             } catch (err) {
-                alert('Network error communicating with Voice Agent server.');
+                console.error("Text processing fetch error:", err);
+                alert('Text Processing Notice:\n\n' + (err.message || 'Unable to connect to server.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-send-fill me-1"></i>Process Transcript & Sync APIs';

@@ -680,12 +680,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         .vendor-chip {
             display: inline-block;
             background: #e2e8f0;
-            color: #334155;
+            color: #1e293b;
             font-size: 0.72rem;
             font-weight: 600;
             padding: 2px 7px;
             border-radius: 4px;
             margin: 1px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .vendor-chip:hover {
+            background: #cbd5e1;
+            transform: translateY(-1px);
+        }
+        .vendor-pill {
+            font-weight: 600;
+            font-size: 0.8rem;
+            transition: all 0.15s ease;
+        }
+        .vendor-pill.active {
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
         }
         .modal-content {
             border-radius: 14px;
@@ -809,7 +823,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <option value="Closed-Won">Closed-Won</option>
                         <option value="Closed-Lost">Closed-Lost</option>
                     </select>
-                    <select id="vendorFilter" class="form-select form-select-sm" style="width: 140px;" onchange="applyFilters()">
+                    <select id="vendorFilter" class="form-select form-select-sm" style="width: 140px;" onchange="filterByVendor(this.value)">
                         <option value="">All Vendors</option>
                         <option value="HPE">HPE</option>
                         <option value="Dell">Dell</option>
@@ -825,6 +839,37 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <button class="btn btn-sm btn-outline-secondary" onclick="loadAllData()" title="Refresh Data">
                         <i class="bi bi-arrow-clockwise"></i>
                     </button>
+                </div>
+
+                <!-- Vendor Quick-Filter Pills Bar -->
+                <div class="d-flex flex-wrap align-items-center gap-2 mt-3 pt-2 border-top w-100" id="vendorPillsContainer">
+                    <span class="small fw-semibold text-muted me-1">
+                        <i class="bi bi-funnel-fill text-primary me-1"></i>Vendor Filter:
+                    </span>
+                    <button type="button" class="btn btn-sm btn-dark px-3 rounded-pill vendor-pill active" id="pill-all" onclick="filterByVendor('')">
+                        All Vendors <span class="badge bg-secondary ms-1" id="count-all">0</span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-primary px-3 rounded-pill vendor-pill" id="pill-hpe" onclick="filterByVendor('HPE')">
+                        <i class="bi bi-hdd-network me-1"></i>HPE <span class="badge bg-primary ms-1" id="count-hpe">0</span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-info px-3 rounded-pill vendor-pill" id="pill-dell" onclick="filterByVendor('Dell')">
+                        <i class="bi bi-server me-1"></i>Dell <span class="badge bg-info ms-1" id="count-dell">0</span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-success px-3 rounded-pill vendor-pill" id="pill-veeam" onclick="filterByVendor('Veeam')">
+                        <i class="bi bi-shield-check me-1"></i>Veeam <span class="badge bg-success ms-1" id="count-veeam">0</span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-warning px-3 rounded-pill vendor-pill text-dark" id="pill-nutanix" onclick="filterByVendor('Nutanix')">
+                        <i class="bi bi-boxes me-1"></i>Nutanix <span class="badge bg-warning text-dark ms-1" id="count-nutanix">0</span>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary px-3 rounded-pill vendor-pill" id="pill-vmware" onclick="filterByVendor('VMware')">
+                        <i class="bi bi-cpu me-1"></i>VMware <span class="badge bg-secondary ms-1" id="count-vmware">0</span>
+                    </button>
+                    <span id="activeVendorIndicator" class="ms-auto small text-muted d-none">
+                        Showing: <strong id="activeVendorName" class="text-primary"></strong>
+                        <button class="btn btn-link btn-sm text-danger text-decoration-none py-0 ms-1" onclick="filterByVendor('')">
+                            <i class="bi bi-x-circle me-1"></i>Clear Filter
+                        </button>
+                    </span>
                 </div>
             </div>
         </div>
@@ -1106,9 +1151,80 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         async function loadAllData() {
             await Promise.all([fetchDeals(), fetchCustomers()]);
             renderMetrics();
+            updateVendorPillCounts();
             applyFilters();
             renderCustomerTable();
             populateCustomerDatalist();
+        }
+
+        function updateVendorPillCounts() {
+            const countAll = allDeals.length;
+            const countHpe = allDeals.filter(d => d.primary_vendors && /hpe|hewlett/i.test(d.primary_vendors)).length;
+            const countDell = allDeals.filter(d => d.primary_vendors && /dell/i.test(d.primary_vendors)).length;
+            const countVeeam = allDeals.filter(d => d.primary_vendors && /veeam/i.test(d.primary_vendors)).length;
+            const countNutanix = allDeals.filter(d => d.primary_vendors && /nutanix/i.test(d.primary_vendors)).length;
+            const countVmware = allDeals.filter(d => d.primary_vendors && /vmware/i.test(d.primary_vendors)).length;
+
+            const setBadge = (id, count) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = count;
+            };
+
+            setBadge('count-all', countAll);
+            setBadge('count-hpe', countHpe);
+            setBadge('count-dell', countDell);
+            setBadge('count-veeam', countVeeam);
+            setBadge('count-nutanix', countNutanix);
+            setBadge('count-vmware', countVmware);
+        }
+
+        function filterByVendor(vendor) {
+            const vendorSelect = document.getElementById('vendorFilter');
+            if (vendorSelect && vendorSelect.value !== vendor) {
+                vendorSelect.value = vendor;
+            }
+
+            const pillMap = {
+                '': 'pill-all',
+                'HPE': 'pill-hpe',
+                'Dell': 'pill-dell',
+                'Veeam': 'pill-veeam',
+                'Nutanix': 'pill-nutanix',
+                'VMware': 'pill-vmware'
+            };
+
+            const outlineMap = {
+                '': 'btn-outline-dark',
+                'HPE': 'btn-outline-primary',
+                'Dell': 'btn-outline-info',
+                'Veeam': 'btn-outline-success',
+                'Nutanix': 'btn-outline-warning',
+                'VMware': 'btn-outline-secondary'
+            };
+
+            Object.entries(pillMap).forEach(([v, pillId]) => {
+                const btn = document.getElementById(pillId);
+                if (!btn) return;
+                btn.className = 'btn btn-sm px-3 rounded-pill vendor-pill';
+                if (v.toLowerCase() === (vendor || '').toLowerCase()) {
+                    btn.classList.add('active', 'btn-dark');
+                } else {
+                    btn.classList.add(outlineMap[v] || 'btn-outline-secondary');
+                }
+            });
+
+            const indicator = document.getElementById('activeVendorIndicator');
+            const nameEl = document.getElementById('activeVendorName');
+            if (indicator && nameEl) {
+                if (vendor) {
+                    indicator.classList.remove('d-none');
+                    nameEl.textContent = vendor;
+                } else {
+                    indicator.classList.add('d-none');
+                }
+            }
+
+            applyFilters();
         }
 
         async function fetchDeals() {
@@ -1212,7 +1328,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             tbody.innerHTML = deals.map(d => {
                 const stageClass = 'badge-' + d.stage.replace(/\\s+/g, '-');
                 const vendorChips = d.primary_vendors 
-                    ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip">${v.trim()}</span>`).join(' ')
+                    ? d.primary_vendors.split(',').map(v => {
+                        const vTrim = v.trim();
+                        return `<span class="vendor-chip" onclick="filterByVendor('${vTrim}')" title="Click to filter by ${vTrim}"><i class="bi bi-tag-fill me-1 opacity-50"></i>${vTrim}</span>`;
+                      }).join(' ')
                     : '<span class="text-muted small">-</span>';
 
                 return `

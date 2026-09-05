@@ -267,13 +267,23 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         p["priority"] = "Medium"
 
-    # 7. Deal ID handling
+    # 7. Deal ID & Names handling
     deal_id = p.get("related_deal_id")
     if deal_id is not None and str(deal_id).strip():
         digits = re.findall(r"\d+", str(deal_id))
         p["related_deal_id"] = int(digits[0]) if digits else None
     else:
         p["related_deal_id"] = None
+
+    if "customer_name" in p and p["customer_name"]:
+        p["customer_name"] = str(p["customer_name"]).strip()
+    else:
+        p["customer_name"] = None
+
+    if "deal_name" in p and p["deal_name"]:
+        p["deal_name"] = str(p["deal_name"]).strip()
+    else:
+        p["deal_name"] = None
 
     # 8. Management blockers
     if "management_blockers" in p and p["management_blockers"]:
@@ -284,6 +294,7 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     # 9. Changed By
     p["changed_by"] = p.get("changed_by") or "Voice Agent"
     return p
+
 
 
 def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -301,6 +312,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
 
     # Map deals by customer or name keywords for smart linking
     deal_keyword_map = {}
+    deal_details_map = {}
     for d in baseline_deals:
         d_id = d.get("deal_id")
         name = str(d.get("deal_name", "")).lower()
@@ -308,6 +320,10 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if d_id:
             deal_keyword_map[name] = d_id
             deal_keyword_map[cust] = d_id
+            deal_details_map[d_id] = {
+                "deal_name": d.get("deal_name"),
+                "customer_name": d.get("company_name"),
+            }
 
     # Also check newly planned crm_updates
     crm_updates = ai_data.get("crm_updates", [])
@@ -321,12 +337,45 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 deal_keyword_map[d_name] = d_id
             if d_cust:
                 deal_keyword_map[d_cust] = d_id
+            if d_id not in deal_details_map:
+                deal_details_map[d_id] = {
+                    "deal_name": p.get("deal_name"),
+                    "customer_name": p.get("company_name"),
+                }
 
     def find_related_deal(text: str) -> Optional[int]:
         t_low = text.lower()
         for k, d_id in deal_keyword_map.items():
             if k and len(k) > 3 and k in t_low:
                 return d_id
+        return None
+
+    def detect_customer_name(text: str) -> Optional[str]:
+        t_low = text.lower()
+        if "almarai" in t_low:
+            return "Almarai"
+        if "hajj" in t_low:
+            return "Ministry of Hajj"
+        if "foreign affairs" in t_low:
+            return "Ministry of Foreign Affairs"
+        if "planning" in t_low:
+            return "Ministry of Planning"
+        if "human resources" in t_low or "mhr" in t_low:
+            return "Ministry of Human Resources"
+        if "jeddah" in t_low:
+            return "Jeddah Municipality"
+        if "electronic university" in t_low or "seu" in t_low:
+            return "Saudi Electronic University"
+        if "solarwinds" in t_low:
+            return "SolarWinds Request"
+        if "fintech" in t_low:
+            return "FinTech Horizons"
+        if "nordic" in t_low:
+            return "Nordic Health Systems"
+        if "apex" in t_low:
+            return "Apex Logistics"
+        if "acme" in t_low:
+            return "Acme Cloud Corp"
         return None
 
     def detect_vendor(text: str) -> str:
@@ -366,6 +415,11 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if any(len(act_low) > 8 and (act_low[:20] in et or et in act_low) for et in existing_titles):
             continue
 
+        d_id = find_related_deal(action_text)
+        d_info = deal_details_map.get(d_id, {}) if d_id else {}
+        c_name = d_info.get("customer_name") or detect_customer_name(action_text)
+        d_name = d_info.get("deal_name")
+
         task_updates.append({
             "method": "POST",
             "payload": {
@@ -375,7 +429,9 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "vendor_domain": detect_vendor(action_text),
                 "status": "In Progress",
                 "priority": "High" if ("tender" in act_low or "rfp" in act_low) else "Medium",
-                "related_deal_id": find_related_deal(action_text),
+                "related_deal_id": d_id,
+                "customer_name": c_name,
+                "deal_name": d_name,
                 "changed_by": "Voice Agent",
             }
         })
@@ -387,6 +443,11 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         prog_low = prog_text.lower()
         if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low:
             if not any(len(prog_low) > 8 and (prog_low[:20] in et or et in prog_low) for et in existing_titles):
+                d_id = find_related_deal(prog_text)
+                d_info = deal_details_map.get(d_id, {}) if d_id else {}
+                c_name = d_info.get("customer_name") or detect_customer_name(prog_text)
+                d_name = d_info.get("deal_name")
+
                 task_updates.append({
                     "method": "POST",
                     "payload": {
@@ -396,13 +457,16 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                         "vendor_domain": detect_vendor(prog_text),
                         "status": "In Progress",
                         "priority": "High",
-                        "related_deal_id": find_related_deal(prog_text),
+                        "related_deal_id": d_id,
+                        "customer_name": c_name,
+                        "deal_name": d_name,
                         "changed_by": "Voice Agent",
                     }
                 })
                 existing_titles.append(prog_low)
 
     return task_updates
+
 
 
 async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -16,6 +16,37 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator, model_valida
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 DB_FILE = Path(__file__).resolve().parent / "tasks.db"
+CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
+
+
+def resolve_deal_details(
+    deal_id: Optional[int], 
+    custom_deal: Optional[str] = None, 
+    custom_customer: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolves deal title and customer company name from crm.db if not explicitly provided."""
+    d_name = str(custom_deal).strip() if custom_deal and str(custom_deal).strip() else None
+    c_name = str(custom_customer).strip() if custom_customer and str(custom_customer).strip() else None
+
+    if deal_id and CRM_DB_FILE.exists() and (not d_name or not c_name):
+        try:
+            with sqlite3.connect(CRM_DB_FILE) as crm_conn:
+                crm_conn.row_factory = sqlite3.Row
+                row = crm_conn.execute("""
+                    SELECT d.deal_name, c.company_name 
+                    FROM deals d 
+                    JOIN customers c ON d.customer_id = c.customer_id 
+                    WHERE d.deal_id = ?;
+                """, (deal_id,)).fetchone()
+                if row:
+                    if not d_name:
+                        d_name = row["deal_name"]
+                    if not c_name:
+                        c_name = row["company_name"]
+        except Exception as e:
+            print(f"Notice: Failed to query crm.db: {e}")
+
+    return d_name, c_name
 
 
 class TaskCategory(str, Enum):
@@ -85,13 +116,79 @@ def init_db():
     );
     """)
 
-    # Schema migration check: ensure started_at and completed_at exist
+    # Schema migration check: ensure started_at, completed_at, customer_name, deal_name exist
     cursor.execute("PRAGMA table_info(tasks);")
     existing_cols = [r["name"] for r in cursor.fetchall()]
     if "started_at" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN started_at TIMESTAMP;")
     if "completed_at" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP;")
+    if "customer_name" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN customer_name TEXT;")
+    if "deal_name" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN deal_name TEXT;")
+
+    # Backfill customer_name & deal_name from crm.db where available
+    if CRM_DB_FILE.exists():
+        try:
+            with sqlite3.connect(CRM_DB_FILE) as crm_conn:
+                crm_conn.row_factory = sqlite3.Row
+                crm_rows = crm_conn.execute("""
+                    SELECT d.deal_id, d.deal_name, c.company_name 
+                    FROM deals d 
+                    JOIN customers c ON d.customer_id = c.customer_id;
+                """).fetchall()
+                deal_map = {r["deal_id"]: (r["deal_name"], r["company_name"]) for r in crm_rows}
+
+                cursor.execute("SELECT task_id, related_deal_id, task_title, customer_name, deal_name FROM tasks;")
+                for t in cursor.fetchall():
+                    tid = t["task_id"]
+                    did = t["related_deal_id"]
+                    t_title = t["task_title"] or ""
+                    c_name = t["customer_name"]
+                    d_name = t["deal_name"]
+
+                    if did and did in deal_map:
+                        crm_deal, crm_cust = deal_map[did]
+                        if not d_name:
+                            d_name = crm_deal
+                        if not c_name:
+                            c_name = crm_cust
+                    else:
+                        low_title = t_title.lower()
+                        for _did, (_dname, _cname) in deal_map.items():
+                            if _cname.lower() in low_title or _dname.lower() in low_title:
+                                if not c_name:
+                                    c_name = _cname
+                                if not d_name:
+                                    d_name = _dname
+                                break
+                        if not c_name:
+                            if "almarai" in low_title:
+                                c_name = "Almarai"
+                            elif "human resources" in low_title or "hr" in low_title:
+                                c_name = "Ministry of Human Resources"
+                            elif "solarwinds" in low_title:
+                                c_name = "SolarWinds Request"
+                            elif "hajj" in low_title:
+                                c_name = "Ministry of Hajj"
+                            elif "foreign affairs" in low_title:
+                                c_name = "Ministry of Foreign Affairs"
+                            elif "planning" in low_title:
+                                c_name = "Ministry of Planning"
+                            elif "jeddah" in low_title:
+                                c_name = "Jeddah Municipality"
+                            elif "electronic university" in low_title:
+                                c_name = "Saudi Electronic University"
+
+                    if c_name or d_name:
+                        cursor.execute(
+                            "UPDATE tasks SET customer_name = ?, deal_name = ? WHERE task_id = ?;",
+                            (c_name, d_name, tid)
+                        )
+        except Exception as e:
+            print(f"Notice during deal backfill: {e}")
+
 
     # Activity event log table for full lifecycle tracking
     cursor.execute("""
@@ -273,6 +370,8 @@ class TaskBase(BaseModel):
     task_title: str = Field(default="Presales Action Item", description="Actionable title for the task")
     category: Union[TaskCategory, str] = Field(default=TaskCategory.GENERAL_ACTION, description="RFP_OWNERSHIP, RFP_DISTRIBUTED_SCOPE, or GENERAL_ACTION")
     related_deal_id: Optional[Union[int, str]] = Field(None, description="Optional foreign deal ID reference")
+    customer_name: Optional[str] = Field(None, description="Customer or client organization name")
+    deal_name: Optional[str] = Field(None, description="Associated CRM deal / tender title")
     assigned_to: Union[PresalesRep, str] = Field(default=PresalesRep.PRESALES_1, description="Presales 1 or Presales 2")
     vendor_domain: Union[VendorDomain, str] = Field(default=VendorDomain.GENERAL, description="Vendor scope")
     status: Union[TaskStatus, str] = Field(default=TaskStatus.NOT_STARTED, description="Current workflow state")
@@ -385,6 +484,8 @@ class TaskUpdate(BaseModel):
     task_title: Optional[str] = None
     category: Optional[Union[TaskCategory, str]] = None
     related_deal_id: Optional[Union[int, str]] = None
+    customer_name: Optional[str] = None
+    deal_name: Optional[str] = None
     assigned_to: Optional[Union[PresalesRep, str]] = None
     vendor_domain: Optional[Union[VendorDomain, str]] = None
     status: Optional[Union[TaskStatus, str]] = None
@@ -542,11 +643,23 @@ def row_to_task(row: sqlite3.Row) -> TaskOut:
     lead_time = compute_duration(created_at, completed_at)
     cycle_time = compute_duration(started_at, completed_at)
 
+    cols = row.keys()
+    c_name = row["customer_name"] if "customer_name" in cols and row["customer_name"] else None
+    d_name = row["deal_name"] if "deal_name" in cols and row["deal_name"] else None
+    d_id = row["related_deal_id"]
+
+    if (not c_name or not d_name) and d_id:
+        auto_deal, auto_cust = resolve_deal_details(d_id, d_name, c_name)
+        d_name = d_name or auto_deal
+        c_name = c_name or auto_cust
+
     return TaskOut(
         task_id=row["task_id"],
         task_title=row["task_title"],
         category=row["category"],
-        related_deal_id=row["related_deal_id"],
+        related_deal_id=d_id,
+        customer_name=c_name,
+        deal_name=d_name,
         assigned_to=row["assigned_to"],
         vendor_domain=row["vendor_domain"],
         status=row["status"],
@@ -560,6 +673,7 @@ def row_to_task(row: sqlite3.Row) -> TaskOut:
         created_at=created_at,
         updated_at=str(row["updated_at"]),
     )
+
 
 
 # -----------------------------------------------------------------------------
@@ -741,16 +855,25 @@ def create_task(payload: TaskCreate):
     started_at = now_iso if status_val != TaskStatus.NOT_STARTED.value else None
     completed_at = now_iso if status_val == TaskStatus.COMPLETED.value else None
 
+    # Resolve customer & deal names
+    deal_name, customer_name = resolve_deal_details(
+        payload.related_deal_id,
+        payload.deal_name,
+        payload.customer_name
+    )
+
     cursor.execute(
         """
         INSERT INTO tasks (
-            task_title, category, related_deal_id, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            task_title, category, related_deal_id, customer_name, deal_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             payload.task_title.strip(),
             cat_val,
             payload.related_deal_id,
+            customer_name,
+            deal_name,
             assigned_val,
             vendor_val,
             status_val,
@@ -763,6 +886,7 @@ def create_task(payload: TaskCreate):
             now_iso,
         ),
     )
+
     task_id = cursor.lastrowid
 
     # Record creation transition in task_activity_log
@@ -821,7 +945,26 @@ def update_task(task_id: int, payload: TaskUpdate):
         update_clauses.append("related_deal_id = ?")
         params.append(payload.related_deal_id)
 
+    if payload.customer_name is not None:
+        update_clauses.append("customer_name = ?")
+        params.append(payload.customer_name.strip() if payload.customer_name else None)
+
+    if payload.deal_name is not None:
+        update_clauses.append("deal_name = ?")
+        params.append(payload.deal_name.strip() if payload.deal_name else None)
+
+    # Auto-resolve deal & customer name if related_deal_id was updated and names were not explicitly passed
+    if payload.related_deal_id is not None and payload.customer_name is None and payload.deal_name is None:
+        auto_deal, auto_cust = resolve_deal_details(payload.related_deal_id)
+        if auto_deal:
+            update_clauses.append("deal_name = ?")
+            params.append(auto_deal)
+        if auto_cust:
+            update_clauses.append("customer_name = ?")
+            params.append(auto_cust)
+
     if payload.assigned_to is not None:
+
         assigned_val = payload.assigned_to.value if hasattr(payload.assigned_to, "value") else str(payload.assigned_to)
         update_clauses.append("assigned_to = ?")
         params.append(assigned_val)
@@ -901,6 +1044,27 @@ def delete_task(task_id: int):
     conn.commit()
     conn.close()
     return None
+
+
+@app.get("/api/crm-deals", tags=["Tasks"])
+def get_crm_deals():
+    """Returns all available CRM deals with customer names for dropdowns and linking."""
+    if not CRM_DB_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(CRM_DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT d.deal_id, d.deal_name, d.stage, d.assigned_presales, c.company_name as customer_name
+                FROM deals d
+                JOIN customers c ON d.customer_id = c.customer_id
+                ORDER BY d.deal_id DESC;
+            """).fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"Error fetching CRM deals: {e}")
+        return []
+
 
 
 # -----------------------------------------------------------------------------
@@ -1071,7 +1235,44 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             font-weight: 600;
         }
 
+        .customer-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            max-width: 175px;
+            white-space: normal;
+            word-break: break-word;
+            text-align: left;
+            line-height: 1.25;
+        }
+
+        .deal-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #f8fafc;
+            color: #334155;
+            border: 1px solid #e2e8f0;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 500;
+            max-width: 185px;
+            white-space: normal;
+            word-break: break-word;
+            text-align: left;
+            line-height: 1.25;
+        }
+
         .blocker-chip {
+
             max-width: 220px;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -1267,7 +1468,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Completed">Completed</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-12">
+                                <label class="form-label small fw-semibold"><i class="bi bi-link-45deg me-1 text-primary"></i>Link to CRM Deal & Customer (Optional)</label>
+                                <select id="newDealSelect" class="form-select" onchange="onDealSelectChanged('new')">
+                                    <option value="">-- Standalone / Unlinked Task --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Customer / Organization Name</label>
+                                <input type="text" id="newCustomerName" class="form-control" placeholder="e.g. Ministry of Foreign Affairs">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Deal / Opportunity Name</label>
+                                <input type="text" id="newDealName" class="form-control" placeholder="e.g. Nutanix HCI Infrastructure Tender">
+                            </div>
+                            <input type="hidden" id="newDealId">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Due Date</label>
+                                <input type="date" id="newDueDate" class="form-control">
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Priority *</label>
                                 <select id="newPriority" class="form-select" required>
                                     <option value="High">High</option>
@@ -1275,18 +1495,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Due Date</label>
-                                <input type="date" id="newDueDate" class="form-control">
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related CRM Deal ID</label>
-                                <input type="number" id="newDealId" class="form-control" placeholder="e.g. 1">
-                            </div>
                             <div class="col-12">
                                 <label class="form-label small fw-semibold">Management / Escalation Blockers</label>
                                 <textarea id="newBlockers" class="form-control" rows="2" placeholder="Note any vendor delays, sizing dependencies, or management help required..."></textarea>
                             </div>
+
                         </div>
                     </div>
                     <div class="modal-footer border-0 pt-0">
@@ -1350,7 +1563,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Completed">Completed</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-12">
+                                <label class="form-label small fw-semibold"><i class="bi bi-link-45deg me-1 text-primary"></i>Link to CRM Deal & Customer</label>
+                                <select id="editDealSelect" class="form-select" onchange="onDealSelectChanged('edit')">
+                                    <option value="">-- Standalone / Custom --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Customer / Organization Name</label>
+                                <input type="text" id="editCustomerName" class="form-control">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Deal / Opportunity Name</label>
+                                <input type="text" id="editDealName" class="form-control">
+                            </div>
+                            <input type="hidden" id="editDealId">
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Due Date</label>
+                                <input type="date" id="editDueDate" class="form-control">
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Priority *</label>
                                 <select id="editPriority" class="form-select" required>
                                     <option value="High">High</option>
@@ -1358,18 +1590,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Due Date</label>
-                                <input type="date" id="editDueDate" class="form-control">
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related Deal ID</label>
-                                <input type="number" id="editDealId" class="form-control">
-                            </div>
                             <div class="col-12">
                                 <label class="form-label small fw-semibold">Management Blockers</label>
                                 <textarea id="editBlockers" class="form-control" rows="3"></textarea>
                             </div>
+
                         </div>
                     </div>
                     <div class="modal-footer border-0 pt-0">
@@ -1414,6 +1639,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     <script>
         let allTasks = [];
+        let crmDeals = [];
         let currentFilter = 'ALL';
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
@@ -1424,6 +1650,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         document.addEventListener('DOMContentLoaded', () => {
             loadTasks();
+            loadCrmDeals();
         });
 
         async function loadTasks() {
@@ -1434,6 +1661,41 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 loadVelocityMetrics();
             } catch (err) {
                 console.error("Failed to load tasks:", err);
+            }
+        }
+
+        async function loadCrmDeals() {
+            try {
+                const res = await fetch('/api/crm-deals');
+                if (res.ok) {
+                    crmDeals = await res.json();
+                    populateDealDropdown('newDealSelect');
+                    populateDealDropdown('editDealSelect');
+                }
+            } catch (err) {
+                console.error("Failed to load CRM deals:", err);
+            }
+        }
+
+        function populateDealDropdown(selectId) {
+            const sel = document.getElementById(selectId);
+            if (!sel) return;
+            const currentVal = sel.value;
+            sel.innerHTML = '<option value="">-- Standalone / Custom --</option>' +
+                crmDeals.map(d => `<option value="${d.deal_id}">Deal #${d.deal_id}: ${d.customer_name} — ${d.deal_name}</option>`).join('');
+            if (currentVal) sel.value = currentVal;
+        }
+
+        function onDealSelectChanged(prefix) {
+            const sel = document.getElementById(prefix + 'DealSelect');
+            const did = sel.value ? parseInt(sel.value) : null;
+            document.getElementById(prefix + 'DealId').value = did || '';
+            if (did) {
+                const found = crmDeals.find(d => d.deal_id === did);
+                if (found) {
+                    document.getElementById(prefix + 'CustomerName').value = found.customer_name || '';
+                    document.getElementById(prefix + 'DealName').value = found.deal_name || '';
+                }
             }
         }
 
@@ -1467,9 +1729,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const filtered = allTasks.filter(t => {
                 const matchesSearch = !search ||
                     t.task_title.toLowerCase().includes(search) ||
+                    (t.customer_name && t.customer_name.toLowerCase().includes(search)) ||
+                    (t.deal_name && t.deal_name.toLowerCase().includes(search)) ||
                     (t.management_blockers && t.management_blockers.toLowerCase().includes(search)) ||
                     t.vendor_domain.toLowerCase().includes(search) ||
                     t.assigned_to.toLowerCase().includes(search);
+
 
                 let matchesFilter = true;
                 if (currentFilter === 'RFP_ONLY') {
@@ -1534,20 +1799,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <table class="table task-table">
                             <thead>
                                 <tr>
-                                    <th class="text-start" style="width: 28%;">Item Title</th>
-                                    <th style="width: 12%;">Assignee</th>
-                                    <th style="width: 13%;">Status</th>
-                                    <th style="width: 9%;">Priority</th>
-                                    <th style="width: 9%;">Vendor</th>
-                                    <th style="width: 15%;">Timing & Velocity</th>
-                                    <th style="width: 9%;">Due Date</th>
-                                    <th style="width: 5%;">Log</th>
+                                    <th class="text-start" style="width: 22%;">Item Title</th>
+                                    <th style="width: 14%;">Customer</th>
+                                    <th style="width: 14%;">Deal / Tender</th>
+                                    <th style="width: 10%;">Assignee</th>
+                                    <th style="width: 11%;">Status</th>
+                                    <th style="width: 7%;">Priority</th>
+                                    <th style="width: 7%;">Vendor</th>
+                                    <th style="width: 10%;">Timing & Velocity</th>
+                                    <th style="width: 5%;">Due</th>
+                                    <th style="width: 4%;">Log</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 ${group.tasks.length === 0 ? `
                                     <tr>
-                                        <td colspan="8" class="text-center py-4 text-muted fst-italic">
+                                        <td colspan="10" class="text-center py-4 text-muted fst-italic">
                                             No tasks in this workstream matching filters.
                                         </td>
                                     </tr>
@@ -1562,7 +1829,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         function renderTaskRow(t) {
             const statusClass = 'status-' + t.status.replace(/\\s+/g, '-');
             const priorityClass = 'priority-' + t.priority;
-            const dealBadge = t.related_deal_id ? `<span class="deal-tag ms-1">Deal #${t.related_deal_id}</span>` : '';
+
+            const customerDisplay = t.customer_name 
+                ? `<span class="customer-badge" title="${t.customer_name}"><i class="bi bi-building text-primary"></i>${t.customer_name}</span>`
+                : '<span class="text-muted small">—</span>';
+
+            const dealText = t.deal_name || (t.related_deal_id ? `Deal #${t.related_deal_id}` : '');
+            const dealDisplay = dealText 
+                ? `<span class="deal-badge" title="${dealText}"><i class="bi bi-briefcase text-secondary"></i>${dealText}</span>`
+                : '<span class="text-muted small">—</span>';
 
             const blockerDisplay = t.management_blockers 
                 ? `<div class="mt-1"><span class="blocker-chip" title="${t.management_blockers}" onclick="openEditTaskModal(${t.task_id})"><i class="bi bi-exclamation-triangle-fill me-1"></i>${t.management_blockers}</span></div>`
@@ -1574,10 +1849,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 const lead = t.lead_time || '-';
                 velocityBadge = `
                     <div class="d-flex flex-column gap-1 align-items-center">
-                        <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.75rem;" title="Cycle Time (Working duration)">
+                        <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.72rem;" title="Cycle Time (Working duration)">
                             <i class="bi bi-stopwatch me-1"></i>Cycle: ${cycle}
                         </span>
-                        <span class="badge bg-light text-muted border py-1 px-2" style="font-size: 0.72rem;" title="Lead Time (Total turnaround)">
+                        <span class="badge bg-light text-muted border py-1 px-2" style="font-size: 0.70rem;" title="Lead Time (Total turnaround)">
                             <i class="bi bi-flag me-1"></i>Lead: ${lead}
                         </span>
                     </div>
@@ -1585,14 +1860,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             } else if (t.started_at) {
                 const startedDate = t.started_at.substring(0, 10);
                 velocityBadge = `
-                    <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2" style="font-size: 0.75rem;" title="Initiated at ${t.started_at}">
+                    <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2" style="font-size: 0.72rem;" title="Initiated at ${t.started_at}">
                         <i class="bi bi-play-fill text-warning me-1"></i>Started ${startedDate}
                     </span>
                 `;
             } else {
                 const createdDate = t.created_at.substring(0, 10);
                 velocityBadge = `
-                    <span class="badge bg-light text-secondary border py-1 px-2" style="font-size: 0.75rem;" title="Created at ${t.created_at}">
+                    <span class="badge bg-light text-secondary border py-1 px-2" style="font-size: 0.72rem;" title="Created at ${t.created_at}">
                         <i class="bi bi-hourglass me-1"></i>Queued ${createdDate}
                     </span>
                 `;
@@ -1604,9 +1879,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
                             ${t.task_title}
                         </a>
-                        ${dealBadge}
                         ${blockerDisplay}
                     </td>
+                    <td>${customerDisplay}</td>
+                    <td>${dealDisplay}</td>
                     <td>
                         <span class="avatar-badge">
                             <i class="bi bi-person-fill text-primary"></i>${t.assigned_to}
@@ -1625,7 +1901,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </div>
                     </td>
                     <td>
-                        <span class="monday-pill ${priorityClass}" style="min-width: 80px;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
+                        <span class="monday-pill ${priorityClass}" style="min-width: 75px;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
                             ${t.priority}
                         </span>
                     </td>
@@ -1637,7 +1913,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     </td>
                     <td>
                         <span class="small ${isOverdue(t.due_date, t.status) ? 'text-danger fw-bold' : 'text-muted'}">
-                            ${t.due_date || '-'}
+                            ${t.due_date ? t.due_date.substring(5) : '-'}
                         </span>
                     </td>
                     <td>
@@ -1648,6 +1924,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 </tr>
             `;
         }
+
 
         function isOverdue(dateStr, status) {
             if (!dateStr || status === 'Completed') return false;
@@ -1710,6 +1987,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         function openNewTaskModal(presetCategory) {
             document.getElementById('newTaskForm').reset();
+            document.getElementById('newDealId').value = '';
+            document.getElementById('newDealSelect').value = '';
+            document.getElementById('newCustomerName').value = '';
+            document.getElementById('newDealName').value = '';
             if (presetCategory) {
                 document.getElementById('newCategory').value = presetCategory;
             }
@@ -1727,6 +2008,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 priority: document.getElementById('newPriority').value,
                 due_date: document.getElementById('newDueDate').value || null,
                 related_deal_id: parseInt(document.getElementById('newDealId').value) || null,
+                customer_name: document.getElementById('newCustomerName').value.trim() || null,
+                deal_name: document.getElementById('newDealName').value.trim() || null,
                 management_blockers: document.getElementById('newBlockers').value || null
             };
 
@@ -1761,7 +2044,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             document.getElementById('editPriority').value = task.priority;
             document.getElementById('editDueDate').value = task.due_date || '';
             document.getElementById('editDealId').value = task.related_deal_id || '';
+            document.getElementById('editCustomerName').value = task.customer_name || '';
+            document.getElementById('editDealName').value = task.deal_name || '';
             document.getElementById('editBlockers').value = task.management_blockers || '';
+
+            const sel = document.getElementById('editDealSelect');
+            if (sel) {
+                sel.value = task.related_deal_id ? String(task.related_deal_id) : '';
+            }
 
             editModal.show();
         }
@@ -1778,8 +2068,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 priority: document.getElementById('editPriority').value,
                 due_date: document.getElementById('editDueDate').value || null,
                 related_deal_id: parseInt(document.getElementById('editDealId').value) || null,
+                customer_name: document.getElementById('editCustomerName').value.trim() || null,
+                deal_name: document.getElementById('editDealName').value.trim() || null,
                 management_blockers: document.getElementById('editBlockers').value || null
             };
+
 
             try {
                 const res = await fetch(`/api/tasks/${taskId}`, {

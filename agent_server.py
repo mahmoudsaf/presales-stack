@@ -524,6 +524,272 @@ async def set_api_key(payload: Dict[str, str]):
     return {"message": "GEMINI_API_KEY saved permanently to local .env file."}
 
 
+@app.get("/api/audit-state")
+async def get_audit_state():
+    """
+    Returns real-time pipeline audit metrics, blockers, category breakdown,
+    and vendor domain counts without invoking generative AI.
+    """
+    baseline = await fetch_baseline_state()
+    deals = baseline.get("deals", [])
+    tasks = baseline.get("tasks", [])
+
+    total_deals = len(deals)
+    total_tasks = len(tasks)
+    open_tasks = [t for t in tasks if str(t.get("status", "")).strip().lower() not in ("completed", "done", "closed")]
+    completed_tasks = [t for t in tasks if str(t.get("status", "")).strip().lower() in ("completed", "done", "closed")]
+
+    # Identify active blockers among open tasks
+    blockers = []
+    for t in open_tasks:
+        is_blk = bool(t.get("is_blocked")) or str(t.get("status", "")).strip().lower() in ("waiting on vendor", "blocked")
+        blocker_note = t.get("management_blockers")
+        if is_blk or (blocker_note and str(blocker_note).strip()):
+            blockers.append({
+                "task_id": t.get("task_id"),
+                "task_title": t.get("task_title") or "Unnamed Task",
+                "customer_name": t.get("customer_name") or "Unspecified Customer",
+                "deal_name": t.get("deal_name") or "Unspecified Deal",
+                "assigned_to": t.get("assigned_to") or "Presales 1",
+                "vendor_domain": t.get("vendor_domain") or "General",
+                "status": t.get("status") or "Blocked",
+                "reason": str(blocker_note).strip() if blocker_note else "Waiting on vendor or partner response"
+            })
+
+    high_priority = [t for t in open_tasks if str(t.get("priority", "")).strip().lower() in ("high", "critical")]
+
+    # Calculate total pipeline value and stage distribution
+    total_pipeline_val = 0.0
+    stages = {}
+    for d in deals:
+        try:
+            total_pipeline_val += float(d.get("estimated_value", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        st = d.get("stage") or "Unspecified"
+        stages[st] = stages.get(st, 0) + 1
+
+    # Breakdown by category
+    category_counts = {
+        "RFP_OWNERSHIP": sum(1 for t in tasks if t.get("category") == "RFP_OWNERSHIP"),
+        "RFP_DISTRIBUTED_SCOPE": sum(1 for t in tasks if t.get("category") == "RFP_DISTRIBUTED_SCOPE"),
+        "GENERAL_ACTION": sum(1 for t in tasks if t.get("category") == "GENERAL_ACTION"),
+    }
+
+    # Breakdown by vendor
+    vendor_counts = {}
+    for t in tasks:
+        v = t.get("vendor_domain") or "General"
+        vendor_counts[v] = vendor_counts.get(v, 0) + 1
+
+    summary = {
+        "total_deals": total_deals,
+        "total_tasks": total_tasks,
+        "open_tasks": len(open_tasks),
+        "completed_tasks": len(completed_tasks),
+        "total_pipeline_value": total_pipeline_val,
+        "blocked_tasks_count": len(blockers),
+        "high_priority_count": len(high_priority),
+        "pipeline_value": f"${total_pipeline_val:,.2f}",
+    }
+
+    return {
+        "status": "success",
+        "crm_connected": baseline["crm_healthy"],
+        "tasks_connected": baseline["tasks_healthy"],
+        "summary": summary,
+        "metrics": summary,
+        "stage_distribution": stages,
+        "vendor_distribution": vendor_counts,
+        "category_counts": category_counts,
+        "blockers": blockers,
+        "high_priority_tasks": high_priority,
+    }
+
+
+@app.get("/api/followup-opportunities")
+async def get_followup_opportunities():
+    """
+    Returns previous/current opportunities classified into the 3 kinds:
+    1. RFP_OWNERSHIP (Prime RFP / Tender ownership)
+    2. RFP_DISTRIBUTED_SCOPE (Multi-vendor & distributed partner scope)
+    3. GENERAL_ACTION (PoC milestones, sizing reviews, general actions)
+    Specifically highlighting which deals have tasks to follow up about (and blockers).
+    """
+    baseline = await fetch_baseline_state()
+    deals = baseline.get("deals", [])
+    tasks = baseline.get("tasks", [])
+
+    opportunities = []
+    claimed_task_ids = set()
+
+    for d in deals:
+        deal_id = d.get("deal_id")
+        deal_name = d.get("deal_name", "")
+        customer_name = d.get("company_name") or d.get("customer_name") or "Customer"
+
+        # Match tasks belonging to this deal
+        linked_tasks = []
+        for t in tasks:
+            t_id = t.get("task_id")
+            t_rel_deal = t.get("related_deal_id")
+            t_deal_name = (t.get("deal_name") or "").strip().lower()
+            t_cust_name = (t.get("customer_name") or "").strip().lower()
+
+            is_match = False
+            if t_rel_deal and t_rel_deal == deal_id:
+                is_match = True
+            elif t_deal_name and deal_name and (t_deal_name in deal_name.lower() or deal_name.lower() in t_deal_name):
+                is_match = True
+            elif t_cust_name and customer_name and (t_cust_name in customer_name.lower() or customer_name.lower() in t_cust_name):
+                is_match = True
+
+            if is_match:
+                linked_tasks.append(t)
+                claimed_task_ids.add(t_id)
+
+        # Filter follow-up tasks (not completed)
+        followup_tasks = [
+            t for t in linked_tasks 
+            if str(t.get("status", "")).strip().lower() not in ("completed", "done", "closed")
+        ]
+        completed_tasks = [
+            t for t in linked_tasks 
+            if str(t.get("status", "")).strip().lower() in ("completed", "done", "closed")
+        ]
+
+        # Determine the opportunity kind (one of the 3 kinds)
+        kind = None
+        for t in linked_tasks:
+            if t.get("category") == "RFP_OWNERSHIP":
+                kind = "RFP_OWNERSHIP"
+                break
+        if not kind:
+            for t in linked_tasks:
+                if t.get("category") == "RFP_DISTRIBUTED_SCOPE":
+                    kind = "RFP_DISTRIBUTED_SCOPE"
+                    break
+        if not kind:
+            for t in linked_tasks:
+                if t.get("category") == "GENERAL_ACTION":
+                    kind = "GENERAL_ACTION"
+                    break
+
+        if not kind:
+            dn_low = deal_name.lower()
+            if any(k in dn_low for k in ["rfp", "tender", "مناقصة", "platform", "منصة"]):
+                kind = "RFP_OWNERSHIP"
+            elif any(k in dn_low for k in ["scope", "refresh", "renewal", "backup", "تجديد", "تحديث", "نطاق", "توريد"]):
+                kind = "RFP_DISTRIBUTED_SCOPE"
+            else:
+                kind = "GENERAL_ACTION"
+
+        # Check if deal has active blockers
+        has_blocker = any(
+            t.get("is_blocked") or str(t.get("status", "")).strip().lower() in ("waiting on vendor", "blocked") or (t.get("management_blockers") and str(t.get("management_blockers")).strip())
+            for t in followup_tasks
+        )
+
+        opportunities.append({
+            "deal_id": deal_id,
+            "deal_name": deal_name,
+            "customer_name": customer_name,
+            "stage": d.get("stage", "Gathering Requirements"),
+            "estimated_value": d.get("estimated_value", 0),
+            "primary_vendors": d.get("primary_vendors", "General"),
+            "assigned_presales": d.get("assigned_presales", "Presales 1"),
+            "kind": kind,
+            "has_followup_tasks": len(followup_tasks) > 0,
+            "followup_tasks_count": len(followup_tasks),
+            "completed_tasks_count": len(completed_tasks),
+            "has_blocker": has_blocker,
+            "followup_tasks": followup_tasks,
+            "completed_tasks": completed_tasks,
+        })
+
+    # Also handle any unclaimed follow-up tasks from task board as standalone deliverables
+    unclaimed = [t for t in tasks if t.get("task_id") not in claimed_task_ids]
+    if unclaimed:
+        unclaimed_groups = {}
+        for t in unclaimed:
+            key = t.get("deal_name") or t.get("customer_name") or "Standup Technical Deliverables"
+            if key not in unclaimed_groups:
+                unclaimed_groups[key] = []
+            unclaimed_groups[key].append(t)
+
+        for key, t_list in unclaimed_groups.items():
+            f_tasks = [t for t in t_list if str(t.get("status", "")).strip().lower() not in ("completed", "done", "closed")]
+            c_tasks = [t for t in t_list if str(t.get("status", "")).strip().lower() in ("completed", "done", "closed")]
+            first_t = t_list[0]
+            kind = first_t.get("category") or "GENERAL_ACTION"
+            has_blk = any(t.get("is_blocked") or str(t.get("status", "")).strip().lower() in ("waiting on vendor", "blocked") or (t.get("management_blockers") and str(t.get("management_blockers")).strip()) for t in f_tasks)
+
+            opportunities.append({
+                "deal_id": first_t.get("related_deal_id"),
+                "deal_name": first_t.get("deal_name") or key,
+                "customer_name": first_t.get("customer_name") or "Deliverables",
+                "stage": "Active Execution",
+                "estimated_value": 0,
+                "primary_vendors": first_t.get("vendor_domain") or "General",
+                "assigned_presales": first_t.get("assigned_to") or "Presales 1",
+                "kind": kind,
+                "has_followup_tasks": len(f_tasks) > 0,
+                "followup_tasks_count": len(f_tasks),
+                "completed_tasks_count": len(c_tasks),
+                "has_blocker": has_blk,
+                "followup_tasks": f_tasks,
+                "completed_tasks": c_tasks,
+            })
+
+    # Group by the 3 kinds
+    rfp_ownership = [o for o in opportunities if o["kind"] == "RFP_OWNERSHIP"]
+    rfp_distributed = [o for o in opportunities if o["kind"] == "RFP_DISTRIBUTED_SCOPE"]
+    general_action = [o for o in opportunities if o["kind"] == "GENERAL_ACTION"]
+
+    rfp_ownership_followup = [o for o in rfp_ownership if o["has_followup_tasks"]]
+    rfp_distributed_followup = [o for o in rfp_distributed if o["has_followup_tasks"]]
+    general_action_followup = [o for o in general_action if o["has_followup_tasks"]]
+
+    return {
+        "status": "success",
+        "counts": {
+            "total_opportunities": len(opportunities),
+            "with_followup_tasks": sum(1 for o in opportunities if o["has_followup_tasks"]),
+            "rfp_ownership_count": len(rfp_ownership),
+            "rfp_ownership_followup_count": len(rfp_ownership_followup),
+            "rfp_distributed_scope_count": len(rfp_distributed),
+            "rfp_distributed_scope_followup_count": len(rfp_distributed_followup),
+            "general_action_count": len(general_action),
+            "general_action_followup_count": len(general_action_followup),
+            "with_blockers_count": sum(1 for o in opportunities if o["has_blocker"]),
+        },
+        "kinds": {
+            "RFP_OWNERSHIP": {
+                "name_en": "RFP Ownership",
+                "name_ar": "مناقصات رئيسية وتكليف كامل",
+                "badge": "badge-rfp-owner",
+                "description": "Prime tenders owned end-to-end requiring technical architecture, RFP response submission, and bid management.",
+                "opportunities": rfp_ownership
+            },
+            "RFP_DISTRIBUTED_SCOPE": {
+                "name_en": "RFP Distributed Scope",
+                "name_ar": "نطاق موزع وشراكات التقنية",
+                "badge": "badge-rfp-dist",
+                "description": "Multi-vendor partner tenders (HPE, Dell, Veeam, Nutanix, VMware) requiring partner discounts, BoQ validations, and distributor scopes.",
+                "opportunities": rfp_distributed
+            },
+            "GENERAL_ACTION": {
+                "name_en": "General Action",
+                "name_ar": "إجراءات وتجارب فنية عامة",
+                "badge": "badge-rfp-action",
+                "description": "PoC testing, hardware sizing, licensing migrations, and operational presales support deliverables.",
+                "opportunities": general_action
+            }
+        },
+        "all_opportunities": opportunities
+    }
+
+
 @app.get("/api/pre-meeting-questions")
 async def get_pre_meeting_questions():
     """
@@ -844,6 +1110,63 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         .dot-red { background-color: #ef4444; }
         .badge-presales1 { background-color: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.3); }
         .badge-presales2 { background-color: rgba(139, 92, 246, 0.2); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.3); }
+
+        /* Modern Tabs Styling */
+        .nav-tabs-custom .nav-link {
+            color: #94a3b8;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 7px 14px;
+            transition: all 0.2s ease;
+        }
+        .nav-tabs-custom .nav-link:hover {
+            color: #e2e8f0;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .nav-tabs-custom .nav-link.active {
+            color: #ffffff !important;
+            background: #2563eb !important;
+            border-color: #2563eb !important;
+            box-shadow: 0 2px 10px rgba(37, 99, 235, 0.4);
+        }
+
+        /* 3 Kinds Badges */
+        .badge-rfp-owner {
+            background-color: rgba(59, 130, 246, 0.18);
+            color: #60a5fa;
+            border: 1px solid rgba(59, 130, 246, 0.45);
+        }
+        .badge-rfp-dist {
+            background-color: rgba(16, 185, 129, 0.18);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.45);
+        }
+        .badge-rfp-action {
+            background-color: rgba(245, 158, 11, 0.18);
+            color: #fbbf24;
+            border: 1px solid rgba(245, 158, 11, 0.45);
+        }
+        .badge-blocker {
+            background-color: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.5);
+        }
+        .kind-filter-btn {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .modal.show {
+            display: block !important;
+        }
+        .modal-backdrop.show {
+            opacity: 0.7;
+        }
     </style>
 </head>
 <body>
@@ -872,7 +1195,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <span>Tasks API (8001)</span>
                 </span>
                 <span class="badge bg-primary-subtle text-primary border px-2 py-2">
-                    <i class="bi bi-cpu me-1"></i>Gemini 3.6 Flash
+                    <i class="bi bi-cpu me-1"></i>Gemini Flash
                 </span>
                 <button class="btn btn-sm btn-outline-light d-flex align-items-center gap-1" onclick="openApiKeyModal()">
                     <i class="bi bi-key-fill text-warning"></i>
@@ -885,23 +1208,99 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <div class="container-fluid px-4 pb-5">
         <div class="row g-4">
 
-            <!-- LEFT COLUMN: Pre-Meeting State Audit & Question Generator -->
+            <!-- LEFT COLUMN: Operations Tabs (Audit State, Follow-up Deals 3 Kinds, Standup Questions) -->
             <div class="col-12 col-xl-5">
-                <div class="app-card p-4 h-100">
-                    <div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom border-secondary border-opacity-25">
-                        <div>
-                            <h6 class="fw-bold text-white mb-1"><i class="bi bi-clipboard2-pulse text-primary me-2"></i>Pre-Meeting State Audit</h6>
-                            <div class="small text-muted">Auto-audits deals & tasks to generate targeted questions</div>
+                <div class="app-card p-3 p-md-4 h-100 d-flex flex-column">
+                    <!-- Tab Navigation Header -->
+                    <ul class="nav nav-pills nav-tabs-custom gap-2 mb-3 pb-2 border-bottom border-secondary border-opacity-25" id="agentTabs" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" id="tab-audit-btn" onclick="switchTab('audit')" type="button">
+                                <i class="bi bi-speedometer2 me-1"></i>Audit State
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-opps-btn" onclick="switchTab('opps')" type="button">
+                                <i class="bi bi-diagram-3 me-1"></i>Follow-up Deals (3 Kinds)
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" id="tab-questions-btn" onclick="switchTab('questions')" type="button">
+                                <i class="bi bi-chat-quote me-1"></i>Standup Questions
+                            </button>
+                        </li>
+                    </ul>
+
+                    <!-- TAB 1: Audit State Pane (No auto-execute on page load!) -->
+                    <div id="pane-audit" class="flex-grow-1 d-flex flex-column">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <div>
+                                <h6 class="fw-bold text-white mb-0"><i class="bi bi-clipboard2-data text-primary me-2"></i>Pipeline & Tasks Audit State</h6>
+                                <div class="small text-muted">Audits active CRM deals, tasks health, and blockers</div>
+                            </div>
+                            <button class="btn btn-sm btn-primary d-flex align-items-center gap-1" onclick="runAuditState()" id="runAuditBtn">
+                                <i class="bi bi-lightning-charge-fill"></i> Execute State Audit
+                            </button>
                         </div>
-                        <button class="btn btn-sm btn-primary d-flex align-items-center gap-1" onclick="loadPreMeetingQuestions()">
-                            <i class="bi bi-lightning-charge-fill"></i> Audit State
-                        </button>
+                        <div id="auditContentContainer" class="flex-grow-1 overflow-auto" style="max-height: 680px;">
+                            <div class="text-center py-5 text-muted">
+                                <i class="bi bi-speedometer2 fs-1 d-block mb-2 text-secondary"></i>
+                                Click <strong>"Execute State Audit"</strong> to query current pipeline metrics, deliverables status, and active roadblocks.
+                            </div>
+                        </div>
                     </div>
 
-                    <div id="questionsContainer">
-                        <div class="text-center py-5 text-muted">
-                            <i class="bi bi-chat-left-dots fs-1 d-block mb-2 text-secondary"></i>
-                            Click <strong>"Audit State"</strong> to query current pipeline & generate bilingual standup questions.
+                    <!-- TAB 2: Follow-up Opportunities (3 Kinds) Pane -->
+                    <div id="pane-opps" class="d-none flex-grow-1 d-flex flex-column">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <div>
+                                <h6 class="fw-bold text-white mb-0"><i class="bi bi-kanban text-info me-2"></i>Previous Opportunities (3 Kinds)</h6>
+                                <div class="small text-muted">Classified by kind with pending follow-up deliverables</div>
+                            </div>
+                            <button class="btn btn-sm btn-outline-info d-flex align-items-center gap-1" onclick="loadFollowupOpportunities()" id="loadOppsBtn">
+                                <i class="bi bi-arrow-repeat"></i> Refresh
+                            </button>
+                        </div>
+
+                        <!-- 3 Kinds Filter Toolbar -->
+                        <div class="d-flex flex-wrap gap-1 mb-3 pt-1">
+                            <button class="btn btn-sm btn-primary kind-filter-btn" id="filter-btn-ALL" onclick="filterFollowupByKind('ALL')">
+                                All (<span id="count-ALL">0</span>)
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-RFP_OWNERSHIP" onclick="filterFollowupByKind('RFP_OWNERSHIP')">
+                                <span class="badge badge-rfp-owner me-1">RFP Ownership</span>(<span id="count-RFP_OWNERSHIP">0</span>)
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-RFP_DISTRIBUTED_SCOPE" onclick="filterFollowupByKind('RFP_DISTRIBUTED_SCOPE')">
+                                <span class="badge badge-rfp-dist me-1">Distributed Scope</span>(<span id="count-RFP_DISTRIBUTED_SCOPE">0</span>)
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-GENERAL_ACTION" onclick="filterFollowupByKind('GENERAL_ACTION')">
+                                <span class="badge badge-rfp-action me-1">General Action</span>(<span id="count-GENERAL_ACTION">0</span>)
+                            </button>
+                        </div>
+
+                        <div id="oppsContentContainer" class="flex-grow-1 overflow-auto" style="max-height: 640px;">
+                            <div class="text-center py-5 text-muted">
+                                <i class="bi bi-diagram-3 fs-1 d-block mb-2 text-secondary"></i>
+                                Click <strong>"Refresh"</strong> to categorize deals into the 3 kinds and identify pending follow-up deliverables.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- TAB 3: Questions Pane (Manual generate button only) -->
+                    <div id="pane-questions" class="d-none flex-grow-1 d-flex flex-column">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <div>
+                                <h6 class="fw-bold text-white mb-0"><i class="bi bi-chat-left-dots text-warning me-2"></i>Bilingual Standup Questions</h6>
+                                <div class="small text-muted">Targeted questions for presales engineers on tasks needing follow-up</div>
+                            </div>
+                            <button class="btn btn-sm btn-outline-warning d-flex align-items-center gap-1" onclick="loadPreMeetingQuestions()" id="loadQuestionsBtn">
+                                <i class="bi bi-lightning-charge-fill"></i> Generate Questions
+                            </button>
+                        </div>
+                        <div id="questionsContainer" class="flex-grow-1 overflow-auto" style="max-height: 680px;">
+                            <div class="text-center py-5 text-muted">
+                                <i class="bi bi-chat-quote fs-1 d-block mb-2 text-secondary"></i>
+                                Click <strong>"Generate Questions"</strong> to query current pipeline & generate bilingual standup questions.
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -916,7 +1315,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <!-- Mic & Recording Section -->
                     <div class="text-center py-3">
                         <div class="d-flex justify-content-center mb-3">
-                            <button id="recordBtn" class="mic-button mic-idle" onclick="toggleRecording()">
+                            <button id="recordBtn" class="mic-button mic-idle" onclick="toggleRecording()" title="Click to Start/Stop Recording">
                                 <i class="bi bi-mic-fill" id="micIcon"></i>
                             </button>
                         </div>
@@ -1001,42 +1400,64 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- API Key Configuration Modal -->
-    <div class="modal fade" id="apiKeyModal" tabindex="-1">
+    <!-- API Key Configuration Modal (Supports Bootstrap & Native Fallback) -->
+    <div class="modal fade" id="apiKeyModal" tabindex="-1" aria-hidden="true" style="display:none;">
         <div class="modal-dialog">
             <div class="modal-content bg-dark text-light border-secondary">
                 <div class="modal-header border-secondary">
                     <h6 class="modal-title fw-bold"><i class="bi bi-key-fill text-warning me-2"></i>Configure Gemini API Key</h6>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    <button type="button" class="btn-close btn-close-white" onclick="closeApiKeyModal()" aria-label="Close"></button>
                 </div>
                 <div class="modal-body">
-                    <p class="small text-muted">Enter your Google Gemini API key to enable native audio speech recognition and dynamic generation via Gemini 2.5 Flash.</p>
+                    <p class="small text-muted">Enter your Google Gemini API key to enable native audio speech recognition and dynamic generation via Gemini Flash models.</p>
                     <input type="password" id="geminiApiKeyInput" class="form-control mb-2" placeholder="AIzaSy...">
+                    <div class="small text-secondary"><i class="bi bi-shield-check me-1 text-success"></i>Saved locally in <code>.env</code> file.</div>
                 </div>
                 <div class="modal-footer border-secondary">
-                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeApiKeyModal()">Close</button>
                     <button type="button" class="btn btn-primary btn-sm" onclick="saveApiKey()">Save API Key</button>
                 </div>
             </div>
         </div>
     </div>
+    <div id="customModalBackdrop" class="modal-backdrop fade show" style="display:none;" onclick="closeApiKeyModal()"></div>
 
     <!-- Bootstrap JS Bundle -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
-        let mediaRecorder;
+        let mediaRecorder = null;
         let recordedChunks = [];
-        let timerInterval;
+        let timerInterval = null;
         let secondsElapsed = 0;
         let recordedBlob = null;
-        const apiKeyModal = new bootstrap.Modal(document.getElementById('apiKeyModal'));
+        let apiKeyModalInstance = null;
+        let currentFollowupData = null;
+        let activeKindFilter = 'ALL';
 
+        // Initialize strictly with health check. ZERO auto-generation of questions or audits on page load!
         document.addEventListener('DOMContentLoaded', () => {
             checkHealth();
-            loadPreMeetingQuestions();
         });
 
+        // ---------------------------------------------------------------------
+        // Tab Navigation
+        // ---------------------------------------------------------------------
+        function switchTab(tabKey) {
+            // Update Tab Nav Buttons
+            document.getElementById('tab-audit-btn').classList.toggle('active', tabKey === 'audit');
+            document.getElementById('tab-opps-btn').classList.toggle('active', tabKey === 'opps');
+            document.getElementById('tab-questions-btn').classList.toggle('active', tabKey === 'questions');
+
+            // Toggle Panes
+            document.getElementById('pane-audit').classList.toggle('d-none', tabKey !== 'audit');
+            document.getElementById('pane-opps').classList.toggle('d-none', tabKey !== 'opps');
+            document.getElementById('pane-questions').classList.toggle('d-none', tabKey !== 'questions');
+        }
+
+        // ---------------------------------------------------------------------
+        // Health Checking
+        // ---------------------------------------------------------------------
         async function checkHealth() {
             try {
                 const res = await fetch('/api/health');
@@ -1051,23 +1472,305 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             }
         }
 
+        // ---------------------------------------------------------------------
+        // TAB 1: Audit State
+        // ---------------------------------------------------------------------
+        async function runAuditState() {
+            const btn = document.getElementById('runAuditBtn');
+            const container = document.getElementById('auditContentContainer');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Auditing...';
+            container.innerHTML = '<div class="text-center py-5 text-muted"><div class="spinner-border text-primary mb-2"></div><div>Executing pipeline & deliverables audit...</div></div>';
+
+            try {
+                const res = await fetch('/api/audit-state');
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Audit state query failed');
+                }
+                renderAuditState(data);
+            } catch (err) {
+                container.innerHTML = `<div class="alert alert-danger small p-3"><i class="bi bi-exclamation-triangle-fill me-2"></i>Failed to audit state: ${err.message}. Ensure CRM (8000) and Tasks (8001) are running.</div>`;
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-lightning-charge-fill me-1"></i>Execute State Audit';
+            }
+        }
+
+        function renderAuditState(data) {
+            const container = document.getElementById('auditContentContainer');
+            const s = data.summary || {};
+            const stages = data.stage_distribution || {};
+            const vendors = data.vendor_distribution || {};
+            const blockers = data.blockers || [];
+            const highPri = data.high_priority_tasks || [];
+
+            let html = `
+                <!-- Metrics Grid -->
+                <div class="row g-2 mb-3">
+                    <div class="col-6 col-sm-3">
+                        <div class="p-2 bg-dark rounded-3 border border-secondary border-opacity-25 text-center">
+                            <div class="small text-muted">Total Deals</div>
+                            <div class="fs-5 fw-bold text-white">${s.total_deals || 0}</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-sm-3">
+                        <div class="p-2 bg-dark rounded-3 border border-secondary border-opacity-25 text-center">
+                            <div class="small text-muted">Pipeline Value</div>
+                            <div class="fs-5 fw-bold text-info">${Number(s.total_pipeline_value || 0).toLocaleString()} SAR</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-sm-3">
+                        <div class="p-2 bg-dark rounded-3 border border-secondary border-opacity-25 text-center">
+                            <div class="small text-muted">Open Tasks</div>
+                            <div class="fs-5 fw-bold text-warning">${s.open_tasks || 0}</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-sm-3">
+                        <div class="p-2 bg-dark rounded-3 border border-secondary border-opacity-25 text-center">
+                            <div class="small text-muted">Completed</div>
+                            <div class="fs-5 fw-bold text-success">${s.completed_tasks || 0}</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Active Roadblocks Banner if present
+            if (blockers.length > 0) {
+                html += `
+                    <div class="alert alert-danger p-2 mb-3 small">
+                        <div class="fw-bold mb-1"><i class="bi bi-shield-fill-exclamation me-1"></i>Active Roadblocks & Vendor Holds (${blockers.length})</div>
+                        <ul class="mb-0 ps-3">
+                            ${blockers.map(b => `<li><strong>${b.task_title}</strong> (${b.vendor_domain}): ${b.management_blockers || b.status}</li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            // High Priority Tasks
+            if (highPri.length > 0) {
+                html += `
+                    <div class="mb-3">
+                        <div class="small text-uppercase fw-bold text-secondary mb-1">
+                            <i class="bi bi-fire text-danger me-1"></i>High Priority Deliverables (${highPri.length})
+                        </div>
+                        <div class="list-group list-group-flush border border-secondary border-opacity-25 rounded-3">
+                            ${highPri.map(t => `
+                                <div class="list-group-item bg-dark text-light p-2 border-secondary border-opacity-25 d-flex justify-content-between align-items-center">
+                                    <div class="me-2 text-truncate" style="max-width: 70%;">
+                                        <div class="fw-semibold small">${t.task_title}</div>
+                                        <div class="text-muted" style="font-size: 0.72rem;">${t.deal_name || 'Deal'} • ${t.assigned_to || 'Assigned'}</div>
+                                    </div>
+                                    <span class="badge bg-danger-subtle text-danger border border-danger-subtle">${t.status}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Breakdown Sections
+            html += `
+                <div class="row g-2">
+                    <div class="col-12 col-md-6">
+                        <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 h-100">
+                            <div class="small text-uppercase fw-bold text-secondary mb-2"><i class="bi bi-funnel me-1"></i>Deals by Stage</div>
+                            ${Object.entries(stages).map(([st, cnt]) => `
+                                <div class="d-flex justify-content-between align-items-center small py-1 border-bottom border-secondary border-opacity-10">
+                                    <span class="text-secondary">${st}</span>
+                                    <span class="badge bg-secondary">${cnt}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                    <div class="col-12 col-md-6">
+                        <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 h-100">
+                            <div class="small text-uppercase fw-bold text-secondary mb-2"><i class="bi bi-building me-1"></i>Tasks by Vendor Domain</div>
+                            ${Object.entries(vendors).map(([vd, cnt]) => `
+                                <div class="d-flex justify-content-between align-items-center small py-1 border-bottom border-secondary border-opacity-10">
+                                    <span class="text-secondary">${vd}</span>
+                                    <span class="badge bg-info bg-opacity-25 text-info">${cnt}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            container.innerHTML = html;
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 2: Follow-up Opportunities (3 Kinds)
+        // ---------------------------------------------------------------------
+        async function loadFollowupOpportunities() {
+            const btn = document.getElementById('loadOppsBtn');
+            const container = document.getElementById('oppsContentContainer');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Loading...';
+            container.innerHTML = '<div class="text-center py-5 text-muted"><div class="spinner-border text-info mb-2"></div><div>Categorizing deals into 3 kinds & checking follow-up tasks...</div></div>';
+
+            try {
+                const res = await fetch('/api/followup-opportunities');
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Failed to fetch opportunities');
+                }
+                currentFollowupData = data;
+                
+                // Update badge counts on filter buttons
+                const c = data.counts || {};
+                document.getElementById('count-ALL').textContent = c.total_opportunities || 0;
+                document.getElementById('count-RFP_OWNERSHIP').textContent = `${c.rfp_ownership_followup_count || 0}/${c.rfp_ownership_count || 0}`;
+                document.getElementById('count-RFP_DISTRIBUTED_SCOPE').textContent = `${c.rfp_distributed_scope_followup_count || 0}/${c.rfp_distributed_scope_count || 0}`;
+                document.getElementById('count-GENERAL_ACTION').textContent = `${c.general_action_followup_count || 0}/${c.general_action_count || 0}`;
+
+                renderFollowupOpportunities(activeKindFilter);
+            } catch (err) {
+                container.innerHTML = `<div class="alert alert-danger small p-3"><i class="bi bi-exclamation-triangle-fill me-2"></i>Failed to load opportunities: ${err.message}.</div>`;
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>Refresh';
+            }
+        }
+
+        function filterFollowupByKind(kind) {
+            activeKindFilter = kind;
+            ['ALL', 'RFP_OWNERSHIP', 'RFP_DISTRIBUTED_SCOPE', 'GENERAL_ACTION'].forEach(k => {
+                const btn = document.getElementById('filter-btn-' + k);
+                if (btn) {
+                    if (k === kind) {
+                        btn.className = 'btn btn-sm btn-primary kind-filter-btn';
+                    } else {
+                        btn.className = 'btn btn-sm btn-outline-secondary kind-filter-btn';
+                    }
+                }
+            });
+            renderFollowupOpportunities(kind);
+        }
+
+        function renderFollowupOpportunities(kindFilter) {
+            const container = document.getElementById('oppsContentContainer');
+            if (!currentFollowupData || !currentFollowupData.all_opportunities) {
+                container.innerHTML = '<div class="text-muted small text-center py-4">No opportunities data loaded.</div>';
+                return;
+            }
+
+            let opps = currentFollowupData.all_opportunities;
+            if (kindFilter && kindFilter !== 'ALL') {
+                opps = opps.filter(o => o.kind === kindFilter);
+            }
+
+            if (!opps.length) {
+                container.innerHTML = `<div class="text-muted small text-center py-5"><i class="bi bi-inbox fs-2 d-block mb-2"></i>No deals found matching filter "${kindFilter}".</div>`;
+                return;
+            }
+
+            container.innerHTML = opps.map(o => {
+                let kindBadgeClass = 'badge-rfp-action';
+                let kindName = 'General Action';
+                let kindNameAr = 'إجراءات فنية عامة';
+                if (o.kind === 'RFP_OWNERSHIP') {
+                    kindBadgeClass = 'badge-rfp-owner';
+                    kindName = 'RFP Ownership';
+                    kindNameAr = 'مناقصة رئيسية';
+                } else if (o.kind === 'RFP_DISTRIBUTED_SCOPE') {
+                    kindBadgeClass = 'badge-rfp-dist';
+                    kindName = 'RFP Distributed Scope';
+                    kindNameAr = 'نطاق موزع وشراكات';
+                }
+
+                const followCount = o.followup_tasks_count || 0;
+                const statusBadge = followCount > 0
+                    ? `<span class="badge bg-warning text-dark"><i class="bi bi-clock-history me-1"></i>Follow-up Needed (${followCount})</span>`
+                    : `<span class="badge bg-success"><i class="bi bi-check2-circle me-1"></i>All Tasks Done</span>`;
+
+                const blockerBadge = o.has_blocker
+                    ? `<span class="badge badge-blocker ms-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>Blocked</span>`
+                    : '';
+
+                // Render tasks needing follow-up
+                let tasksHtml = '';
+                if (o.followup_tasks && o.followup_tasks.length > 0) {
+                    tasksHtml = `
+                        <div class="mt-2 pt-2 border-top border-secondary border-opacity-25">
+                            <div class="text-secondary fw-semibold mb-1" style="font-size: 0.75rem;">
+                                <i class="bi bi-arrow-return-right me-1"></i>Active Tasks to Follow Up About:
+                            </div>
+                            <div class="d-flex flex-column gap-1">
+                                ${o.followup_tasks.map(t => `
+                                    <div class="p-2 rounded-2 bg-black bg-opacity-30 border border-secondary border-opacity-15 small">
+                                        <div class="d-flex justify-content-between align-items-start">
+                                            <span class="text-light fw-medium">${t.task_title}</span>
+                                            <span class="badge ${t.priority === 'High' ? 'bg-danger' : 'bg-secondary'} ms-2">${t.status}</span>
+                                        </div>
+                                        <div class="d-flex justify-content-between align-items-center mt-1 text-muted" style="font-size: 0.72rem;">
+                                            <span><i class="bi bi-person me-1"></i>${t.assigned_to || 'Assigned'} • <i class="bi bi-layers me-1"></i>${t.vendor_domain || 'General'}</span>
+                                            ${t.is_blocked || t.management_blockers ? `<span class="text-danger"><i class="bi bi-slash-circle me-1"></i>${t.management_blockers || 'Blocked'}</span>` : ''}
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+
+                return `
+                    <div class="card bg-dark bg-opacity-60 border border-secondary border-opacity-30 p-3 mb-3" style="border-radius: 11px;">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div>
+                                <span class="badge ${kindBadgeClass} me-1">${kindName}</span>
+                                <span class="font-arabic small text-muted">(${kindNameAr})</span>
+                            </div>
+                            <div>
+                                ${statusBadge}
+                                ${blockerBadge}
+                            </div>
+                        </div>
+
+                        <div class="d-flex justify-content-between align-items-baseline">
+                            <h6 class="text-white fw-bold mb-1">${o.deal_name}</h6>
+                            <span class="text-info fw-semibold small">${Number(o.estimated_value || 0).toLocaleString()} SAR</span>
+                        </div>
+                        <div class="small text-muted mb-2">
+                            <i class="bi bi-building me-1"></i>${o.customer_name || 'Customer'} • 
+                            <i class="bi bi-diagram-2 me-1"></i>${o.stage} • 
+                            <i class="bi bi-cpu me-1"></i>${o.primary_vendors || 'General'} • 
+                            <i class="bi bi-person-badge me-1"></i>${o.assigned_presales}
+                        </div>
+
+                        ${tasksHtml}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // ---------------------------------------------------------------------
+        // TAB 3: Standup Questions Generator (Manual Trigger)
+        // ---------------------------------------------------------------------
         async function loadPreMeetingQuestions() {
+            const btn = document.getElementById('loadQuestionsBtn');
             const container = document.getElementById('questionsContainer');
-            container.innerHTML = '<div class="text-center py-4 text-muted"><div class="spinner-border spinner-border-sm text-primary me-2"></div>Auditing active pipeline & tasks...</div>';
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Generating...';
+            container.innerHTML = '<div class="text-center py-5 text-muted"><div class="spinner-border text-warning mb-2"></div><div>Analyzing open deliverables & generating bilingual questions...</div></div>';
 
             try {
                 const res = await fetch('/api/pre-meeting-questions');
                 const data = await res.json();
                 renderQuestions(data.questions || []);
             } catch (err) {
-                container.innerHTML = '<div class="alert alert-danger small">Failed to load questions. Please ensure CRM (8000) and Tasks (8001) are running.</div>';
+                container.innerHTML = '<div class="alert alert-danger small p-3">Failed to load questions. Please ensure CRM (8000) and Tasks (8001) are running.</div>';
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-lightning-charge-fill me-1"></i>Generate Questions';
             }
         }
 
         function renderQuestions(questions) {
             const container = document.getElementById('questionsContainer');
             if (!questions.length) {
-                container.innerHTML = '<div class="text-muted small">No questions generated.</div>';
+                container.innerHTML = '<div class="text-muted small text-center py-5">No open deliverables requiring follow-up questions.</div>';
                 return;
             }
 
@@ -1093,6 +1796,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             }).join('');
         }
 
+        // ---------------------------------------------------------------------
+        // Multimodal Microphone Recording (Resilient Dual-stage getUserMedia)
+        // ---------------------------------------------------------------------
         async function toggleRecording() {
             const recordBtn = document.getElementById('recordBtn');
             const micIcon = document.getElementById('micIcon');
@@ -1101,28 +1807,58 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             if (!mediaRecorder || mediaRecorder.state === 'inactive') {
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    prompt.innerHTML = '<span class="text-info"><i class="bi bi-hourglass-split me-1"></i>Accessing microphone...</span>';
+                    
+                    let stream = null;
+                    try {
+                        stream = await navigator.mediaDevices.getUserMedia({
+                            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+                        });
+                    } catch (constraintErr) {
+                        console.warn("Retrying microphone with basic constraints:", constraintErr);
+                        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    }
+
                     recordedChunks = [];
-                    mediaRecorder = new MediaRecorder(stream);
+                    let mimeType = 'audio/webm';
+                    if (!MediaRecorder.isTypeSupported('audio/webm')) {
+                        if (MediaRecorder.isTypeSupported('audio/mp4')) {
+                            mimeType = 'audio/mp4';
+                        } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+                            mimeType = 'audio/ogg';
+                        } else {
+                            mimeType = '';
+                        }
+                    }
+
+                    mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
 
                     mediaRecorder.ondataavailable = e => {
-                        if (e.data.size > 0) recordedChunks.push(e.data);
+                        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
                     };
 
                     mediaRecorder.onstop = () => {
-                        recordedBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+                        // Release hardware mic tracks
+                        try {
+                            stream.getTracks().forEach(track => track.stop());
+                        } catch(e) {}
+
+                        const actualType = mediaRecorder.mimeType || 'audio/webm';
+                        recordedBlob = new Blob(recordedChunks, { type: actualType });
                         const audioUrl = URL.createObjectURL(recordedBlob);
                         document.getElementById('audioPlayer').src = audioUrl;
                         document.getElementById('audioPlaybackContainer').classList.remove('d-none');
-                        prompt.textContent = "Recording complete. Review playback or click analyze.";
+                        prompt.innerHTML = '<span class="text-success fw-semibold"><i class="bi bi-check2-circle me-1"></i>Recording complete. Play audio or click "Analyze Speech & Sync APIs".</span>';
                     };
 
-                    mediaRecorder.start();
+                    mediaRecorder.start(250);
                     recordBtn.className = 'mic-button mic-recording';
                     micIcon.className = 'bi bi-stop-fill';
-                    prompt.textContent = "Recording standup meeting... Speak in Arabic / English.";
+                    prompt.innerHTML = '<span class="text-danger fw-bold"><i class="bi bi-record-circle me-1"></i>Recording standup meeting... Speak in Arabic / English. Click red button to stop.</span>';
                     
                     secondsElapsed = 0;
+                    timer.textContent = "00:00";
+                    if (timerInterval) clearInterval(timerInterval);
                     timerInterval = setInterval(() => {
                         secondsElapsed++;
                         const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
@@ -1130,11 +1866,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         timer.textContent = `${mins}:${secs}`;
                     }, 1000);
                 } catch (err) {
-                    alert('Microphone access denied or not available: ' + err.message);
+                    console.error("Microphone access error:", err);
+                    recordBtn.className = 'mic-button mic-idle';
+                    micIcon.className = 'bi bi-mic-fill';
+                    prompt.innerHTML = `<span class="text-danger"><i class="bi bi-exclamation-triangle-fill me-1"></i>Mic Error: ${err.message}. Please allow mic permissions in browser settings or use file upload below.</span>`;
                 }
             } else {
-                mediaRecorder.stop();
-                clearInterval(timerInterval);
+                try {
+                    mediaRecorder.stop();
+                } catch(e) {
+                    console.warn("Error stopping mediaRecorder:", e);
+                }
+                if (timerInterval) clearInterval(timerInterval);
                 recordBtn.className = 'mic-button mic-idle';
                 micIcon.className = 'bi bi-mic-fill';
             }
@@ -1160,7 +1903,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         async function uploadAndAnalyze(blobOrFile, filename) {
             const btn = document.getElementById('processAudioBtn');
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Gemini 3.6 Flash Processing Speech & Syncing APIs...';
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Gemini Processing Speech & Syncing APIs...';
 
             const formData = new FormData();
             formData.append('file', blobOrFile, filename);
@@ -1225,27 +1968,63 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             resultsCard.scrollIntoView({ behavior: 'smooth' });
         }
 
+        // ---------------------------------------------------------------------
+        // Resilient Modal Controller (Works with Bootstrap or Pure CSS Fallback)
+        // ---------------------------------------------------------------------
         function openApiKeyModal() {
-            apiKeyModal.show();
+            const modalEl = document.getElementById('apiKeyModal');
+            if (window.bootstrap && window.bootstrap.Modal) {
+                try {
+                    if (!apiKeyModalInstance) {
+                        apiKeyModalInstance = new bootstrap.Modal(modalEl);
+                    }
+                    apiKeyModalInstance.show();
+                    return;
+                } catch (e) {
+                    console.warn("Bootstrap modal failed, using fallback:", e);
+                }
+            }
+            // Fallback display
+            modalEl.classList.add('show');
+            modalEl.style.display = 'block';
+            const backdrop = document.getElementById('customModalBackdrop');
+            if (backdrop) backdrop.style.display = 'block';
+        }
+
+        function closeApiKeyModal() {
+            const modalEl = document.getElementById('apiKeyModal');
+            if (apiKeyModalInstance) {
+                try {
+                    apiKeyModalInstance.hide();
+                } catch(e) {}
+            }
+            modalEl.classList.remove('show');
+            modalEl.style.display = 'none';
+            const backdrop = document.getElementById('customModalBackdrop');
+            if (backdrop) backdrop.style.display = 'none';
         }
 
         async function saveApiKey() {
             const key = document.getElementById('geminiApiKeyInput').value.trim();
             if (!key) return;
 
-            const res = await fetch('/api/set-api-key', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ api_key: key })
-            });
+            try {
+                const res = await fetch('/api/set-api-key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
 
-            if (res.ok) {
-                apiKeyModal.hide();
-                document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
-                await checkHealth();
-                alert('Gemini API key configured successfully!');
-            } else {
-                alert('Failed to save API key');
+                if (res.ok) {
+                    closeApiKeyModal();
+                    document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
+                    await checkHealth();
+                    alert('Gemini API key configured successfully!');
+                } else {
+                    alert('Failed to save API key');
+                }
+            } catch (e) {
+                alert('Network error saving API key: ' + e.message);
             }
         }
     </script>

@@ -1508,6 +1508,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             color: #ffffff;
             box-shadow: 0 2px 10px rgba(59, 130, 246, 0.4);
         }
+        .modal.show {
+            display: block !important;
+        }
+        .modal-backdrop.show {
+            opacity: 0.7;
+        }
     </style>
 </head>
 <body>
@@ -1555,17 +1561,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <!-- Tab Navigation Header -->
                     <ul class="nav nav-pills nav-fill mb-3 p-1 bg-dark bg-opacity-75 rounded-3 border border-secondary border-opacity-25" id="agentLeftTabs" role="tablist">
                         <li class="nav-item" role="presentation">
-                            <button class="nav-link active py-2 px-2 small fw-semibold" id="tab-audit-btn" data-bs-toggle="pill" data-bs-target="#pane-audit" type="button" role="tab">
+                            <button class="nav-link active py-2 px-2 small fw-semibold" id="tab-audit-btn" data-bs-toggle="pill" data-bs-target="#pane-audit" onclick="switchTab('tab-audit-btn', 'pane-audit')" type="button" role="tab">
                                 <i class="bi bi-speedometer2 me-1"></i>Audit State
                             </button>
                         </li>
                         <li class="nav-item" role="presentation">
-                            <button class="nav-link py-2 px-2 small fw-semibold" id="tab-opps-btn" data-bs-toggle="pill" data-bs-target="#pane-opps" type="button" role="tab">
+                            <button class="nav-link py-2 px-2 small fw-semibold" id="tab-opps-btn" data-bs-toggle="pill" data-bs-target="#pane-opps" onclick="switchTab('tab-opps-btn', 'pane-opps')" type="button" role="tab">
                                 <i class="bi bi-diagram-3 me-1"></i>Follow-Up Deals
                             </button>
                         </li>
                         <li class="nav-item" role="presentation">
-                            <button class="nav-link py-2 px-2 small fw-semibold" id="tab-questions-btn" data-bs-toggle="pill" data-bs-target="#pane-questions" type="button" role="tab">
+                            <button class="nav-link py-2 px-2 small fw-semibold" id="tab-questions-btn" data-bs-toggle="pill" data-bs-target="#pane-questions" onclick="switchTab('tab-questions-btn', 'pane-questions')" type="button" role="tab">
                                 <i class="bi bi-patch-question me-1"></i>Questions
                             </button>
                         </li>
@@ -1781,24 +1787,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
 
     <!-- API Key Configuration Modal -->
-    <div class="modal fade" id="apiKeyModal" tabindex="-1">
-        <div class="modal-dialog">
-            <div class="modal-content bg-dark text-light border-secondary">
+    <div class="modal fade" id="apiKeyModal" tabindex="-1" style="display: none;">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content bg-dark text-light border border-secondary shadow-lg">
                 <div class="modal-header border-secondary">
                     <h6 class="modal-title fw-bold"><i class="bi bi-key-fill text-warning me-2"></i>Configure Gemini API Key</h6>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="closeApiKeyModal()"></button>
                 </div>
                 <div class="modal-body">
                     <p class="small text-muted">Enter your Google Gemini API key to enable native audio speech recognition and dynamic generation via Gemini 2.5 Flash.</p>
                     <input type="password" id="geminiApiKeyInput" class="form-control mb-2" placeholder="AIzaSy...">
                 </div>
                 <div class="modal-footer border-secondary">
-                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal" onclick="closeApiKeyModal()">Close</button>
                     <button type="button" class="btn btn-primary btn-sm" onclick="saveApiKey()">Save API Key</button>
                 </div>
             </div>
         </div>
     </div>
+    <div id="customModalBackdrop" class="modal-backdrop fade show" style="display: none; z-index: 1040;" onclick="closeApiKeyModal()"></div>
 
     <!-- Bootstrap JS Bundle -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -1813,7 +1820,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         let isInitializingMedia = false;
         let speechRecognizer = null;
         let liveSpeechTranscript = "";
-        const apiKeyModal = new bootstrap.Modal(document.getElementById('apiKeyModal'));
+        let apiKeyModalInstance = null;
+
+        // Resilient Tab Switcher (Works with or without Bootstrap JS)
+        function switchTab(tabId, paneId) {
+            document.querySelectorAll('#agentLeftTabs .nav-link').forEach(btn => {
+                btn.classList.remove('active');
+                btn.setAttribute('aria-selected', 'false');
+            });
+            document.querySelectorAll('#agentLeftTabsContent .tab-pane').forEach(pane => {
+                pane.classList.remove('show', 'active');
+            });
+            const activeBtn = document.getElementById(tabId);
+            const activePane = document.getElementById(paneId);
+            if (activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.setAttribute('aria-selected', 'true');
+            }
+            if (activePane) {
+                activePane.classList.add('show', 'active');
+            }
+        }
 
         document.addEventListener('DOMContentLoaded', () => {
             checkHealth();
@@ -2240,13 +2267,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             // 3. Verify mediaDevices support in browser context
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 isInitializingMedia = false;
-                prompt.textContent = "Microphone requires HTTPS or localhost. Please use file upload below.";
-                alert("Microphone recording is not available in this browser context (requires HTTPS or localhost). Please use the audio file upload option below.");
+                const msg = "Microphone requires http://localhost:8002, http://127.0.0.1:8002, or HTTPS. Please upload an audio file below.";
+                prompt.innerHTML = `<span class="text-warning fw-semibold"><i class="bi bi-shield-exclamation me-1"></i>${msg}</span>`;
+                alert(msg);
                 return;
             }
 
             try {
-                prompt.textContent = "Accessing microphone...";
+                prompt.textContent = "Accessing microphone... Please allow permission if prompted.";
 
                 // Clean up any stale streams
                 if (activeStream) {
@@ -2254,13 +2282,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     activeStream = null;
                 }
 
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }
-                });
+                let stream = null;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        }
+                    });
+                } catch (constrErr) {
+                    console.warn("Retrying with simple audio: true due to:", constrErr);
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                }
+
                 activeStream = stream;
                 recordedChunks = [];
                 liveSpeechTranscript = "";
@@ -2291,7 +2326,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     document.getElementById('audioPlayer').src = audioUrl;
                     document.getElementById('audioPlaybackContainer').classList.remove('d-none');
                     prompt.textContent = "Recording complete. Review playback or click Analyze Speech & Sync APIs.";
-                    
+
                     if (activeStream) {
                         try { activeStream.getTracks().forEach(t => t.stop()); } catch (e) {}
                         activeStream = null;
@@ -2334,8 +2369,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 }
                 recordBtn.className = 'mic-button mic-idle';
                 micIcon.className = 'bi bi-mic-fill';
-                prompt.textContent = "Microphone error: " + err.message;
-                alert("Microphone Error: " + err.message + "\\n\\nPlease allow microphone permission in your browser or use the audio file upload option below.");
+                prompt.innerHTML = `<span class="text-danger fw-semibold"><i class="bi bi-slash-circle me-1"></i>Microphone error: <strong>${err.name}</strong> - ${err.message}. Please check microphone permissions or upload audio below.</span>`;
             } finally {
                 isInitializingMedia = false;
             }
@@ -2476,26 +2510,69 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
 
         function openApiKeyModal() {
-            apiKeyModal.show();
+            const modalEl = document.getElementById('apiKeyModal');
+            const backdrop = document.getElementById('customModalBackdrop');
+            if (window.bootstrap && window.bootstrap.Modal) {
+                try {
+                    if (!apiKeyModalInstance) {
+                        apiKeyModalInstance = bootstrap.Modal.getOrCreateInstance(modalEl);
+                    }
+                    apiKeyModalInstance.show();
+                    return;
+                } catch(e) {
+                    console.warn("Bootstrap modal exception:", e);
+                }
+            }
+            if (modalEl) {
+                modalEl.style.display = 'block';
+                modalEl.classList.add('show');
+            }
+            if (backdrop) backdrop.style.display = 'block';
+            document.body.classList.add('modal-open');
+        }
+
+        function closeApiKeyModal() {
+            const modalEl = document.getElementById('apiKeyModal');
+            const backdrop = document.getElementById('customModalBackdrop');
+            if (apiKeyModalInstance) {
+                try { apiKeyModalInstance.hide(); } catch(e) {}
+            }
+            if (modalEl) {
+                modalEl.style.display = 'none';
+                modalEl.classList.remove('show');
+            }
+            if (backdrop) backdrop.style.display = 'none';
+            document.body.classList.remove('modal-open');
+            document.querySelectorAll('.modal-backdrop').forEach(el => {
+                if (el.id !== 'customModalBackdrop') el.remove();
+            });
         }
 
         async function saveApiKey() {
             const key = document.getElementById('geminiApiKeyInput').value.trim();
-            if (!key) return;
+            if (!key) {
+                alert("Please enter a valid Gemini API key.");
+                return;
+            }
 
-            const res = await fetch('/api/set-api-key', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ api_key: key })
-            });
+            try {
+                const res = await fetch('/api/set-api-key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
 
-            if (res.ok) {
-                apiKeyModal.hide();
-                document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
-                await checkHealth();
-                alert('Gemini API key configured successfully!');
-            } else {
-                alert('Failed to save API key');
+                if (res.ok) {
+                    closeApiKeyModal();
+                    document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
+                    await checkHealth();
+                    alert('Gemini API key configured successfully!');
+                } else {
+                    const errData = await res.json().catch(() => ({}));
+                    alert('Failed to save API key: ' + (errData.detail || res.statusText));
+                }
+            } catch (err) {
+                alert('Network error saving API key: ' + err.message);
             }
         }
     </script>

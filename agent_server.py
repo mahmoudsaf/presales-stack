@@ -944,16 +944,27 @@ async def process_audio(file: UploadFile = File(...)):
 
     instructions = f"""
 You are an expert bilingual (Saudi Arabic & English) Enterprise Presales Operations AI.
-You are listening to an audio recording of a presales team standup meeting. The engineers speak a natural blend of Saudi Arabic and English IT terminology.
+You are listening to an audio recording of a presales team standup meeting. The engineers speak in their natural languages: Saudi Arabic and English IT terminology.
+
+CRITICAL LANGUAGE & TRANSCRIPTION RULES (STRICT REQUIREMENT):
+1. KEEP THE TRANSCRIPT AND SUMMARY IN ARABIC AND ENGLISH EXACTLY AS SPOKEN — NO TRANSLATION:
+   - If speech was spoken in Arabic, transcribe and keep it in Arabic.
+   - If speech was spoken in English, transcribe and keep it in English.
+   - DO NOT translate spoken Arabic into English. DO NOT translate spoken English into Arabic.
+   - Preserve authentic Saudi Arabic phrasing, technical code-switching, and natural engineer terminology.
+2. KEEP DEAL NAMES AND OPPORTUNITY NAMES IN ARABIC EXACTLY AS SPOKEN:
+   - When a deal, tender, RFP, opportunity, or customer is mentioned in Arabic, KEEP THE DEAL NAME AND OPPORTUNITY NAME IN ARABIC AS SPOKEN.
+   - Never translate Arabic deal names (e.g. keep "مناقصة وزارة التخطيط", "توريد أجهزة ديل", "مشروع منصة الحج والعمرة", "تجديد رخص فيم").
+   - When creating or updating deals or tasks, use the original Arabic deal/opportunity name as spoken.
 
 BASELINE CRM DEALS:
-{json.dumps(deals, indent=2)}
+{json.dumps(deals, indent=2, ensure_ascii=False)}
 
 BASELINE TASK BOARD:
-{json.dumps(tasks, indent=2)}
+{json.dumps(tasks, indent=2, ensure_ascii=False)}
 
 Your responsibilities:
-1. Listen carefully and transcribe/understand all spoken updates from Presales 1 and Presales 2.
+1. Listen carefully and transcribe/understand all spoken updates from Presales 1 and Presales 2 exactly in their spoken languages without translation.
 2. Compare spoken updates against the baseline CRM deals and Task Board items above to detect DELTAS:
    - Deal stage changes (e.g. PoC -> Proposal, Discovery -> Gathering Requirements, Proposal -> Closed-Won).
    - Estimated deal value revisions.
@@ -963,28 +974,30 @@ Your responsibilities:
 3. Formulate structured REST API updates:
    - `crm_updates`: Array of deal updates. Use "PUT" with "deal_id" and "payload" for existing deals; or "POST" with "payload" for newly won or qualified deals.
      IMPORTANT ENUM CONSTRAINTS FOR CRM DEALS:
+     * deal_name: Keep in original Arabic/English as spoken!
      * stage MUST be one of: ["Discovery", "Gathering Requirements", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage; if activities are ongoing/in progress, use "Gathering Requirements").
      * assigned_presales MUST be: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
      * estimated_value must be a numeric float (e.g. 125000.0).
-    - `task_updates`: Array of task updates.
-      CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
-      IMPORTANT CONSTRAINTS FOR TASKS:
-      * task_title: Actionable, descriptive title (e.g. "Gather technical requirements for Ministry of Hajj platform").
-      * status MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-      * assigned_to MUST be: "Presales 1" or "Presales 2".
-      * category MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
-      * vendor_domain MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE".
-      * priority MUST be one of: ["High", "Medium", "Low"].
-      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
-      * changed_by: "Voice Agent" (or the speaking engineer).
-4. Produce an Executive Briefing Report containing:
-   - `today_progress`: Array of key accomplishments confirmed in the call.
-   - `tomorrow_actions`: Array of prioritized next steps.
-   - `management_warnings`: Array of critical risks, vendor roadblocks, or management escalations.
+     * vendor_notes: Keep in original language as spoken.
+   - `task_updates`: Array of task updates.
+     CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
+     IMPORTANT CONSTRAINTS FOR TASKS:
+     * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "جمع المتطلبات الفنية لمناقصة منصة الحج والعمرة").
+     * status MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
+     * assigned_to MUST be: "Presales 1" or "Presales 2".
+     * category MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
+     * vendor_domain MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE".
+     * priority MUST be one of: ["High", "Medium", "Low"].
+     * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
+     * changed_by: "Voice Agent" (or the speaking engineer).
+4. Produce an Executive Briefing Report in the original spoken language without translation:
+   - `today_progress`: Array of key accomplishments in the spoken language.
+   - `tomorrow_actions`: Array of prioritized next steps in the spoken language.
+   - `management_warnings`: Array of critical risks, vendor roadblocks, or management escalations in the spoken language.
 
 Return STRICT JSON matching this schema:
 {{
-  "transcript_summary": "Concise summary of the meeting highlights in English with Arabic context where appropriate.",
+  "transcript_summary": "Authentic transcript and summary of the meeting highlights preserving the exact language as spoken (Arabic and English mixed as spoken, NO translation).",
   "crm_updates": [
     {{
       "method": "PUT",
@@ -992,7 +1005,7 @@ Return STRICT JSON matching this schema:
       "payload": {{
         "stage": "Proposal",
         "estimated_value": 135000.0,
-        "vendor_notes": "Updated note..."
+        "vendor_notes": "Updated note in spoken language..."
       }}
     }}
   ],
@@ -1000,7 +1013,7 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "Actionable task name",
+        "task_title": "Actionable task title in original spoken language (Arabic or English)",
         "category": "RFP_OWNERSHIP",
         "assigned_to": "Presales 2",
         "vendor_domain": "Dell",
@@ -1012,9 +1025,9 @@ Return STRICT JSON matching this schema:
     }}
   ],
   "executive_report": {{
-    "today_progress": ["..."],
-    "tomorrow_actions": ["..."],
-    "management_warnings": ["..."]
+    "today_progress": ["... (in original spoken language)"],
+    "tomorrow_actions": ["... (in original spoken language)"],
+    "management_warnings": ["... (in original spoken language)"]
   }}
 }}
 """

@@ -1372,8 +1372,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                     <!-- Meeting Summary -->
                     <div class="mb-4">
-                        <div class="small text-uppercase fw-semibold text-muted mb-1">Standup Meeting Summary</div>
-                        <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 text-light" id="summaryText"></div>
+                        <div class="small text-uppercase fw-semibold text-muted mb-1">Standup Meeting Transcript & Summary</div>
+                        <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 text-light font-arabic" id="summaryText" dir="auto" style="white-space: pre-wrap; line-height: 1.6;"></div>
                     </div>
 
                     <!-- Executive 3-Column Report -->
@@ -1381,19 +1381,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <div class="col-12 col-md-4">
                             <div class="p-3 rounded-3 border border-success border-opacity-25 bg-success bg-opacity-10 h-100">
                                 <div class="fw-bold small text-success mb-2"><i class="bi bi-check-circle me-1"></i>Today's Key Progress</div>
-                                <ul class="small ps-3 mb-0" id="todayProgressList"></ul>
+                                <ul class="small ps-3 mb-0 font-arabic" id="todayProgressList" dir="auto"></ul>
                             </div>
                         </div>
                         <div class="col-12 col-md-4">
                             <div class="p-3 rounded-3 border border-primary border-opacity-25 bg-primary bg-opacity-10 h-100">
                                 <div class="fw-bold small text-primary mb-2"><i class="bi bi-arrow-right-circle me-1"></i>Tomorrow's Actions</div>
-                                <ul class="small ps-3 mb-0" id="tomorrowActionsList"></ul>
+                                <ul class="small ps-3 mb-0 font-arabic" id="tomorrowActionsList" dir="auto"></ul>
                             </div>
                         </div>
                         <div class="col-12 col-md-4">
                             <div class="p-3 rounded-3 border border-danger border-opacity-25 bg-danger bg-opacity-10 h-100">
                                 <div class="fw-bold small text-danger mb-2"><i class="bi bi-exclamation-triangle me-1"></i>Management Warnings</div>
-                                <ul class="small ps-3 mb-0" id="managementWarningsList"></ul>
+                                <ul class="small ps-3 mb-0 font-arabic" id="managementWarningsList" dir="auto"></ul>
                             </div>
                         </div>
                     </div>

@@ -741,27 +741,29 @@ async def get_followup_opportunities():
                 "completed_tasks": c_tasks,
             })
 
-    # Group by the 3 kinds
-    rfp_ownership = [o for o in opportunities if o["kind"] == "RFP_OWNERSHIP"]
-    rfp_distributed = [o for o in opportunities if o["kind"] == "RFP_DISTRIBUTED_SCOPE"]
-    general_action = [o for o in opportunities if o["kind"] == "GENERAL_ACTION"]
+    # Filter strictly for opportunities that have tasks needing follow-up (all tasks completed are excluded!)
+    followup_deals = [
+        o for o in opportunities 
+        if o["has_followup_tasks"] and o.get("followup_tasks_count", 0) > 0
+    ]
 
-    rfp_ownership_followup = [o for o in rfp_ownership if o["has_followup_tasks"]]
-    rfp_distributed_followup = [o for o in rfp_distributed if o["has_followup_tasks"]]
-    general_action_followup = [o for o in general_action if o["has_followup_tasks"]]
+    # Group strictly by the 3 kinds for deals needing follow-up
+    rfp_ownership_followup = [o for o in followup_deals if o["kind"] == "RFP_OWNERSHIP"]
+    rfp_distributed_followup = [o for o in followup_deals if o["kind"] == "RFP_DISTRIBUTED_SCOPE"]
+    general_action_followup = [o for o in followup_deals if o["kind"] == "GENERAL_ACTION"]
 
     return {
         "status": "success",
         "counts": {
-            "total_opportunities": len(opportunities),
-            "with_followup_tasks": sum(1 for o in opportunities if o["has_followup_tasks"]),
-            "rfp_ownership_count": len(rfp_ownership),
+            "total_opportunities": len(followup_deals),
+            "with_followup_tasks": len(followup_deals),
+            "rfp_ownership_count": len(rfp_ownership_followup),
             "rfp_ownership_followup_count": len(rfp_ownership_followup),
-            "rfp_distributed_scope_count": len(rfp_distributed),
+            "rfp_distributed_scope_count": len(rfp_distributed_followup),
             "rfp_distributed_scope_followup_count": len(rfp_distributed_followup),
-            "general_action_count": len(general_action),
+            "general_action_count": len(general_action_followup),
             "general_action_followup_count": len(general_action_followup),
-            "with_blockers_count": sum(1 for o in opportunities if o["has_blocker"]),
+            "with_blockers_count": sum(1 for o in followup_deals if o["has_blocker"]),
         },
         "kinds": {
             "RFP_OWNERSHIP": {
@@ -769,7 +771,7 @@ async def get_followup_opportunities():
                 "name_ar": "مناقصات رئيسية وتكليف كامل",
                 "badge": "badge-rfp-owner",
                 "description": "Prime tenders owned end-to-end requiring technical architecture, RFP response submission, and bid management.",
-                "opportunities": rfp_ownership,
+                "opportunities": rfp_ownership_followup,
                 "followup_opportunities": rfp_ownership_followup
             },
             "RFP_DISTRIBUTED_SCOPE": {
@@ -777,7 +779,7 @@ async def get_followup_opportunities():
                 "name_ar": "نطاق موزع وشراكات التقنية",
                 "badge": "badge-rfp-dist",
                 "description": "Multi-vendor partner tenders (HPE, Dell, Veeam, Nutanix, VMware) requiring partner discounts, BoQ validations, and distributor scopes.",
-                "opportunities": rfp_distributed,
+                "opportunities": rfp_distributed_followup,
                 "followup_opportunities": rfp_distributed_followup
             },
             "GENERAL_ACTION": {
@@ -785,12 +787,14 @@ async def get_followup_opportunities():
                 "name_ar": "إجراءات وتجارب فنية عامة",
                 "badge": "badge-rfp-action",
                 "description": "PoC testing, hardware sizing, licensing migrations, and operational presales support deliverables.",
-                "opportunities": general_action,
+                "opportunities": general_action_followup,
                 "followup_opportunities": general_action_followup
             }
         },
-        "all_opportunities": opportunities,
-        "followup_opportunities": [o for o in opportunities if o["has_followup_tasks"]]
+        "opportunities": followup_deals,
+        "all_opportunities": followup_deals,
+        "followup_opportunities": followup_deals,
+        "raw_pipeline_deals_count": len(opportunities),
     }
 
 

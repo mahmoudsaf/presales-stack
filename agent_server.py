@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -19,9 +20,27 @@ from pydantic import BaseModel, Field
 # -----------------------------------------------------------------------------
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
+PLACEHOLDER_SUBSTRINGS = ["your_actual", "placeholder", "aizasyyouractual"]
+
+
+def is_placeholder(val: Optional[str]) -> bool:
+    if not val:
+        return True
+    s = val.strip().lower()
+    return any(p in s for p in PLACEHOLDER_SUBSTRINGS) or s.startswith("your_")
+
+
+def mask_key(val: Optional[str]) -> Optional[str]:
+    if not val or is_placeholder(val):
+        return None
+    s = val.strip()
+    if len(s) <= 8:
+        return "****"
+    return f"{s[:6]}...{s[-4:]}"
+
 
 def load_env_file():
-    """Loads key-value pairs from local .env into os.environ if present."""
+    """Loads key-value pairs from local .env into os.environ with placeholder protection."""
     if ENV_FILE.exists():
         try:
             with open(ENV_FILE, "r", encoding="utf-8") as f:
@@ -31,21 +50,23 @@ def load_env_file():
                         k, v = line.split("=", 1)
                         k = k.strip()
                         v = v.strip().strip("\"'")
-                        if k and not os.environ.get(k):
-                            os.environ[k] = v
+                        if k and v and not is_placeholder(v):
+                            curr = os.environ.get(k, "")
+                            if not curr or is_placeholder(curr) or k == "GEMINI_API_KEY":
+                                os.environ[k] = v
         except Exception as e:
             print(f"Notice: Could not read .env: {e}")
 
 
 def save_env_file(key: str, value: str):
-    """Saves or updates a key-value pair in .env file."""
+    """Saves or updates a key-value pair in .env file and Windows user environment if applicable."""
     lines = []
     found = False
     if ENV_FILE.exists():
         try:
             with open(ENV_FILE, "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.strip().startswith(f"{key}="):
+                    if re.match(rf"^{re.escape(key)}\s*=", line.strip()):
                         lines.append(f'{key}="{value}"\n')
                         found = True
                     else:
@@ -58,6 +79,17 @@ def save_env_file(key: str, value: str):
     with open(ENV_FILE, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
+    os.environ[key] = value
+
+    # Persist in Windows User Environment Registry so it survives reboots and terminal restarts
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as reg_key:
+                winreg.SetValueEx(reg_key, key, 0, winreg.REG_SZ, value)
+        except Exception as e:
+            print(f"Notice: Could not update Windows User Environment: {e}")
+
 
 # Automatically load .env on startup
 load_env_file()
@@ -65,7 +97,7 @@ load_env_file()
 CRM_API_URL = os.getenv("CRM_API_URL", "http://127.0.0.1:8000/api")
 TASKS_API_URL = os.getenv("TASKS_API_URL", "http://127.0.0.1:8001/api")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 
 def generate_with_model_fallback(client: genai.Client, contents: Any, **kwargs):
@@ -88,7 +120,10 @@ def generate_with_model_fallback(client: genai.Client, contents: Any, **kwargs):
 
 def get_gemini_client() -> Optional[genai.Client]:
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key or is_placeholder(api_key):
+        load_env_file()
+        api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or is_placeholder(api_key):
         return None
     try:
         return genai.Client(api_key=api_key)
@@ -108,8 +143,13 @@ async def lifespan(app: FastAPI):
     print(f"Connecting to CRM API: {CRM_API_URL}")
     print(f"Connecting to Tasks API: {TASKS_API_URL}")
     print(f"Gemini Model: {GEMINI_MODEL}")
-    if os.getenv("GEMINI_API_KEY"):
-        print("GEMINI_API_KEY detected.")
+    key = os.getenv("GEMINI_API_KEY")
+    if not key or is_placeholder(key):
+        load_env_file()
+        key = os.getenv("GEMINI_API_KEY")
+
+    if key and not is_placeholder(key):
+        print(f"GEMINI_API_KEY detected ({mask_key(key)}) and active.")
     else:
         print("NOTICE: GEMINI_API_KEY not found in environment. You can set it in the UI or environment variable.")
     print("=" * 60)
@@ -158,28 +198,33 @@ async def fetch_baseline_state() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Could not fetch tasks from Tasks API: {e}")
 
-    # Ensure every task record has customer_name and deal_name populated
+    # Ensure every task record has customer_name, deal_name, and customer_id populated
     deals_by_id = {}
     for d in deals:
         did = d.get("deal_id")
         if did:
-            deals_by_id[did] = (
-                d.get("deal_name") or "",
-                d.get("company_name") or d.get("customer_name") or ""
-            )
+            deals_by_id[did] = {
+                "deal_name": d.get("deal_name") or "",
+                "customer_name": d.get("company_name") or d.get("customer_name") or "",
+                "customer_id": d.get("customer_id")
+            }
 
     for t in tasks:
         rel_id = t.get("related_deal_id")
         if rel_id and rel_id in deals_by_id:
-            d_name, c_name = deals_by_id[rel_id]
-            t["deal_name"] = t.get("deal_name") or d_name
-            t["customer_name"] = t.get("customer_name") or c_name
+            d_info = deals_by_id[rel_id]
+            t["deal_name"] = t.get("deal_name") or d_info["deal_name"]
+            t["customer_name"] = t.get("customer_name") or d_info["customer_name"]
+            t["customer_id"] = t.get("customer_id") or d_info.get("customer_id")
 
         # Fallback keyword match if deal_name or customer_name still missing
-        if not t.get("deal_name") or not t.get("customer_name"):
+        if not t.get("deal_name") or not t.get("customer_name") or not t.get("customer_id"):
             t_title = (t.get("task_title") or "").lower()
             matched = False
-            for did, (d_name, c_name) in deals_by_id.items():
+            for did, d_info in deals_by_id.items():
+                d_name = d_info["deal_name"]
+                c_name = d_info["customer_name"]
+                c_id = d_info.get("customer_id")
                 keywords = []
                 if "فيصل" in d_name or "faisal" in c_name.lower():
                     keywords.extend(["فيصل", "faisal"])
@@ -194,6 +239,7 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                 if (d_name and len(d_name) > 4 and d_name.lower() in t_title) or (c_name and len(c_name) > 3 and c_name.lower() in t_title):
                     t["deal_name"] = t.get("deal_name") or d_name
                     t["customer_name"] = t.get("customer_name") or c_name
+                    t["customer_id"] = t.get("customer_id") or c_id
                     if not t.get("related_deal_id"):
                         t["related_deal_id"] = did
                     matched = True
@@ -202,6 +248,7 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                     if kw in t_title:
                         t["deal_name"] = t.get("deal_name") or d_name
                         t["customer_name"] = t.get("customer_name") or c_name
+                        t["customer_id"] = t.get("customer_id") or c_id
                         if not t.get("related_deal_id"):
                             t["related_deal_id"] = did
                         matched = True
@@ -235,6 +282,71 @@ def sanitize_crm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(payload)
     p.pop("deal_id", None)
     p.pop("customer_id", None)
+
+    # 1. Company Name normalization & alias resolution
+    company = p.get("company_name")
+    if not company:
+        for key in ["customer_name", "customer", "client_name", "client", "account_name", "account", "org_name"]:
+            if p.get(key) and str(p.get(key)).strip():
+                company = str(p.get(key)).strip()
+                break
+
+    deal_raw = p.get("deal_name") or p.get("name") or p.get("title") or p.get("project_name") or p.get("opportunity_name")
+    if not company and deal_raw:
+        d_str = str(deal_raw).strip()
+        m = re.search(r"(?:مشروع|عميل|شركة|مؤسسة|مناقصة)\s+([^\s\-:،,]+)", d_str)
+        if m:
+            company = m.group(1).strip()
+        else:
+            company = d_str[:30]
+    p["company_name"] = str(company or "General Client").strip()
+
+    # 2. Deal Name normalization & alias resolution
+    if not deal_raw:
+        deal_raw = f"مشروع {p['company_name']}"
+    p["deal_name"] = str(deal_raw).strip()
+
+    # 3. Estimated Value parsing with scale multipliers
+    if "estimated_value" in p:
+        val = p["estimated_value"]
+        if isinstance(val, (int, float)):
+            p["estimated_value"] = float(val)
+        else:
+            val_str = str(val).strip()
+            mult = 1.0
+            if re.search(r"(?:مليار|billion|b\b)", val_str, re.I):
+                mult = 1_000_000_000.0
+            elif re.search(r"(?:مليون|ملايين|million|m\b)", val_str, re.I):
+                mult = 1_000_000.0
+            elif re.search(r"(?:ألف|الاف|آلاف|thousand|k\b)", val_str, re.I):
+                mult = 1_000.0
+
+            range_match = re.findall(r"(\d+(?:\.\d+)?)", val_str)
+            if len(range_match) >= 2 and any(sep in val_str for sep in ["-", "إلى", "الى", "to"]):
+                vals = [float(x) for x in range_match[:2]]
+                p["estimated_value"] = round((sum(vals) / len(vals)) * mult, 2)
+            elif range_match:
+                p["estimated_value"] = round(float(range_match[0]) * mult, 2)
+            else:
+                p["estimated_value"] = 0.0
+    else:
+        p["estimated_value"] = 0.0
+
+    # 4. Primary Vendors
+    if "primary_vendors" in p and p["primary_vendors"]:
+        if isinstance(p["primary_vendors"], list):
+            p["primary_vendors"] = [str(v).strip() for v in p["primary_vendors"] if v]
+        else:
+            p["primary_vendors"] = [v.strip() for v in str(p["primary_vendors"]).split(",") if v.strip()]
+    else:
+        notes_and_name = f"{p.get('deal_name', '')} {p.get('vendor_notes', '')}".lower()
+        detected_v = []
+        for v in ["Hitachi Vantara", "Hitachi", "Dell", "HPE", "Nutanix", "VMware", "Veeam"]:
+            if v.lower() in notes_and_name:
+                detected_v.append(v)
+        p["primary_vendors"] = detected_v if detected_v else ["General"]
+
+    # 5. Stage normalization
     if "stage" in p and p["stage"]:
         s = str(p["stage"]).strip().lower()
         stage_map = {
@@ -242,8 +354,28 @@ def sanitize_crm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "ongoing": "Gathering Requirements",
             "active": "Gathering Requirements",
             "discovery": "Discovery",
-            "requirements": "Gathering Requirements",
             "gathering requirements": "Gathering Requirements",
+            "requirements": "Gathering Requirements",
+            "rfp / tender": "RFP / Tender",
+            "rfp/tender": "RFP / Tender",
+            "rfp or tender": "RFP / Tender",
+            "rfp ofr tender": "RFP / Tender",
+            "rfp": "RFP / Tender",
+            "tender": "RFP / Tender",
+            "rfq": "RFP / Tender",
+            "request for pricing": "RFP / Tender",
+            "direct request for pricing": "RFP / Tender",
+            "direct request for pricing request": "RFP / Tender",
+            "pricing request": "RFP / Tender",
+            "pricing": "RFP / Tender",
+            "طلب تسعير": "RFP / Tender",
+            "طلب تسعيرة": "RFP / Tender",
+            "تسعير": "RFP / Tender",
+            "تسعيرة": "RFP / Tender",
+            "استدراج عروض": "RFP / Tender",
+            "استدراج عروض أسعار": "RFP / Tender",
+            "مناقصة": "RFP / Tender",
+            "منافسة": "RFP / Tender",
             "poc": "PoC",
             "proof of concept": "PoC",
             "proposal": "Proposal",
@@ -254,10 +386,17 @@ def sanitize_crm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "closed lost": "Closed-Lost",
             "lost": "Closed-Lost",
         }
-        p["stage"] = stage_map.get(s, "Gathering Requirements")
+        p["stage"] = stage_map.get(s, "Discovery")
+    else:
+        p["stage"] = "Discovery"
+
+    # 6. Assigned Presales
     if "assigned_presales" in p and p["assigned_presales"]:
         v = str(p["assigned_presales"]).strip().lower()
         p["assigned_presales"] = "Presales 2" if "2" in v else "Presales 1"
+    else:
+        p["assigned_presales"] = "Presales 1"
+
     return p
 
 
@@ -332,13 +471,25 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         p["priority"] = "Medium"
 
-    # 7. Deal ID handling
+    # 7. Deal ID, Deal Name, Customer ID & Customer Name handling
     deal_id = p.get("related_deal_id")
     if deal_id is not None and str(deal_id).strip():
         digits = re.findall(r"\d+", str(deal_id))
         p["related_deal_id"] = int(digits[0]) if digits else None
     else:
         p["related_deal_id"] = None
+
+    cust_id = p.get("customer_id")
+    if cust_id is not None and str(cust_id).strip():
+        digits = re.findall(r"\d+", str(cust_id))
+        p["customer_id"] = int(digits[0]) if digits else None
+    else:
+        p["customer_id"] = None
+
+    if p.get("deal_name"):
+        p["deal_name"] = str(p["deal_name"]).strip()
+    if p.get("customer_name"):
+        p["customer_name"] = str(p["customer_name"]).strip()
 
     # 8. Management blockers
     if "management_blockers" in p and p["management_blockers"]:
@@ -355,6 +506,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     """
     Ensures that EVERY actionable deliverable, tender, or next step mentioned in the conversation
     is captured as a task in task_updates, eliminating gaps between executive report and task board.
+    Attaches deal_id, deal_name, and customer_name to tasks for full cross-system linkage.
     """
     task_updates = list(ai_data.get("task_updates", []))
     existing_titles = [str(item.get("payload", {}).get("task_title", "")).lower() for item in task_updates]
@@ -365,34 +517,51 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     progress = exec_report.get("today_progress", [])
 
     # Map deals by customer or name keywords for smart linking
-    deal_keyword_map = {}
+    known_deals = []
     for d in baseline_deals:
-        d_id = d.get("deal_id")
-        name = str(d.get("deal_name", "")).lower()
-        cust = str(d.get("company_name", "")).lower()
-        if d_id:
-            deal_keyword_map[name] = d_id
-            deal_keyword_map[cust] = d_id
+        known_deals.append({
+            "deal_id": d.get("deal_id"),
+            "deal_name": d.get("deal_name", ""),
+            "customer_name": d.get("company_name", ""),
+            "customer_id": d.get("customer_id"),
+        })
 
-    # Also check newly planned crm_updates
+    # Also check newly planned crm_updates (both POST and PUT)
     crm_updates = ai_data.get("crm_updates", [])
     for cu in crm_updates:
-        d_id = cu.get("deal_id")
         p = cu.get("payload", {})
-        d_name = str(p.get("deal_name", "")).lower()
-        d_cust = str(p.get("company_name", "")).lower()
-        if d_id:
-            if d_name:
-                deal_keyword_map[d_name] = d_id
-            if d_cust:
-                deal_keyword_map[d_cust] = d_id
+        d_name = p.get("deal_name") or p.get("title") or ""
+        c_name = p.get("company_name") or p.get("customer_name") or p.get("customer") or ""
+        d_id = cu.get("deal_id")
+        c_id = cu.get("customer_id") or p.get("customer_id")
+        if d_name or c_name:
+            known_deals.append({
+                "deal_id": d_id,
+                "deal_name": d_name,
+                "customer_name": c_name,
+                "customer_id": c_id,
+            })
 
-    def find_related_deal(text: str) -> Optional[int]:
+    def find_related_deal_and_context(text: str):
         t_low = text.lower()
-        for k, d_id in deal_keyword_map.items():
-            if k and len(k) > 3 and k in t_low:
-                return d_id
-        return None
+        for d in known_deals:
+            d_id = d.get("deal_id")
+            d_name = d.get("deal_name", "")
+            c_name = d.get("customer_name", "")
+            c_id = d.get("customer_id")
+
+            # Check customer name
+            if c_name and len(c_name) > 2 and c_name.lower() in t_low:
+                return d_id, d_name, c_name, c_id
+            # Check deal name
+            if d_name and len(d_name) > 3 and (d_name.lower() in t_low or t_low in d_name.lower()):
+                return d_id, d_name, c_name, c_id
+            # Check individual tokens of customer name (e.g. "كاست" or "المراعي")
+            for token in c_name.split():
+                if len(token) > 2 and token.lower() in t_low:
+                    return d_id, d_name, c_name, c_id
+
+        return None, None, None, None
 
     def detect_vendor(text: str) -> str:
         t_low = text.lower()
@@ -422,6 +591,21 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             return "RFP_DISTRIBUTED_SCOPE"
         return "GENERAL_ACTION"
 
+    # Enrich any tasks generated directly by Gemini
+    for tu in task_updates:
+        p = tu.get("payload", {})
+        t_text = f"{p.get('task_title', '')} {p.get('management_blockers', '')} {p.get('deal_name', '')} {p.get('customer_name', '')}"
+        if not p.get("customer_name") or not p.get("deal_name") or not p.get("related_deal_id") or not p.get("customer_id"):
+            d_id, d_name, c_name, c_id = find_related_deal_and_context(t_text)
+            if not p.get("related_deal_id") and d_id:
+                p["related_deal_id"] = d_id
+            if not p.get("deal_name") and d_name:
+                p["deal_name"] = d_name
+            if not p.get("customer_name") and c_name:
+                p["customer_name"] = c_name
+            if not p.get("customer_id") and c_id:
+                p["customer_id"] = c_id
+
     # 1. Reconcile tomorrow's actions
     for action in actions:
         action_text = str(action).strip()
@@ -430,6 +614,8 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         act_low = action_text.lower()
         if any(len(act_low) > 8 and (act_low[:20] in et or et in act_low) for et in existing_titles):
             continue
+
+        d_id, d_name, c_name, c_id = find_related_deal_and_context(action_text)
 
         task_updates.append({
             "method": "POST",
@@ -440,7 +626,10 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "vendor_domain": detect_vendor(action_text),
                 "status": "In Progress",
                 "priority": "High" if ("tender" in act_low or "rfp" in act_low) else "Medium",
-                "related_deal_id": find_related_deal(action_text),
+                "related_deal_id": d_id,
+                "deal_name": d_name,
+                "customer_id": c_id,
+                "customer_name": c_name,
                 "changed_by": "Voice Agent",
             }
         })
@@ -452,6 +641,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         prog_low = prog_text.lower()
         if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low:
             if not any(len(prog_low) > 8 and (prog_low[:20] in et or et in prog_low) for et in existing_titles):
+                d_id, d_name, c_name, c_id = find_related_deal_and_context(prog_text)
                 task_updates.append({
                     "method": "POST",
                     "payload": {
@@ -461,7 +651,10 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                         "vendor_domain": detect_vendor(prog_text),
                         "status": "In Progress",
                         "priority": "High",
-                        "related_deal_id": find_related_deal(prog_text),
+                        "related_deal_id": d_id,
+                        "deal_name": d_name,
+                        "customer_id": c_id,
+                        "customer_name": c_name,
                         "changed_by": "Voice Agent",
                     }
                 })
@@ -472,9 +665,10 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
 
 async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sync_logs = []
+    created_deals = []
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # 1. Execute CRM Updates
+        # 1. Execute CRM Updates FIRST (Creates customer and deal)
         for item in crm_updates:
             method = item.get("method", "PUT").upper()
             deal_id = item.get("deal_id")
@@ -484,25 +678,31 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                 if method == "PUT" and deal_id:
                     url = f"{CRM_API_URL}/deals/{deal_id}"
                     res = await client.put(url, json=payload)
+                    success = res.status_code in (200, 201)
+                    detail = res.json() if success else res.text
                     sync_logs.append({
                         "target": "CRM",
                         "method": "PUT",
                         "endpoint": url,
                         "status_code": res.status_code,
-                        "success": res.status_code in (200, 201),
-                        "detail": res.json() if res.status_code in (200, 201) else res.text,
+                        "success": success,
+                        "detail": detail,
                     })
                 elif method == "POST":
                     url = f"{CRM_API_URL}/deals"
                     res = await client.post(url, json=payload)
+                    success = res.status_code in (200, 201)
+                    detail = res.json() if success else res.text
                     sync_logs.append({
                         "target": "CRM",
                         "method": "POST",
                         "endpoint": url,
                         "status_code": res.status_code,
-                        "success": res.status_code in (200, 201),
-                        "detail": res.json() if res.status_code in (200, 201) else res.text,
+                        "success": success,
+                        "detail": detail,
                     })
+                    if success and isinstance(detail, dict):
+                        created_deals.append(detail)
             except Exception as e:
                 sync_logs.append({
                     "target": "CRM",
@@ -513,11 +713,30 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     "detail": str(e),
                 })
 
-        # 2. Execute Task Updates
+        # 2. Link newly created deal IDs & customer info to Task Updates
         for item in task_updates:
             method = item.get("method", "PUT").upper()
             task_id = item.get("task_id")
             payload = sanitize_task_payload(item.get("payload", {}))
+
+            # Smart correlation with freshly created CRM deals
+            if not payload.get("related_deal_id") or not payload.get("customer_name") or not payload.get("customer_id"):
+                search_text = f"{payload.get('task_title', '')} {payload.get('deal_name', '')} {payload.get('customer_name', '')}".lower()
+                for cd in created_deals:
+                    c_id = cd.get("deal_id")
+                    c_cust_id = cd.get("customer_id")
+                    c_name = str(cd.get("deal_name", "")).lower()
+                    c_cust = str(cd.get("company_name", "")).lower()
+                    if (c_cust and c_cust in search_text) or (c_name and (c_name in search_text or search_text in c_name)):
+                        if not payload.get("related_deal_id"):
+                            payload["related_deal_id"] = c_id
+                        if not payload.get("deal_name"):
+                            payload["deal_name"] = cd.get("deal_name")
+                        if not payload.get("customer_name"):
+                            payload["customer_name"] = cd.get("company_name")
+                        if not payload.get("customer_id") and c_cust_id:
+                            payload["customer_id"] = c_cust_id
+                        break
 
             try:
                 if method == "PUT" and task_id:
@@ -570,9 +789,18 @@ def extract_json(raw_text: str) -> Dict[str, Any]:
 @app.get("/api/health")
 async def health_check():
     baseline = await fetch_baseline_state()
+    key = os.getenv("GEMINI_API_KEY")
+    if not key or is_placeholder(key):
+        load_env_file()
+        key = os.getenv("GEMINI_API_KEY")
+
+    has_key = bool(key and not is_placeholder(key))
+    masked = mask_key(key) if has_key else None
+
     return {
         "status": "online",
-        "gemini_api_key_configured": bool(os.getenv("GEMINI_API_KEY")),
+        "gemini_api_key_configured": has_key,
+        "gemini_api_key_masked": masked,
         "gemini_model": GEMINI_MODEL,
         "crm_api": {"url": CRM_API_URL, "connected": baseline["crm_healthy"], "deals_count": len(baseline["deals"])},
         "tasks_api": {"url": TASKS_API_URL, "connected": baseline["tasks_healthy"], "tasks_count": len(baseline["tasks"])},
@@ -582,11 +810,15 @@ async def health_check():
 @app.post("/api/set-api-key")
 async def set_api_key(payload: Dict[str, str]):
     key = payload.get("api_key", "").strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="API key cannot be empty.")
+    if not key or is_placeholder(key):
+        raise HTTPException(status_code=400, detail="Please enter a valid Gemini API key.")
     os.environ["GEMINI_API_KEY"] = key
     save_env_file("GEMINI_API_KEY", key)
-    return {"message": "GEMINI_API_KEY saved permanently to local .env file."}
+    return {
+        "message": "GEMINI_API_KEY saved permanently to local .env file and Windows Environment.",
+        "gemini_api_key_configured": True,
+        "gemini_api_key_masked": mask_key(key),
+    }
 
 
 @app.get("/api/audit-state")
@@ -1031,28 +1263,35 @@ BASELINE TASK BOARD:
 Your responsibilities:
 1. Listen carefully and transcribe/understand all spoken updates from Presales 1 and Presales 2 exactly in their spoken languages without translation.
 2. Compare spoken updates against the baseline CRM deals and Task Board items above to detect DELTAS:
-   - Deal stage changes (e.g. PoC -> Proposal, Discovery -> Gathering Requirements, Proposal -> Closed-Won).
+   - Deal stage changes (e.g. Discovery -> RFP / Tender, RFP / Tender -> Proposal, PoC -> Proposal, Proposal -> Closed-Won).
    - Estimated deal value revisions.
    - Task status transitions (e.g. In Progress -> Completed, Waiting on Vendor -> In Progress, Not Started -> In Progress).
    - Resolved or newly raised management blockers.
    - Any newly mentioned deals or tasks to create.
 3. Formulate structured REST API updates:
-   - `crm_updates`: Array of deal updates. Use "PUT" with "deal_id" and "payload" for existing deals; or "POST" with "payload" for newly won or qualified deals.
-     IMPORTANT ENUM CONSTRAINTS FOR CRM DEALS:
-     * deal_name: Keep in original Arabic/English as spoken!
-     * stage MUST be one of: ["Discovery", "Gathering Requirements", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage; if activities are ongoing/in progress, use "Gathering Requirements").
-     * assigned_presales MUST be: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
-     * estimated_value must be a numeric float (e.g. 125000.0).
-     * vendor_notes: Keep in original language as spoken.
+   - `crm_updates`: Array of deal updates.
+     * For existing baseline deals: Use "PUT" with "deal_id" and "payload".
+     * For newly discussed projects/opportunities (e.g. "مشروع كاست", "مشروع المراعي"): Use "POST" with "payload".
+     IMPORTANT REQUIREMENTS FOR CRM DEALS (CRITICAL):
+     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة").
+     * deal_name: REQUIRED for "POST". Descriptive deal/project title in original Arabic/English as spoken (e.g. "مشروع كاست - تحديث مركز البيانات", "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell").
+     * primary_vendors: Array of vendor technologies (e.g. ["Hitachi Vantara"], ["Dell"], ["HPE"], ["Veeam"]).
+     * stage: MUST be one of: ["Discovery", "Gathering Requirements", "RFP / Tender", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage).
+     * RFP & REQUEST FOR PRICING RULE (STRICT): If the presales engineer mentions receiving an RFP (طلب تقديم عروض), RFQ, or a request for pricing (طلب تسعير / استدراج عروض أسعار / تسعيرة مباشرة), set the deal stage to "RFP / Tender". This represents a direct request for pricing or tender proposal, usually for opportunities or private/commercial accounts not related to the Eitimad (منصة اعتماد) portal which is designated for government tenders.
+     * assigned_presales: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
+     * estimated_value: Numeric float in SAR/USD (e.g. 1.25M to 1.5M -> 1350000.0, 10M -> 10000000.0). Remember 1 million = 1000000.0.
+     * vendor_notes: Technical requirements, scope, target close dates, in original spoken language.
    - `task_updates`: Array of task updates.
      CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
      IMPORTANT CONSTRAINTS FOR TASKS:
-     * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "جمع المتطلبات الفنية لمناقصة منصة الحج والعمرة").
-     * status MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-     * assigned_to MUST be: "Presales 1" or "Presales 2".
-     * category MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
-     * vendor_domain MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE".
-     * priority MUST be one of: ["High", "Medium", "Low"].
+     * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "إعداد وتدقيق المقترح الفني لفرصة كاست بالتنسيق مع Hitachi Vantara").
+     * customer_name: Name of customer or organization (e.g. "كاست", "المراعي").
+     * deal_name: Descriptive deal/project title.
+     * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
+     * assigned_to: MUST be: "Presales 1" or "Presales 2".
+     * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
+     * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
+     * priority: MUST be one of: ["High", "Medium", "Low"].
      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
      * changed_by: "Voice Agent" (or the speaking engineer).
 4. Produce an Executive Briefing Report in the original spoken language without translation:
@@ -1065,12 +1304,27 @@ Return STRICT JSON matching this schema:
   "transcript_summary": "Authentic transcript and summary of the meeting highlights preserving the exact language as spoken (Arabic and English mixed as spoken, NO translation).",
   "crm_updates": [
     {{
-      "method": "PUT",
-      "deal_id": 1,
+      "method": "POST",
       "payload": {{
-        "stage": "Proposal",
-        "estimated_value": 135000.0,
-        "vendor_notes": "Updated note in spoken language..."
+        "company_name": "المراعي",
+        "deal_name": "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell",
+        "primary_vendors": ["Dell"],
+        "stage": "Gathering Requirements",
+        "estimated_value": 10000000.0,
+        "assigned_presales": "Presales 1",
+        "vendor_notes": "طلب العميل لحلول الأجهزة الشخصية كمبيوتر ولابتوبات وأكسسوارات متوقع إغلاقها بنهاية السنة"
+      }}
+    }},
+    {{
+      "method": "POST",
+      "payload": {{
+        "company_name": "كاست",
+        "deal_name": "مشروع كاست - تحديث مركز البيانات",
+        "primary_vendors": ["Hitachi Vantara"],
+        "stage": "Gathering Requirements",
+        "estimated_value": 1250000.0,
+        "assigned_presales": "Presales 1",
+        "vendor_notes": "تحديث مركز البيانات Data Center Tech Refresh بحلول Hitachi Vantara ميزانية 1 إلى 1.5 مليون ريال"
       }}
     }}
   ],
@@ -1078,9 +1332,11 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "Actionable task title in original spoken language (Arabic or English)",
+        "task_title": "متابعة تحديد المواصفات والكميات لأجهزة Dell المطلوبة لشركة المراعي وتحديد جدول التسليم",
+        "customer_name": "المراعي",
+        "deal_name": "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell",
         "category": "RFP_OWNERSHIP",
-        "assigned_to": "Presales 2",
+        "assigned_to": "Presales 1",
         "vendor_domain": "Dell",
         "status": "In Progress",
         "priority": "High",
@@ -1283,7 +1539,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <span class="badge bg-primary-subtle text-primary border px-2 py-2">
                     <i class="bi bi-cpu me-1"></i>Gemini Flash
                 </span>
-                <button class="btn btn-sm btn-outline-light d-flex align-items-center gap-1" onclick="openApiKeyModal()">
+                <a href="http://127.0.0.1:8000/dashboard" target="_blank" class="btn btn-sm btn-outline-info d-flex align-items-center gap-1">
+                    <i class="bi bi-bar-chart-line-fill"></i> 📊 Visual Dashboard
+                </a>
+                <button class="btn btn-sm btn-outline-light d-flex align-items-center gap-1" id="apiKeyBtn" onclick="openApiKeyModal()">
                     <i class="bi bi-key-fill text-warning"></i>
                     <span id="apiKeyBtnText">Configure Gemini Key</span>
                 </button>
@@ -1495,9 +1754,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <button type="button" class="btn-close btn-close-white" onclick="closeApiKeyModal()" aria-label="Close"></button>
                 </div>
                 <div class="modal-body">
-                    <p class="small text-muted">Enter your Google Gemini API key to enable native audio speech recognition and dynamic generation via Gemini Flash models.</p>
-                    <input type="password" id="geminiApiKeyInput" class="form-control mb-2" placeholder="AIzaSy...">
-                    <div class="small text-secondary"><i class="bi bi-shield-check me-1 text-success"></i>Saved locally in <code>.env</code> file.</div>
+                    <div id="currentApiKeyStatus" class="mb-3"></div>
+                    <p class="small text-muted mb-2">Enter your Google Gemini API key to enable native audio speech recognition and dynamic generation via Gemini Flash models.</p>
+                    <input type="password" id="geminiApiKeyInput" class="form-control mb-2" placeholder="AIzaSy... or AQ....">
+                    <div class="small text-secondary"><i class="bi bi-shield-check me-1 text-success"></i>Saved permanently to local <code>.env</code> file &amp; Windows User Environment (persists across restarts).</div>
                 </div>
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary btn-sm" onclick="closeApiKeyModal()">Close</button>
@@ -1550,8 +1810,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 const data = await res.json();
                 document.getElementById('crmDot').className = 'status-dot ' + (data.crm_api.connected ? 'dot-green' : 'dot-red');
                 document.getElementById('tasksDot').className = 'status-dot ' + (data.tasks_api.connected ? 'dot-green' : 'dot-red');
+                const btn = document.getElementById('apiKeyBtn');
                 if (data.gemini_api_key_configured) {
-                    document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
+                    const masked = data.gemini_api_key_masked ? ` (${data.gemini_api_key_masked})` : '';
+                    if (btn) btn.className = 'btn btn-sm btn-outline-success d-flex align-items-center gap-1';
+                    document.getElementById('apiKeyBtnText').textContent = `Gemini Active${masked}`;
+                } else {
+                    if (btn) btn.className = 'btn btn-sm btn-outline-warning d-flex align-items-center gap-1';
+                    document.getElementById('apiKeyBtnText').textContent = "Configure Gemini Key";
+                    // Check if saved in localStorage as a backup
+                    const localKey = localStorage.getItem('gemini_api_key');
+                    if (localKey && !localKey.includes('your_actual') && localKey.trim().length > 10) {
+                        await fetch('/api/set-api-key', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ api_key: localKey.trim() })
+                        });
+                        await checkHealth();
+                        return;
+                    }
                 }
             } catch (err) {
                 console.error("Health check error:", err);
@@ -2074,6 +2351,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         // ---------------------------------------------------------------------
         function openApiKeyModal() {
             const modalEl = document.getElementById('apiKeyModal');
+
+            // Render current status and masked key
+            fetch('/api/health').then(r => r.json()).then(d => {
+                const statusEl = document.getElementById('currentApiKeyStatus');
+                if (statusEl) {
+                    if (d.gemini_api_key_configured) {
+                        statusEl.innerHTML = `
+                            <div class="alert alert-success border border-success border-opacity-25 bg-success bg-opacity-10 small py-2 mb-2">
+                                <i class="bi bi-shield-check text-success me-1"></i>
+                                <strong>Active Gemini Key:</strong> <code>${d.gemini_api_key_masked || 'Configured'}</code>
+                                <div class="text-secondary mt-1" style="font-size:0.75rem;">Key is permanently saved in local <code>.env</code> and Windows User environment. It will stay active on server restart.</div>
+                            </div>
+                        `;
+                    } else {
+                        statusEl.innerHTML = `
+                            <div class="alert alert-warning border border-warning border-opacity-25 bg-warning bg-opacity-10 small py-2 mb-2">
+                                <i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>
+                                No active API key configured. Enter your Gemini API key below to activate AI features.
+                            </div>
+                        `;
+                    }
+                }
+            }).catch(e => console.warn("Failed fetching health for modal:", e));
+
             if (window.bootstrap && window.bootstrap.Modal) {
                 try {
                     if (!apiKeyModalInstance) {
@@ -2117,12 +2418,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 });
 
                 if (res.ok) {
+                    localStorage.setItem('gemini_api_key', key);
+                    document.getElementById('geminiApiKeyInput').value = '';
                     closeApiKeyModal();
-                    document.getElementById('apiKeyBtnText').textContent = "Gemini Key Configured";
                     await checkHealth();
-                    alert('Gemini API key configured successfully!');
+                    alert('Gemini API key saved permanently! It will remain active even when restarting.');
                 } else {
-                    alert('Failed to save API key');
+                    const err = await res.json();
+                    alert('Failed to save API key: ' + (err.detail || 'Invalid key'));
                 }
             } catch (e) {
                 alert('Network error saving API key: ' + e.message);

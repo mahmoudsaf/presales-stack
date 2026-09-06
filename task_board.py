@@ -1,3 +1,4 @@
+import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator, model_valida
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 DB_FILE = Path(__file__).resolve().parent / "tasks.db"
+CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
 
 
 class TaskCategory(str, Enum):
@@ -72,6 +74,7 @@ def init_db():
         task_title TEXT NOT NULL,
         category TEXT NOT NULL CHECK(category IN ('RFP_OWNERSHIP', 'RFP_DISTRIBUTED_SCOPE', 'GENERAL_ACTION')),
         related_deal_id INTEGER,
+        customer_id INTEGER,
         assigned_to TEXT NOT NULL CHECK(assigned_to IN ('Presales 1', 'Presales 2')),
         vendor_domain TEXT NOT NULL CHECK(vendor_domain IN ('HPE', 'Veeam', 'Dell', 'Nutanix', 'VMware', 'General')),
         status TEXT NOT NULL CHECK(status IN ('Not Started', 'In Progress', 'Waiting on Vendor', 'Pending Review', 'Completed')),
@@ -85,7 +88,7 @@ def init_db():
     );
     """)
 
-    # Schema migration check: ensure started_at, completed_at, deal_name, customer_name exist
+    # Schema migration check: ensure started_at, completed_at, deal_name, customer_name, customer_id exist
     cursor.execute("PRAGMA table_info(tasks);")
     existing_cols = [r["name"] for r in cursor.fetchall()]
     if "started_at" not in existing_cols:
@@ -96,6 +99,8 @@ def init_db():
         cursor.execute("ALTER TABLE tasks ADD COLUMN deal_name TEXT;")
     if "customer_name" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN customer_name TEXT;")
+    if "customer_id" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN customer_id INTEGER;")
 
     # Activity event log table for full lifecycle tracking
     cursor.execute("""
@@ -110,175 +115,179 @@ def init_db():
     );
     """)
 
-    # Seed illustrative default tasks if database is empty
-    cursor.execute("SELECT COUNT(*) FROM tasks;")
-    if cursor.fetchone()[0] == 0:
-        seed_tasks = [
-            (
-                "Author Executive Technical Summary for Hospital Cluster",
-                "RFP_OWNERSHIP",
-                1,
-                "Presales 1",
-                "HPE",
-                "In Progress",
-                "High",
-                "2026-09-18",
-                "Awaiting final sizing quote from HPE partner portal.",
-                "2026-09-02 09:00:00",
-                None,
-            ),
-            (
-                "Validate Nutanix AHV Sizing & IOPS Specs",
-                "RFP_DISTRIBUTED_SCOPE",
-                1,
-                "Presales 2",
-                "Nutanix",
-                "Waiting on Vendor",
-                "High",
-                "2026-09-15",
-                "Vendor SE is on annual leave until Tuesday.",
-                "2026-09-03 11:30:00",
-                None,
-            ),
-            (
-                "Build Veeam v12.2 Immutability Bill of Materials (BOM)",
-                "RFP_DISTRIBUTED_SCOPE",
-                2,
-                "Presales 2",
-                "Veeam",
-                "Pending Review",
-                "Medium",
-                "2026-09-22",
-                None,
-                "2026-09-04 14:00:00",
-                None,
-            ),
-            (
-                "Dell PowerProtect Sizing Calculator Verification",
-                "RFP_DISTRIBUTED_SCOPE",
-                2,
-                "Presales 1",
-                "Dell",
-                "Completed",
-                "High",
-                "2026-09-10",
-                None,
-                "2026-09-01 08:30:00",
-                "2026-09-04 16:45:00",
-            ),
-            (
-                "Review VMware VCF Licensing Migration Playbook",
-                "GENERAL_ACTION",
-                4,
-                "Presales 2",
-                "VMware",
-                "Not Started",
-                "Medium",
-                "2026-09-25",
-                "Pending customer confirmation of core counts.",
-                None,
-                None,
-            ),
-            (
-                "Schedule Lab PoC Readiness Call for FinTech Horizons",
-                "GENERAL_ACTION",
-                2,
-                "Presales 1",
-                "General",
-                "In Progress",
-                "Low",
-                "2026-09-12",
-                None,
-                "2026-09-04 10:00:00",
-                None,
-            ),
-        ]
+    # Seed illustrative default tasks if explicitly requested via environment variable
+    if os.environ.get("SEED_DEMO_DATA", "").lower() == "true":
+        cursor.execute("SELECT COUNT(*) FROM tasks;")
+        if cursor.fetchone()[0] == 0:
+            seed_tasks = [
+                (
+                    "Author Executive Technical Summary for Hospital Cluster",
+                    "RFP_OWNERSHIP",
+                    1,
+                    "Presales 1",
+                    "HPE",
+                    "In Progress",
+                    "High",
+                    "2026-09-18",
+                    "Awaiting final sizing quote from HPE partner portal.",
+                    "2026-09-02 09:00:00",
+                    None,
+                ),
+                (
+                    "Validate Nutanix AHV Sizing & IOPS Specs",
+                    "RFP_DISTRIBUTED_SCOPE",
+                    1,
+                    "Presales 2",
+                    "Nutanix",
+                    "Waiting on Vendor",
+                    "High",
+                    "2026-09-15",
+                    "Vendor SE is on annual leave until Tuesday.",
+                    "2026-09-03 11:30:00",
+                    None,
+                ),
+                (
+                    "Build Veeam v12.2 Immutability Bill of Materials (BOM)",
+                    "RFP_DISTRIBUTED_SCOPE",
+                    2,
+                    "Presales 2",
+                    "Veeam",
+                    "Pending Review",
+                    "Medium",
+                    "2026-09-22",
+                    None,
+                    "2026-09-04 14:00:00",
+                    None,
+                ),
+                (
+                    "Dell PowerProtect Sizing Calculator Verification",
+                    "RFP_DISTRIBUTED_SCOPE",
+                    2,
+                    "Presales 1",
+                    "Dell",
+                    "Completed",
+                    "High",
+                    "2026-09-10",
+                    None,
+                    "2026-09-01 08:30:00",
+                    "2026-09-04 16:45:00",
+                ),
+                (
+                    "Review VMware VCF Licensing Migration Playbook",
+                    "GENERAL_ACTION",
+                    4,
+                    "Presales 2",
+                    "VMware",
+                    "Not Started",
+                    "Medium",
+                    "2026-09-25",
+                    "Pending customer confirmation of core counts.",
+                    None,
+                    None,
+                ),
+                (
+                    "Schedule Lab PoC Readiness Call for FinTech Horizons",
+                    "GENERAL_ACTION",
+                    2,
+                    "Presales 1",
+                    "General",
+                    "In Progress",
+                    "Low",
+                    "2026-09-12",
+                    None,
+                    "2026-09-04 10:00:00",
+                    None,
+                ),
+            ]
 
-        cursor.executemany(
-            """
-            INSERT INTO tasks (
-                task_title, category, related_deal_id, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """,
-            seed_tasks,
-        )
+            cursor.executemany(
+                """
+                INSERT INTO tasks (
+                    task_title, category, related_deal_id, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                seed_tasks,
+            )
+
+        # Seed initial activity logs for tasks if activity table is empty
+        cursor.execute("SELECT COUNT(*) FROM task_activity_log;")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("SELECT task_id, status, assigned_to, created_at, started_at, completed_at FROM tasks;")
+            for t_row in cursor.fetchall():
+                # Initial creation log
+                cursor.execute(
+                    """
+                    INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (t_row["task_id"], None, "Not Started", t_row["created_at"], t_row["assigned_to"]),
+                )
+                # If transitioned to started/in progress
+                if t_row["started_at"] and t_row["status"] != "Not Started":
+                    cursor.execute(
+                        """
+                        INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (t_row["task_id"], "Not Started", "In Progress", t_row["started_at"], t_row["assigned_to"]),
+                    )
+                # If completed
+                if t_row["completed_at"] and t_row["status"] == "Completed":
+                    cursor.execute(
+                        """
+                        INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (t_row["task_id"], "In Progress", "Completed", t_row["completed_at"], t_row["assigned_to"]),
+                    )
 
     # Backfill timestamps for any completed/in-progress tasks if null
     cursor.execute("UPDATE tasks SET started_at = created_at WHERE status != 'Not Started' AND started_at IS NULL;")
     cursor.execute("UPDATE tasks SET completed_at = updated_at WHERE status = 'Completed' AND completed_at IS NULL;")
 
-    # Seed initial activity logs for tasks if activity table is empty
-    cursor.execute("SELECT COUNT(*) FROM task_activity_log;")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("SELECT task_id, status, assigned_to, created_at, started_at, completed_at FROM tasks;")
-        for t_row in cursor.fetchall():
-            # Initial creation log
-            cursor.execute(
-                """
-                INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
-                VALUES (?, ?, ?, ?, ?);
-                """,
-                (t_row["task_id"], None, "Not Started", t_row["created_at"], t_row["assigned_to"]),
-            )
-            # If transitioned to started/in progress
-            if t_row["started_at"] and t_row["status"] != "Not Started":
-                cursor.execute(
-                    """
-                    INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
-                    VALUES (?, ?, ?, ?, ?);
-                    """,
-                    (t_row["task_id"], "Not Started", "In Progress", t_row["started_at"], t_row["assigned_to"]),
-                )
-            # If completed
-            if t_row["completed_at"] and t_row["status"] == "Completed":
-                cursor.execute(
-                    """
-                    INSERT INTO task_activity_log (task_id, from_status, to_status, changed_at, user_id)
-                    VALUES (?, ?, ?, ?, ?);
-                    """,
-                    (t_row["task_id"], "In Progress", "Completed", t_row["completed_at"], t_row["assigned_to"]),
-                )
-
-    # Backfill deal_name and customer_name from crm.db if available
-    CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
+    # Backfill deal_name, customer_name, and customer_id from crm.db if available
     if CRM_DB_FILE.exists():
         try:
             crm_conn = sqlite3.connect(CRM_DB_FILE)
             crm_conn.row_factory = sqlite3.Row
             crm_cur = crm_conn.cursor()
             crm_cur.execute("""
-                SELECT d.deal_id, d.deal_name, c.company_name as customer_name
+                SELECT d.deal_id, d.deal_name, d.customer_id, c.company_name as customer_name
                 FROM deals d
                 LEFT JOIN customers c ON d.customer_id = c.customer_id
             """)
             for r in crm_cur.fetchall():
                 d_id = r["deal_id"]
                 d_name = r["deal_name"]
+                c_id = r["customer_id"]
                 c_name = r["customer_name"] or ""
                 # Backfill linked tasks
                 cursor.execute("""
                     UPDATE tasks 
                     SET deal_name = COALESCE(deal_name, ?),
-                        customer_name = COALESCE(customer_name, ?)
+                        customer_name = COALESCE(customer_name, ?),
+                        customer_id = COALESCE(customer_id, ?)
                     WHERE related_deal_id = ?;
-                """, (d_name, c_name, d_id))
+                """, (d_name, c_name, c_id, d_id))
                 # Auto-link unlinked tasks by deal name or customer name keywords
                 if d_name and len(d_name) > 4:
                     cursor.execute("""
                         UPDATE tasks 
                         SET related_deal_id = COALESCE(related_deal_id, ?),
                             deal_name = COALESCE(deal_name, ?),
-                            customer_name = COALESCE(customer_name, ?)
+                            customer_name = COALESCE(customer_name, ?),
+                            customer_id = COALESCE(customer_id, ?)
                         WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, f"%{d_name.lower()}%"))
+                    """, (d_id, d_name, c_name, c_id, f"%{d_name.lower()}%"))
                 if c_name and len(c_name) > 3:
                     cursor.execute("""
                         UPDATE tasks 
                         SET related_deal_id = COALESCE(related_deal_id, ?),
                             deal_name = COALESCE(deal_name, ?),
-                            customer_name = COALESCE(customer_name, ?)
+                            customer_name = COALESCE(customer_name, ?),
+                            customer_id = COALESCE(customer_id, ?)
                         WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, f"%{c_name.lower()}%"))
+                    """, (d_id, d_name, c_name, c_id, f"%{c_name.lower()}%"))
             crm_conn.close()
         except Exception as e:
             print(f"Notice: CRM backfill skipped: {e}")
@@ -293,10 +302,8 @@ def init_db():
     conn.close()
 
 
-CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
-
-def get_deal_customer_map() -> Dict[int, Dict[str, str]]:
-    """Fetches deal_name and customer_name for each deal_id from crm.db if available."""
+def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
+    """Fetches deal_name, customer_id, customer_name, and primary_vendors for each deal_id from crm.db if available."""
     deal_map = {}
     if not CRM_DB_FILE.exists():
         return deal_map
@@ -305,20 +312,44 @@ def get_deal_customer_map() -> Dict[int, Dict[str, str]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT d.deal_id, d.deal_name, c.company_name as customer_name
+            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, c.company_name as customer_name
             FROM deals d
             LEFT JOIN customers c ON d.customer_id = c.customer_id
             ORDER BY d.deal_id ASC
         """)
         for r in cur.fetchall():
             deal_map[r["deal_id"]] = {
+                "deal_id": r["deal_id"],
                 "deal_name": r["deal_name"] or "",
+                "customer_id": r["customer_id"],
                 "customer_name": r["customer_name"] or "",
+                "primary_vendors": r["primary_vendors"] or "",
             }
         conn.close()
     except Exception:
         pass
     return deal_map
+
+
+def get_customer_list() -> List[Dict[str, Any]]:
+    """Fetches customer_id and company_name list from crm.db if available."""
+    cust_list = []
+    if not CRM_DB_FILE.exists():
+        return cust_list
+    try:
+        conn = sqlite3.connect(CRM_DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT customer_id, company_name FROM customers ORDER BY customer_id ASC;")
+        for r in cur.fetchall():
+            cust_list.append({
+                "customer_id": r["customer_id"],
+                "company_name": r["company_name"] or "",
+            })
+        conn.close()
+    except Exception:
+        pass
+    return cust_list
 
 
 @asynccontextmanager
@@ -355,6 +386,7 @@ class TaskBase(BaseModel):
     task_title: str = Field(default="Presales Action Item", description="Actionable title for the task")
     category: Union[TaskCategory, str] = Field(default=TaskCategory.GENERAL_ACTION, description="RFP_OWNERSHIP, RFP_DISTRIBUTED_SCOPE, or GENERAL_ACTION")
     related_deal_id: Optional[Union[int, str]] = Field(None, description="Optional foreign deal ID reference")
+    customer_id: Optional[Union[int, str]] = Field(None, description="Optional foreign customer ID reference")
     deal_name: Optional[str] = Field(None, description="Optional associated deal name")
     customer_name: Optional[str] = Field(None, description="Optional associated customer name")
     assigned_to: Union[PresalesRep, str] = Field(default=PresalesRep.PRESALES_1, description="Presales 1 or Presales 2")
@@ -451,6 +483,18 @@ class TaskBase(BaseModel):
             return int(nums[0])
         return None
 
+    @field_validator("customer_id", mode="before")
+    @classmethod
+    def normalize_customer_id(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, int):
+            return v
+        nums = re.findall(r"\d+", str(v))
+        if nums:
+            return int(nums[0])
+        return None
+
 
 class TaskCreate(TaskBase):
     changed_by: Optional[str] = Field(default="Voice Agent", description="User or agent recording the creation")
@@ -469,6 +513,7 @@ class TaskUpdate(BaseModel):
     task_title: Optional[str] = None
     category: Optional[Union[TaskCategory, str]] = None
     related_deal_id: Optional[Union[int, str]] = None
+    customer_id: Optional[Union[int, str]] = None
     deal_name: Optional[str] = None
     customer_name: Optional[str] = None
     assigned_to: Optional[Union[PresalesRep, str]] = None
@@ -574,6 +619,18 @@ class TaskUpdate(BaseModel):
             return int(nums[0])
         return None
 
+    @field_validator("customer_id", mode="before")
+    @classmethod
+    def normalize_customer_id(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, int):
+            return v
+        nums = re.findall(r"\d+", str(v))
+        if nums:
+            return int(nums[0])
+        return None
+
 
 class TaskOut(TaskBase):
     task_id: int
@@ -631,14 +688,22 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] 
     cols = row.keys()
     d_name = row["deal_name"] if "deal_name" in cols and row["deal_name"] else None
     c_name = row["customer_name"] if "customer_name" in cols and row["customer_name"] else None
+    c_id = row["customer_id"] if "customer_id" in cols and row["customer_id"] else None
 
     rel_deal = row["related_deal_id"]
-    if (not d_name or not c_name) and rel_deal:
+    if (not d_name or not c_name or not c_id) and rel_deal:
         if deal_map is None:
             deal_map = get_deal_customer_map()
         if rel_deal in deal_map:
             d_name = d_name or deal_map[rel_deal].get("deal_name")
             c_name = c_name or deal_map[rel_deal].get("customer_name")
+            c_id = c_id or deal_map[rel_deal].get("customer_id")
+
+    if not c_name and c_id:
+        for c in get_customer_list():
+            if c["customer_id"] == c_id:
+                c_name = c["company_name"]
+                break
 
     if not c_name and row["task_title"]:
         title_lower = str(row["task_title"]).lower()
@@ -654,6 +719,7 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] 
         task_title=row["task_title"],
         category=row["category"],
         related_deal_id=rel_deal,
+        customer_id=c_id,
         deal_name=d_name,
         customer_name=c_name,
         assigned_to=row["assigned_to"],
@@ -852,26 +918,35 @@ def create_task(payload: TaskCreate):
     started_at = now_iso if status_val != TaskStatus.NOT_STARTED.value else None
     completed_at = now_iso if status_val == TaskStatus.COMPLETED.value else None
 
-    # Resolve deal_name and customer_name
+    # Resolve deal_name, customer_name, and customer_id
     deal_map = get_deal_customer_map()
     deal_name = payload.deal_name
     customer_name = payload.customer_name
-    if payload.related_deal_id and (not deal_name or not customer_name):
+    customer_id = payload.customer_id
+    if payload.related_deal_id and (not deal_name or not customer_name or not customer_id):
         d_info = deal_map.get(payload.related_deal_id)
         if d_info:
             deal_name = deal_name or d_info.get("deal_name")
             customer_name = customer_name or d_info.get("customer_name")
+            customer_id = customer_id or d_info.get("customer_id")
+
+    if customer_id and not customer_name:
+        for c in get_customer_list():
+            if c["customer_id"] == customer_id:
+                customer_name = c["company_name"]
+                break
 
     cursor.execute(
         """
         INSERT INTO tasks (
-            task_title, category, related_deal_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            task_title, category, related_deal_id, customer_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             payload.task_title.strip(),
             cat_val,
             payload.related_deal_id,
+            customer_id,
             deal_name,
             customer_name,
             assigned_val,
@@ -940,6 +1015,16 @@ def update_task(task_id: int, payload: TaskUpdate):
         update_clauses.append("category = ?")
         params.append(cat_val)
 
+    if payload.customer_id is not None:
+        update_clauses.append("customer_id = ?")
+        params.append(payload.customer_id)
+        if payload.customer_name is None and payload.customer_id:
+            for c in get_customer_list():
+                if c["customer_id"] == payload.customer_id:
+                    update_clauses.append("customer_name = ?")
+                    params.append(c["company_name"])
+                    break
+
     if payload.related_deal_id is not None:
         update_clauses.append("related_deal_id = ?")
         params.append(payload.related_deal_id)
@@ -953,6 +1038,9 @@ def update_task(task_id: int, payload: TaskUpdate):
                 if payload.customer_name is None:
                     update_clauses.append("customer_name = ?")
                     params.append(d_info.get("customer_name"))
+                if payload.customer_id is None and d_info.get("customer_id"):
+                    update_clauses.append("customer_id = ?")
+                    params.append(d_info.get("customer_id"))
 
     if payload.deal_name is not None:
         update_clauses.append("deal_name = ?")
@@ -1039,9 +1127,20 @@ def get_deals_lookup():
     """Returns simplified deal and customer list for task linking dropdowns."""
     deal_map = get_deal_customer_map()
     return [
-        {"deal_id": did, "deal_name": d["deal_name"], "customer_name": d["customer_name"]}
+        {
+            "deal_id": did,
+            "deal_name": d["deal_name"],
+            "customer_id": d.get("customer_id"),
+            "customer_name": d["customer_name"],
+        }
         for did, d in sorted(deal_map.items())
     ]
+
+
+@app.get("/api/customers-lookup", tags=["Customers"])
+def get_customers_lookup():
+    """Returns list of registered customers from CRM for dropdown selection."""
+    return get_customer_list()
 
 
 @app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
@@ -1263,6 +1362,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <div class="text-muted small">Monday.com-style tracking for RFP Ownership, Distributed Scopes & Technical Actions</div>
             </div>
             <div class="d-flex align-items-center gap-2">
+                <a href="http://127.0.0.1:8000/dashboard" class="btn btn-sm btn-outline-primary d-flex align-items-center gap-1" title="Executive Visual Analytics & Metrics Dashboard">
+                    <i class="bi bi-bar-chart-line-fill"></i> 📊 Visual Dashboard
+                </a>
                 <a href="/docs" target="_blank" class="btn btn-sm btn-outline-secondary">
                     <i class="bi bi-file-earmark-code me-1"></i>Swagger Docs
                 </a>
@@ -1384,12 +1486,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <input type="text" id="newTitle" class="form-control" placeholder="e.g. Complete Technical RFP Section 3.2" required>
                             </div>
                             <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Customer Name</label>
-                                <input type="text" id="newCustomerName" list="taskCustomerDatalist" class="form-control" placeholder="e.g. Acme Corp (or select deal)">
+                                <label class="form-label small fw-semibold"><i class="bi bi-building text-primary me-1"></i>Customer Account (ID & Name)</label>
+                                <select id="newCustomerId" class="form-select" onchange="onNewCustomerChange()">
+                                    <option value="">-- Select Customer or None --</option>
+                                </select>
                             </div>
                             <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related CRM Deal</label>
-                                <select id="newDealId" class="form-select">
+                                <label class="form-label small fw-semibold"><i class="bi bi-briefcase text-success me-1"></i>Related CRM Deal (ID & Name)</label>
+                                <select id="newDealId" class="form-select" onchange="onNewDealChange()">
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
@@ -1462,12 +1566,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <input type="text" id="editTitle" class="form-control" required>
                             </div>
                             <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Customer Name</label>
-                                <input type="text" id="editCustomerName" list="taskCustomerDatalist" class="form-control" placeholder="Customer / Company Name">
+                                <label class="form-label small fw-semibold"><i class="bi bi-building text-primary me-1"></i>Customer Account (ID & Name)</label>
+                                <select id="editCustomerId" class="form-select" onchange="onEditCustomerChange()">
+                                    <option value="">-- Select Customer or None --</option>
+                                </select>
                             </div>
                             <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related CRM Deal</label>
-                                <select id="editDealId" class="form-select">
+                                <label class="form-label small fw-semibold"><i class="bi bi-briefcase text-success me-1"></i>Related CRM Deal (ID & Name)</label>
+                                <select id="editDealId" class="form-select" onchange="onEditDealChange()">
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
@@ -1561,6 +1667,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <script>
         let allTasks = [];
         let allDeals = [];
+        let allCustomers = [];
         let currentFilter = 'ALL';
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
@@ -1571,73 +1678,167 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         document.addEventListener('DOMContentLoaded', () => {
             loadTasks();
-            const newDealSel = document.getElementById('newDealId');
-            if (newDealSel) {
-                newDealSel.addEventListener('change', (e) => {
-                    const selId = parseInt(e.target.value);
-                    const found = allDeals.find(d => d.deal_id === selId);
-                    if (found && found.customer_name) {
-                        const custInput = document.getElementById('newCustomerName');
-                        if (custInput) custInput.value = found.customer_name;
-                    }
-                });
-            }
-            const editDealSel = document.getElementById('editDealId');
-            if (editDealSel) {
-                editDealSel.addEventListener('change', (e) => {
-                    const selId = parseInt(e.target.value);
-                    const banner = document.getElementById('editDealBannerContainer');
-                    const found = allDeals.find(d => d.deal_id === selId);
-                    if (found) {
-                        const custInput = document.getElementById('editCustomerName');
-                        if (custInput && found.customer_name) custInput.value = found.customer_name;
-                        if (banner) {
-                            banner.innerHTML = `
-                                <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
-                                    <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${found.customer_name || 'N/A'}</strong></span>
-                                    <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${found.deal_name}</strong></span>
-                                </div>
-                            `;
-                        }
-                    } else {
-                        if (banner) banner.innerHTML = '';
-                    }
-                });
-            }
         });
 
-        async function loadDealsLookup() {
+        async function loadLookups() {
             try {
-                const res = await fetch('/api/deals-lookup');
-                if (res.ok) {
-                    allDeals = await res.json();
-                    populateDealSelects();
-                    populateCustomerDatalist();
+                const [dealsRes, custsRes] = await Promise.all([
+                    fetch('/api/deals-lookup'),
+                    fetch('/api/customers-lookup')
+                ]);
+                if (dealsRes.ok) {
+                    allDeals = await dealsRes.json();
                 }
+                if (custsRes.ok) {
+                    allCustomers = await custsRes.json();
+                }
+                populateCustomerSelects();
+                populateDealSelects();
+                populateCustomerDatalist();
             } catch(e) {
-                console.warn("Failed to load deals lookup:", e);
+                console.warn("Failed to load lookups:", e);
             }
         }
 
-        function populateDealSelects() {
-            const newSel = document.getElementById('newDealId');
-            const editSel = document.getElementById('editDealId');
-            if (!newSel || !editSel) return;
+        function populateCustomerSelects() {
+            const newCustSel = document.getElementById('newCustomerId');
+            const editCustSel = document.getElementById('editCustomerId');
+            if (!newCustSel || !editCustSel) return;
 
-            const opts = ['<option value="">-- No Linked Deal --</option>'];
-            allDeals.forEach(d => {
-                const label = `Deal #${d.deal_id}: ${d.deal_name}${d.customer_name ? ` (${d.customer_name})` : ''}`;
-                opts.push(`<option value="${d.deal_id}">${label}</option>`);
+            const opts = ['<option value="">-- No Customer Selected --</option>'];
+            allCustomers.forEach(c => {
+                opts.push(`<option value="${c.customer_id}">#${c.customer_id} - ${c.company_name}</option>`);
             });
             const html = opts.join('');
-            newSel.innerHTML = html;
-            editSel.innerHTML = html;
+            const prevNew = newCustSel.value;
+            const prevEdit = editCustSel.value;
+            newCustSel.innerHTML = html;
+            editCustSel.innerHTML = html;
+            if (prevNew && newCustSel.querySelector(`option[value="${prevNew}"]`)) newCustSel.value = prevNew;
+            if (prevEdit && editCustSel.querySelector(`option[value="${prevEdit}"]`)) editCustSel.value = prevEdit;
+        }
+
+        function populateDealSelects(filterCustomerId = null, target = 'both') {
+            const newSel = document.getElementById('newDealId');
+            const editSel = document.getElementById('editDealId');
+
+            const makeOptions = (selectedCustId) => {
+                const opts = ['<option value="">-- No Linked Deal --</option>'];
+                const filtered = selectedCustId 
+                    ? allDeals.filter(d => d.customer_id === selectedCustId)
+                    : allDeals;
+                filtered.forEach(d => {
+                    const custLabel = d.customer_name ? ` (#${d.customer_id || ''} ${d.customer_name})` : '';
+                    const label = `Deal #${d.deal_id}: ${d.deal_name}${custLabel}`;
+                    opts.push(`<option value="${d.deal_id}">${label}</option>`);
+                });
+                return opts.join('');
+            };
+
+            if (target === 'both' || target === 'new') {
+                if (newSel) {
+                    const prevVal = newSel.value;
+                    newSel.innerHTML = makeOptions(filterCustomerId);
+                    if (prevVal && newSel.querySelector(`option[value="${prevVal}"]`)) {
+                        newSel.value = prevVal;
+                    }
+                }
+            }
+            if (target === 'both' || target === 'edit') {
+                if (editSel) {
+                    const prevVal = editSel.value;
+                    editSel.innerHTML = makeOptions(filterCustomerId);
+                    if (prevVal && editSel.querySelector(`option[value="${prevVal}"]`)) {
+                        editSel.value = prevVal;
+                    }
+                }
+            }
+        }
+
+        function onNewCustomerChange() {
+            const custId = parseInt(document.getElementById('newCustomerId').value) || null;
+            populateDealSelects(custId, 'new');
+            const newDealSel = document.getElementById('newDealId');
+            if (newDealSel && newDealSel.value) {
+                const deal = allDeals.find(d => d.deal_id === parseInt(newDealSel.value));
+                if (deal && custId && deal.customer_id !== custId) {
+                    newDealSel.value = "";
+                }
+            }
+        }
+
+        function onNewDealChange() {
+            const dealId = parseInt(document.getElementById('newDealId').value) || null;
+            if (!dealId) return;
+            const deal = allDeals.find(d => d.deal_id === dealId);
+            if (deal && deal.customer_id) {
+                const newCustSel = document.getElementById('newCustomerId');
+                if (newCustSel) {
+                    newCustSel.value = deal.customer_id;
+                    populateDealSelects(deal.customer_id, 'new');
+                    newCustSel.value = deal.customer_id;
+                    document.getElementById('newDealId').value = dealId;
+                }
+            }
+        }
+
+        function onEditCustomerChange() {
+            const custId = parseInt(document.getElementById('editCustomerId').value) || null;
+            populateDealSelects(custId, 'edit');
+            const editDealSel = document.getElementById('editDealId');
+            if (editDealSel && editDealSel.value) {
+                const deal = allDeals.find(d => d.deal_id === parseInt(editDealSel.value));
+                if (deal && custId && deal.customer_id !== custId) {
+                    editDealSel.value = "";
+                }
+            }
+            updateEditBanner();
+        }
+
+        function onEditDealChange() {
+            const dealId = parseInt(document.getElementById('editDealId').value) || null;
+            if (!dealId) {
+                updateEditBanner();
+                return;
+            }
+            const deal = allDeals.find(d => d.deal_id === dealId);
+            if (deal && deal.customer_id) {
+                const editCustSel = document.getElementById('editCustomerId');
+                if (editCustSel) {
+                    editCustSel.value = deal.customer_id;
+                    populateDealSelects(deal.customer_id, 'edit');
+                    editCustSel.value = deal.customer_id;
+                    document.getElementById('editDealId').value = dealId;
+                }
+            }
+            updateEditBanner();
+        }
+
+        function updateEditBanner() {
+            const banner = document.getElementById('editDealBannerContainer');
+            if (!banner) return;
+            const custId = parseInt(document.getElementById('editCustomerId').value) || null;
+            const dealId = parseInt(document.getElementById('editDealId').value) || null;
+            const cust = allCustomers.find(c => c.customer_id === custId);
+            const deal = allDeals.find(d => d.deal_id === dealId);
+
+            if (cust || deal) {
+                banner.innerHTML = `
+                    <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
+                        <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${cust ? '#' + cust.customer_id + ' ' + cust.company_name : 'None'}</strong></span>
+                        <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${deal ? '#' + deal.deal_id + ' ' + deal.deal_name : 'None'}</strong></span>
+                    </div>
+                `;
+            } else {
+                banner.innerHTML = '';
+            }
         }
 
         function populateCustomerDatalist() {
             const datalist = document.getElementById('taskCustomerDatalist');
             if (!datalist) return;
             const names = new Set();
+            allCustomers.forEach(c => { if (c.company_name) names.add(c.company_name.trim()); });
             allDeals.forEach(d => { if (d.customer_name) names.add(d.customer_name.trim()); });
             allTasks.forEach(t => { if (t.customer_name) names.add(t.customer_name.trim()); });
             datalist.innerHTML = Array.from(names).sort().map(name => `<option value="${name}"></option>`).join('');
@@ -1645,7 +1846,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         async function loadTasks() {
             try {
-                loadDealsLookup();
+                loadLookups();
                 const res = await fetch('/api/tasks');
                 allTasks = await res.json();
                 populateCustomerDatalist();
@@ -1756,7 +1957,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             <thead>
                                 <tr>
                                     <th class="text-start" style="width: 28%;">Item Title</th>
-                                    <th class="text-start" style="width: 14%;">Customer Name</th>
+                                    <th class="text-start" style="width: 15%;">Customer (ID & Name)</th>
                                     <th style="width: 11%;">Assignee</th>
                                     <th style="width: 12%;">Status</th>
                                     <th style="width: 9%;">Priority</th>
@@ -1786,7 +1987,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             const dealLabel = t.deal_name ? t.deal_name : (t.related_deal_id ? `Deal #${t.related_deal_id}` : '');
             const dealBadge = dealLabel 
-                ? `<span class="deal-tag" style="font-size: 0.73rem;" title="Associated Deal"><i class="bi bi-briefcase me-1"></i>Deal: <strong class="text-primary">${dealLabel}</strong>${t.related_deal_id && t.deal_name ? ` (#${t.related_deal_id})` : ''}</span>` 
+                ? `<span class="deal-tag" style="font-size: 0.73rem;" title="Associated Deal"><i class="bi bi-briefcase me-1"></i>Deal: ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.7rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}<strong class="text-primary">${dealLabel}</strong></span>` 
                 : '';
 
             const blockerDisplay = t.management_blockers 
@@ -1840,12 +2041,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     </td>
                     <td class="text-start">
                         ${t.customer_name ? `
-                            <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem; font-weight: 600;" title="${t.customer_name}">
-                                <i class="bi bi-building text-primary me-1"></i>${t.customer_name}
-                            </span>
+                            <div class="d-flex align-items-center gap-1">
+                                ${t.customer_id ? `<span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>` : ''}
+                                <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem; font-weight: 600;" title="${t.customer_name}">
+                                    <i class="bi bi-building text-primary me-1"></i>${t.customer_name}
+                                </span>
+                            </div>
+                        ` : (t.customer_id ? `
+                            <span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>
                         ` : `
                             <span class="text-muted small fst-italic">-</span>
-                        `}
+                        `)}
                     </td>
                     <td>
                         <span class="avatar-badge">
@@ -1947,8 +2153,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         function openNewTaskModal(presetCategory) {
             document.getElementById('newTaskForm').reset();
-            const custInput = document.getElementById('newCustomerName');
-            if (custInput) custInput.value = '';
+            populateCustomerSelects();
+            populateDealSelects(null, 'new');
             if (presetCategory) {
                 document.getElementById('newCategory').value = presetCategory;
             }
@@ -1957,17 +2163,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         async function submitNewTask(e) {
             e.preventDefault();
-            const custName = document.getElementById('newCustomerName').value.trim();
+            const custId = parseInt(document.getElementById('newCustomerId').value) || null;
             const dealId = parseInt(document.getElementById('newDealId').value) || null;
+            const custObj = allCustomers.find(c => c.customer_id === custId);
+            const dealObj = allDeals.find(d => d.deal_id === dealId);
+
             const payload = {
                 task_title: document.getElementById('newTitle').value,
                 category: document.getElementById('newCategory').value,
                 assigned_to: document.getElementById('newAssigned').value,
-                customer_name: custName || null,
+                customer_id: custId,
+                customer_name: custObj ? custObj.company_name : (dealObj ? dealObj.customer_name : null),
                 status: document.getElementById('newStatus').value,
                 priority: document.getElementById('newPriority').value,
                 due_date: document.getElementById('newDueDate').value || null,
                 related_deal_id: dealId,
+                deal_name: dealObj ? dealObj.deal_name : null,
                 management_blockers: document.getElementById('newBlockers').value || null
             };
 
@@ -1995,46 +2206,44 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             document.getElementById('editTaskId').value = task.task_id;
             document.getElementById('editTitle').value = task.task_title;
-            document.getElementById('editCustomerName').value = task.customer_name || '';
+            populateCustomerSelects();
+
+            const custId = task.customer_id || (allDeals.find(d => d.deal_id === task.related_deal_id)?.customer_id || '');
+            document.getElementById('editCustomerId').value = custId || '';
+
+            populateDealSelects(custId || null, 'edit');
+            document.getElementById('editDealId').value = task.related_deal_id || '';
+
             document.getElementById('editCategory').value = task.category;
             document.getElementById('editAssigned').value = task.assigned_to;
             document.getElementById('editStatus').value = task.status;
             document.getElementById('editPriority').value = task.priority;
             document.getElementById('editDueDate').value = task.due_date || '';
-            document.getElementById('editDealId').value = task.related_deal_id || '';
             document.getElementById('editBlockers').value = task.management_blockers || '';
 
-            const banner = document.getElementById('editDealBannerContainer');
-            if (banner) {
-                if (task.customer_name || task.deal_name) {
-                    banner.innerHTML = `
-                        <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
-                            <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${task.customer_name || 'N/A'}</strong></span>
-                            <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${task.deal_name || ('Deal #' + task.related_deal_id)}</strong></span>
-                        </div>
-                    `;
-                } else {
-                    banner.innerHTML = '';
-                }
-            }
-
+            updateEditBanner();
             editModal.show();
         }
 
         async function submitEditTask(e) {
             e.preventDefault();
             const taskId = document.getElementById('editTaskId').value;
-            const custName = document.getElementById('editCustomerName').value.trim();
+            const custId = parseInt(document.getElementById('editCustomerId').value) || null;
             const dealId = parseInt(document.getElementById('editDealId').value) || null;
+            const custObj = allCustomers.find(c => c.customer_id === custId);
+            const dealObj = allDeals.find(d => d.deal_id === dealId);
+
             const payload = {
                 task_title: document.getElementById('editTitle').value,
                 category: document.getElementById('editCategory').value,
                 assigned_to: document.getElementById('editAssigned').value,
-                customer_name: custName || null,
+                customer_id: custId,
+                customer_name: custObj ? custObj.company_name : (dealObj ? dealObj.customer_name : null),
                 status: document.getElementById('editStatus').value,
                 priority: document.getElementById('editPriority').value,
                 due_date: document.getElementById('editDueDate').value || null,
                 related_deal_id: dealId,
+                deal_name: dealObj ? dealObj.deal_name : null,
                 management_blockers: document.getElementById('editBlockers').value || null
             };
 

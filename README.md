@@ -8,7 +8,7 @@ A lightweight, local, full-stack Presales operations platform powered by **Pytho
 
 | Component | Port | File | Primary Responsibility |
 | :--- | :--- | :--- | :--- |
-| **Local CRM API & Dashboard** | `8000` | `app.py` | Customer accounts, multi-vendor deal pipeline, stages, values, and presales assignment. |
+| **Visual Analytics & CRM Dashboard** | `8000` | `app.py` | Executive visual metrics, Chart.js analytics, customer accounts, multi-vendor deal pipeline, and presales assignment. Access at `/` or `/dashboard`. |
 | **Monday.com Task Board** | `8001` | `task_board.py` | RFP technical ownership, distributed scopes, priority, and management blockers. |
 | **Voice Operations AI Agent** | `8002` | `agent_server.py` | Bilingual (Saudi Arabic/English) audio standup processor, pre-meeting state audit, and automated REST API sync. |
 | **Concurrent Stack Launcher** | - | `start_stack.py` | Spawns and manages all 3 services concurrently with unified lifecycle management. |

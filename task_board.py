@@ -85,13 +85,17 @@ def init_db():
     );
     """)
 
-    # Schema migration check: ensure started_at and completed_at exist
+    # Schema migration check: ensure started_at, completed_at, deal_name, customer_name exist
     cursor.execute("PRAGMA table_info(tasks);")
     existing_cols = [r["name"] for r in cursor.fetchall()]
     if "started_at" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN started_at TIMESTAMP;")
     if "completed_at" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP;")
+    if "deal_name" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN deal_name TEXT;")
+    if "customer_name" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN customer_name TEXT;")
 
     # Activity event log table for full lifecycle tracking
     cursor.execute("""
@@ -235,8 +239,86 @@ def init_db():
                     (t_row["task_id"], "In Progress", "Completed", t_row["completed_at"], t_row["assigned_to"]),
                 )
 
+    # Backfill deal_name and customer_name from crm.db if available
+    CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
+    if CRM_DB_FILE.exists():
+        try:
+            crm_conn = sqlite3.connect(CRM_DB_FILE)
+            crm_conn.row_factory = sqlite3.Row
+            crm_cur = crm_conn.cursor()
+            crm_cur.execute("""
+                SELECT d.deal_id, d.deal_name, c.company_name as customer_name
+                FROM deals d
+                LEFT JOIN customers c ON d.customer_id = c.customer_id
+            """)
+            for r in crm_cur.fetchall():
+                d_id = r["deal_id"]
+                d_name = r["deal_name"]
+                c_name = r["customer_name"] or ""
+                # Backfill linked tasks
+                cursor.execute("""
+                    UPDATE tasks 
+                    SET deal_name = COALESCE(deal_name, ?),
+                        customer_name = COALESCE(customer_name, ?)
+                    WHERE related_deal_id = ?;
+                """, (d_name, c_name, d_id))
+                # Auto-link unlinked tasks by deal name or customer name keywords
+                if d_name and len(d_name) > 4:
+                    cursor.execute("""
+                        UPDATE tasks 
+                        SET related_deal_id = COALESCE(related_deal_id, ?),
+                            deal_name = COALESCE(deal_name, ?),
+                            customer_name = COALESCE(customer_name, ?)
+                        WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
+                    """, (d_id, d_name, c_name, f"%{d_name.lower()}%"))
+                if c_name and len(c_name) > 3:
+                    cursor.execute("""
+                        UPDATE tasks 
+                        SET related_deal_id = COALESCE(related_deal_id, ?),
+                            deal_name = COALESCE(deal_name, ?),
+                            customer_name = COALESCE(customer_name, ?)
+                        WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
+                    """, (d_id, d_name, c_name, f"%{c_name.lower()}%"))
+            crm_conn.close()
+        except Exception as e:
+            print(f"Notice: CRM backfill skipped: {e}")
+
+    # Fallback keyword rules for customer_name and deal_name if still NULL
+    cursor.execute("UPDATE tasks SET customer_name = 'Ministry of Human Resources', deal_name = COALESCE(deal_name, 'Ministry HR Renewal Tender') WHERE (customer_name IS NULL OR deal_name IS NULL) AND LOWER(task_title) LIKE '%human resources%';")
+    cursor.execute("UPDATE tasks SET customer_name = 'SolarWinds', deal_name = COALESCE(deal_name, 'SolarWinds License Procurement') WHERE (customer_name IS NULL OR deal_name IS NULL) AND LOWER(task_title) LIKE '%solarwinds%';")
+    cursor.execute("UPDATE tasks SET customer_name = 'Internal Presales Team', deal_name = COALESCE(deal_name, 'Cross-Functional Team Deliverables') WHERE (customer_name IS NULL OR deal_name IS NULL) AND LOWER(task_title) LIKE '%islam%';")
+    cursor.execute("UPDATE tasks SET related_deal_id = COALESCE(related_deal_id, 13), customer_name = 'King Faisal University', deal_name = 'تجديد الدعم الفني لأجهزة ديل لجامعة الملك فيصل' WHERE (customer_name IS NULL OR deal_name IS NULL) AND LOWER(task_title) LIKE '%فيصل%';")
+
     conn.commit()
     conn.close()
+
+
+CRM_DB_FILE = Path(__file__).resolve().parent / "crm.db"
+
+def get_deal_customer_map() -> Dict[int, Dict[str, str]]:
+    """Fetches deal_name and customer_name for each deal_id from crm.db if available."""
+    deal_map = {}
+    if not CRM_DB_FILE.exists():
+        return deal_map
+    try:
+        conn = sqlite3.connect(CRM_DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.deal_id, d.deal_name, c.company_name as customer_name
+            FROM deals d
+            LEFT JOIN customers c ON d.customer_id = c.customer_id
+            ORDER BY d.deal_id ASC
+        """)
+        for r in cur.fetchall():
+            deal_map[r["deal_id"]] = {
+                "deal_name": r["deal_name"] or "",
+                "customer_name": r["customer_name"] or "",
+            }
+        conn.close()
+    except Exception:
+        pass
+    return deal_map
 
 
 @asynccontextmanager
@@ -273,6 +355,8 @@ class TaskBase(BaseModel):
     task_title: str = Field(default="Presales Action Item", description="Actionable title for the task")
     category: Union[TaskCategory, str] = Field(default=TaskCategory.GENERAL_ACTION, description="RFP_OWNERSHIP, RFP_DISTRIBUTED_SCOPE, or GENERAL_ACTION")
     related_deal_id: Optional[Union[int, str]] = Field(None, description="Optional foreign deal ID reference")
+    deal_name: Optional[str] = Field(None, description="Optional associated deal name")
+    customer_name: Optional[str] = Field(None, description="Optional associated customer name")
     assigned_to: Union[PresalesRep, str] = Field(default=PresalesRep.PRESALES_1, description="Presales 1 or Presales 2")
     vendor_domain: Union[VendorDomain, str] = Field(default=VendorDomain.GENERAL, description="Vendor scope")
     status: Union[TaskStatus, str] = Field(default=TaskStatus.NOT_STARTED, description="Current workflow state")
@@ -385,6 +469,8 @@ class TaskUpdate(BaseModel):
     task_title: Optional[str] = None
     category: Optional[Union[TaskCategory, str]] = None
     related_deal_id: Optional[Union[int, str]] = None
+    deal_name: Optional[str] = None
+    customer_name: Optional[str] = None
     assigned_to: Optional[Union[PresalesRep, str]] = None
     vendor_domain: Optional[Union[VendorDomain, str]] = None
     status: Optional[Union[TaskStatus, str]] = None
@@ -531,7 +617,7 @@ def compute_duration(start_str: Optional[str], end_str: Optional[str]) -> Option
         return None
 
 
-def row_to_task(row: sqlite3.Row) -> TaskOut:
+def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] = None) -> TaskOut:
     created_at = str(row["created_at"])
     started_at = str(row["started_at"]) if row["started_at"] else None
     completed_at = str(row["completed_at"]) if row["completed_at"] else None
@@ -542,11 +628,34 @@ def row_to_task(row: sqlite3.Row) -> TaskOut:
     lead_time = compute_duration(created_at, completed_at)
     cycle_time = compute_duration(started_at, completed_at)
 
+    cols = row.keys()
+    d_name = row["deal_name"] if "deal_name" in cols and row["deal_name"] else None
+    c_name = row["customer_name"] if "customer_name" in cols and row["customer_name"] else None
+
+    rel_deal = row["related_deal_id"]
+    if (not d_name or not c_name) and rel_deal:
+        if deal_map is None:
+            deal_map = get_deal_customer_map()
+        if rel_deal in deal_map:
+            d_name = d_name or deal_map[rel_deal].get("deal_name")
+            c_name = c_name or deal_map[rel_deal].get("customer_name")
+
+    if not c_name and row["task_title"]:
+        title_lower = str(row["task_title"]).lower()
+        if "human resources" in title_lower:
+            c_name = "Ministry of Human Resources"
+        elif "solarwinds" in title_lower:
+            c_name = "SolarWinds"
+        elif "islam" in title_lower:
+            c_name = "Internal Presales Team"
+
     return TaskOut(
         task_id=row["task_id"],
         task_title=row["task_title"],
         category=row["category"],
-        related_deal_id=row["related_deal_id"],
+        related_deal_id=rel_deal,
+        deal_name=d_name,
+        customer_name=c_name,
         assigned_to=row["assigned_to"],
         vendor_domain=row["vendor_domain"],
         status=row["status"],
@@ -605,7 +714,8 @@ def get_tasks(
     rows = cursor.fetchall()
     conn.close()
 
-    tasks = [row_to_task(r) for r in rows]
+    deal_map = get_deal_customer_map()
+    tasks = [row_to_task(r, deal_map) for r in rows]
 
     if group_by:
         grouped: Dict[str, List[TaskOut]] = {}
@@ -718,7 +828,8 @@ def get_rfp_tasks():
     rows = cursor.fetchall()
     conn.close()
 
-    return [row_to_task(r) for r in rows]
+    deal_map = get_deal_customer_map()
+    return [row_to_task(r, deal_map) for r in rows]
 
 
 @app.post("/api/tasks", response_model=TaskOut, status_code=status.HTTP_201_CREATED, tags=["Tasks"])
@@ -741,16 +852,28 @@ def create_task(payload: TaskCreate):
     started_at = now_iso if status_val != TaskStatus.NOT_STARTED.value else None
     completed_at = now_iso if status_val == TaskStatus.COMPLETED.value else None
 
+    # Resolve deal_name and customer_name
+    deal_map = get_deal_customer_map()
+    deal_name = payload.deal_name
+    customer_name = payload.customer_name
+    if payload.related_deal_id and (not deal_name or not customer_name):
+        d_info = deal_map.get(payload.related_deal_id)
+        if d_info:
+            deal_name = deal_name or d_info.get("deal_name")
+            customer_name = customer_name or d_info.get("customer_name")
+
     cursor.execute(
         """
         INSERT INTO tasks (
-            task_title, category, related_deal_id, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            task_title, category, related_deal_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             payload.task_title.strip(),
             cat_val,
             payload.related_deal_id,
+            deal_name,
+            customer_name,
             assigned_val,
             vendor_val,
             status_val,
@@ -820,6 +943,24 @@ def update_task(task_id: int, payload: TaskUpdate):
     if payload.related_deal_id is not None:
         update_clauses.append("related_deal_id = ?")
         params.append(payload.related_deal_id)
+        if payload.related_deal_id:
+            deal_map = get_deal_customer_map()
+            d_info = deal_map.get(payload.related_deal_id)
+            if d_info:
+                if payload.deal_name is None:
+                    update_clauses.append("deal_name = ?")
+                    params.append(d_info.get("deal_name"))
+                if payload.customer_name is None:
+                    update_clauses.append("customer_name = ?")
+                    params.append(d_info.get("customer_name"))
+
+    if payload.deal_name is not None:
+        update_clauses.append("deal_name = ?")
+        params.append(payload.deal_name.strip() if payload.deal_name else None)
+
+    if payload.customer_name is not None:
+        update_clauses.append("customer_name = ?")
+        params.append(payload.customer_name.strip() if payload.customer_name else None)
 
     if payload.assigned_to is not None:
         assigned_val = payload.assigned_to.value if hasattr(payload.assigned_to, "value") else str(payload.assigned_to)
@@ -889,7 +1030,18 @@ def update_task(task_id: int, payload: TaskUpdate):
     row = cursor.fetchone()
     conn.close()
 
-    return row_to_task(row)
+    deal_map = get_deal_customer_map()
+    return row_to_task(row, deal_map)
+
+
+@app.get("/api/deals-lookup", tags=["Deals"])
+def get_deals_lookup():
+    """Returns simplified deal and customer list for task linking dropdowns."""
+    deal_map = get_deal_customer_map()
+    return [
+        {"deal_id": did, "deal_name": d["deal_name"], "customer_name": d["customer_name"]}
+        for did, d in sorted(deal_map.items())
+    ]
 
 
 @app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
@@ -1232,6 +1384,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <input type="text" id="newTitle" class="form-control" placeholder="e.g. Complete Technical RFP Section 3.2" required>
                             </div>
                             <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Customer Name</label>
+                                <input type="text" id="newCustomerName" list="taskCustomerDatalist" class="form-control" placeholder="e.g. Acme Corp (or select deal)">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Related CRM Deal</label>
+                                <select id="newDealId" class="form-select">
+                                    <option value="">-- No Linked Deal --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Workstream Category *</label>
                                 <select id="newCategory" class="form-select" required>
                                     <option value="RFP_OWNERSHIP">RFP Ownership</option>
@@ -1244,17 +1406,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <select id="newAssigned" class="form-select" required>
                                     <option value="Presales 1">Presales 1</option>
                                     <option value="Presales 2">Presales 2</option>
-                                </select>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small fw-semibold">Vendor Domain</label>
-                                <select id="newVendor" class="form-select">
-                                    <option value="General">General</option>
-                                    <option value="HPE">HPE</option>
-                                    <option value="Veeam">Veeam</option>
-                                    <option value="Dell">Dell</option>
-                                    <option value="Nutanix">Nutanix</option>
-                                    <option value="VMware">VMware</option>
                                 </select>
                             </div>
                             <div class="col-md-4">
@@ -1275,17 +1426,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Due Date</label>
                                 <input type="date" id="newDueDate" class="form-control">
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related CRM Deal ID</label>
-                                <input type="number" id="newDealId" class="form-control" placeholder="e.g. 1">
-                            </div>
                             <div class="col-12">
                                 <label class="form-label small fw-semibold">Management / Escalation Blockers</label>
-                                <textarea id="newBlockers" class="form-control" rows="2" placeholder="Note any vendor delays, sizing dependencies, or management help required..."></textarea>
+                                <textarea id="newBlockers" class="form-control" rows="2" placeholder="Note any blockers, dependencies, or management help required..."></textarea>
                             </div>
                         </div>
                     </div>
@@ -1315,6 +1462,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <input type="text" id="editTitle" class="form-control" required>
                             </div>
                             <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Customer Name</label>
+                                <input type="text" id="editCustomerName" list="taskCustomerDatalist" class="form-control" placeholder="Customer / Company Name">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Related CRM Deal</label>
+                                <select id="editDealId" class="form-select">
+                                    <option value="">-- No Linked Deal --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Category *</label>
                                 <select id="editCategory" class="form-select" required>
                                     <option value="RFP_OWNERSHIP">RFP Ownership</option>
@@ -1327,17 +1484,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <select id="editAssigned" class="form-select" required>
                                     <option value="Presales 1">Presales 1</option>
                                     <option value="Presales 2">Presales 2</option>
-                                </select>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small fw-semibold">Vendor Domain</label>
-                                <select id="editVendor" class="form-select">
-                                    <option value="General">General</option>
-                                    <option value="HPE">HPE</option>
-                                    <option value="Veeam">Veeam</option>
-                                    <option value="Dell">Dell</option>
-                                    <option value="Nutanix">Nutanix</option>
-                                    <option value="VMware">VMware</option>
                                 </select>
                             </div>
                             <div class="col-md-4">
@@ -1358,14 +1504,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Due Date</label>
                                 <input type="date" id="editDueDate" class="form-control">
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label small fw-semibold">Related Deal ID</label>
-                                <input type="number" id="editDealId" class="form-control">
-                            </div>
+                            <div class="col-12" id="editDealBannerContainer"></div>
                             <div class="col-12">
                                 <label class="form-label small fw-semibold">Management Blockers</label>
                                 <textarea id="editBlockers" class="form-control" rows="3"></textarea>
@@ -1381,6 +1524,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
         </div>
     </div>
+
+    <!-- Customer Autocomplete Datalist -->
+    <datalist id="taskCustomerDatalist"></datalist>
 
     <!-- Task Lifecycle & Audit History Modal -->
     <div class="modal fade" id="historyModal" tabindex="-1" aria-hidden="true">
@@ -1414,6 +1560,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     <script>
         let allTasks = [];
+        let allDeals = [];
         let currentFilter = 'ALL';
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
@@ -1424,12 +1571,84 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         document.addEventListener('DOMContentLoaded', () => {
             loadTasks();
+            const newDealSel = document.getElementById('newDealId');
+            if (newDealSel) {
+                newDealSel.addEventListener('change', (e) => {
+                    const selId = parseInt(e.target.value);
+                    const found = allDeals.find(d => d.deal_id === selId);
+                    if (found && found.customer_name) {
+                        const custInput = document.getElementById('newCustomerName');
+                        if (custInput) custInput.value = found.customer_name;
+                    }
+                });
+            }
+            const editDealSel = document.getElementById('editDealId');
+            if (editDealSel) {
+                editDealSel.addEventListener('change', (e) => {
+                    const selId = parseInt(e.target.value);
+                    const banner = document.getElementById('editDealBannerContainer');
+                    const found = allDeals.find(d => d.deal_id === selId);
+                    if (found) {
+                        const custInput = document.getElementById('editCustomerName');
+                        if (custInput && found.customer_name) custInput.value = found.customer_name;
+                        if (banner) {
+                            banner.innerHTML = `
+                                <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
+                                    <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${found.customer_name || 'N/A'}</strong></span>
+                                    <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${found.deal_name}</strong></span>
+                                </div>
+                            `;
+                        }
+                    } else {
+                        if (banner) banner.innerHTML = '';
+                    }
+                });
+            }
         });
+
+        async function loadDealsLookup() {
+            try {
+                const res = await fetch('/api/deals-lookup');
+                if (res.ok) {
+                    allDeals = await res.json();
+                    populateDealSelects();
+                    populateCustomerDatalist();
+                }
+            } catch(e) {
+                console.warn("Failed to load deals lookup:", e);
+            }
+        }
+
+        function populateDealSelects() {
+            const newSel = document.getElementById('newDealId');
+            const editSel = document.getElementById('editDealId');
+            if (!newSel || !editSel) return;
+
+            const opts = ['<option value="">-- No Linked Deal --</option>'];
+            allDeals.forEach(d => {
+                const label = `Deal #${d.deal_id}: ${d.deal_name}${d.customer_name ? ` (${d.customer_name})` : ''}`;
+                opts.push(`<option value="${d.deal_id}">${label}</option>`);
+            });
+            const html = opts.join('');
+            newSel.innerHTML = html;
+            editSel.innerHTML = html;
+        }
+
+        function populateCustomerDatalist() {
+            const datalist = document.getElementById('taskCustomerDatalist');
+            if (!datalist) return;
+            const names = new Set();
+            allDeals.forEach(d => { if (d.customer_name) names.add(d.customer_name.trim()); });
+            allTasks.forEach(t => { if (t.customer_name) names.add(t.customer_name.trim()); });
+            datalist.innerHTML = Array.from(names).sort().map(name => `<option value="${name}"></option>`).join('');
+        }
 
         async function loadTasks() {
             try {
+                loadDealsLookup();
                 const res = await fetch('/api/tasks');
                 allTasks = await res.json();
+                populateCustomerDatalist();
                 renderBoard();
                 loadVelocityMetrics();
             } catch (err) {
@@ -1467,6 +1686,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const filtered = allTasks.filter(t => {
                 const matchesSearch = !search ||
                     t.task_title.toLowerCase().includes(search) ||
+                    (t.customer_name && t.customer_name.toLowerCase().includes(search)) ||
+                    (t.deal_name && t.deal_name.toLowerCase().includes(search)) ||
                     (t.management_blockers && t.management_blockers.toLowerCase().includes(search)) ||
                     t.vendor_domain.toLowerCase().includes(search) ||
                     t.assigned_to.toLowerCase().includes(search);
@@ -1506,7 +1727,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     tasks: filtered.filter(t => t.category === 'RFP_OWNERSHIP')
                 },
                 'RFP_DISTRIBUTED_SCOPE': {
-                    title: 'RFP Distributed Vendor Scope Items',
+                    title: 'RFP Distributed Scope Items',
                     color: '#a25ddc',
                     tasks: filtered.filter(t => t.category === 'RFP_DISTRIBUTED_SCOPE')
                 },
@@ -1535,12 +1756,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             <thead>
                                 <tr>
                                     <th class="text-start" style="width: 28%;">Item Title</th>
-                                    <th style="width: 12%;">Assignee</th>
-                                    <th style="width: 13%;">Status</th>
+                                    <th class="text-start" style="width: 14%;">Customer Name</th>
+                                    <th style="width: 11%;">Assignee</th>
+                                    <th style="width: 12%;">Status</th>
                                     <th style="width: 9%;">Priority</th>
-                                    <th style="width: 9%;">Vendor</th>
-                                    <th style="width: 15%;">Timing & Velocity</th>
-                                    <th style="width: 9%;">Due Date</th>
+                                    <th style="width: 13%;">Timing & Velocity</th>
+                                    <th style="width: 8%;">Due Date</th>
                                     <th style="width: 5%;">Log</th>
                                 </tr>
                             </thead>
@@ -1562,7 +1783,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         function renderTaskRow(t) {
             const statusClass = 'status-' + t.status.replace(/\\s+/g, '-');
             const priorityClass = 'priority-' + t.priority;
-            const dealBadge = t.related_deal_id ? `<span class="deal-tag ms-1">Deal #${t.related_deal_id}</span>` : '';
+
+            const dealLabel = t.deal_name ? t.deal_name : (t.related_deal_id ? `Deal #${t.related_deal_id}` : '');
+            const dealBadge = dealLabel 
+                ? `<span class="deal-tag" style="font-size: 0.73rem;" title="Associated Deal"><i class="bi bi-briefcase me-1"></i>Deal: <strong class="text-primary">${dealLabel}</strong>${t.related_deal_id && t.deal_name ? ` (#${t.related_deal_id})` : ''}</span>` 
+                : '';
 
             const blockerDisplay = t.management_blockers 
                 ? `<div class="mt-1"><span class="blocker-chip" title="${t.management_blockers}" onclick="openEditTaskModal(${t.task_id})"><i class="bi bi-exclamation-triangle-fill me-1"></i>${t.management_blockers}</span></div>`
@@ -1601,11 +1826,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             return `
                 <tr>
                     <td class="text-start">
-                        <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
-                            ${t.task_title}
-                        </a>
-                        ${dealBadge}
+                        <div class="d-flex flex-wrap align-items-center gap-1">
+                            <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
+                                ${t.task_title}
+                            </a>
+                        </div>
+                        ${dealBadge ? `
+                            <div class="d-flex flex-wrap align-items-center gap-1 mt-1">
+                                ${dealBadge}
+                            </div>
+                        ` : ''}
                         ${blockerDisplay}
+                    </td>
+                    <td class="text-start">
+                        ${t.customer_name ? `
+                            <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem; font-weight: 600;" title="${t.customer_name}">
+                                <i class="bi bi-building text-primary me-1"></i>${t.customer_name}
+                            </span>
+                        ` : `
+                            <span class="text-muted small fst-italic">-</span>
+                        `}
                     </td>
                     <td>
                         <span class="avatar-badge">
@@ -1628,9 +1868,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <span class="monday-pill ${priorityClass}" style="min-width: 80px;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
                             ${t.priority}
                         </span>
-                    </td>
-                    <td>
-                        <span class="badge bg-light text-secondary border px-2 py-1">${t.vendor_domain}</span>
                     </td>
                     <td>
                         ${velocityBadge}
@@ -1710,6 +1947,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         function openNewTaskModal(presetCategory) {
             document.getElementById('newTaskForm').reset();
+            const custInput = document.getElementById('newCustomerName');
+            if (custInput) custInput.value = '';
             if (presetCategory) {
                 document.getElementById('newCategory').value = presetCategory;
             }
@@ -1718,15 +1957,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         async function submitNewTask(e) {
             e.preventDefault();
+            const custName = document.getElementById('newCustomerName').value.trim();
+            const dealId = parseInt(document.getElementById('newDealId').value) || null;
             const payload = {
                 task_title: document.getElementById('newTitle').value,
                 category: document.getElementById('newCategory').value,
                 assigned_to: document.getElementById('newAssigned').value,
-                vendor_domain: document.getElementById('newVendor').value,
+                customer_name: custName || null,
                 status: document.getElementById('newStatus').value,
                 priority: document.getElementById('newPriority').value,
                 due_date: document.getElementById('newDueDate').value || null,
-                related_deal_id: parseInt(document.getElementById('newDealId').value) || null,
+                related_deal_id: dealId,
                 management_blockers: document.getElementById('newBlockers').value || null
             };
 
@@ -1754,14 +1995,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             document.getElementById('editTaskId').value = task.task_id;
             document.getElementById('editTitle').value = task.task_title;
+            document.getElementById('editCustomerName').value = task.customer_name || '';
             document.getElementById('editCategory').value = task.category;
             document.getElementById('editAssigned').value = task.assigned_to;
-            document.getElementById('editVendor').value = task.vendor_domain;
             document.getElementById('editStatus').value = task.status;
             document.getElementById('editPriority').value = task.priority;
             document.getElementById('editDueDate').value = task.due_date || '';
             document.getElementById('editDealId').value = task.related_deal_id || '';
             document.getElementById('editBlockers').value = task.management_blockers || '';
+
+            const banner = document.getElementById('editDealBannerContainer');
+            if (banner) {
+                if (task.customer_name || task.deal_name) {
+                    banner.innerHTML = `
+                        <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
+                            <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${task.customer_name || 'N/A'}</strong></span>
+                            <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${task.deal_name || ('Deal #' + task.related_deal_id)}</strong></span>
+                        </div>
+                    `;
+                } else {
+                    banner.innerHTML = '';
+                }
+            }
 
             editModal.show();
         }
@@ -1769,15 +2024,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         async function submitEditTask(e) {
             e.preventDefault();
             const taskId = document.getElementById('editTaskId').value;
+            const custName = document.getElementById('editCustomerName').value.trim();
+            const dealId = parseInt(document.getElementById('editDealId').value) || null;
             const payload = {
                 task_title: document.getElementById('editTitle').value,
                 category: document.getElementById('editCategory').value,
                 assigned_to: document.getElementById('editAssigned').value,
-                vendor_domain: document.getElementById('editVendor').value,
+                customer_name: custName || null,
                 status: document.getElementById('editStatus').value,
                 priority: document.getElementById('editPriority').value,
                 due_date: document.getElementById('editDueDate').value || null,
-                related_deal_id: parseInt(document.getElementById('editDealId').value) || null,
+                related_deal_id: dealId,
                 management_blockers: document.getElementById('editBlockers').value || null
             };
 

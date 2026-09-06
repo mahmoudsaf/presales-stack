@@ -1690,9 +1690,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 }
 
                 const followCount = o.followup_tasks_count || 0;
-                const statusBadge = followCount > 0
-                    ? `<span class="badge bg-warning text-dark"><i class="bi bi-clock-history me-1"></i>Follow-up Needed (${followCount})</span>`
-                    : `<span class="badge bg-success"><i class="bi bi-check2-circle me-1"></i>All Tasks Done</span>`;
+                const statusBadge = `<span class="badge bg-warning text-dark"><i class="bi bi-clock-history me-1"></i>Follow-up Needed (${followCount})</span>`;
 
                 const blockerBadge = o.has_blocker
                     ? `<span class="badge badge-blocker ms-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>Blocked</span>`

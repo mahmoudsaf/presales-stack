@@ -769,24 +769,28 @@ async def get_followup_opportunities():
                 "name_ar": "مناقصات رئيسية وتكليف كامل",
                 "badge": "badge-rfp-owner",
                 "description": "Prime tenders owned end-to-end requiring technical architecture, RFP response submission, and bid management.",
-                "opportunities": rfp_ownership
+                "opportunities": rfp_ownership,
+                "followup_opportunities": rfp_ownership_followup
             },
             "RFP_DISTRIBUTED_SCOPE": {
                 "name_en": "RFP Distributed Scope",
                 "name_ar": "نطاق موزع وشراكات التقنية",
                 "badge": "badge-rfp-dist",
                 "description": "Multi-vendor partner tenders (HPE, Dell, Veeam, Nutanix, VMware) requiring partner discounts, BoQ validations, and distributor scopes.",
-                "opportunities": rfp_distributed
+                "opportunities": rfp_distributed,
+                "followup_opportunities": rfp_distributed_followup
             },
             "GENERAL_ACTION": {
                 "name_en": "General Action",
                 "name_ar": "إجراءات وتجارب فنية عامة",
                 "badge": "badge-rfp-action",
                 "description": "PoC testing, hardware sizing, licensing migrations, and operational presales support deliverables.",
-                "opportunities": general_action
+                "opportunities": general_action,
+                "followup_opportunities": general_action_followup
             }
         },
-        "all_opportunities": opportunities
+        "all_opportunities": opportunities,
+        "followup_opportunities": [o for o in opportunities if o["has_followup_tasks"]]
     }
 
 
@@ -1253,8 +1257,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <div id="pane-opps" class="d-none flex-grow-1 d-flex flex-column">
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <div>
-                                <h6 class="fw-bold text-white mb-0"><i class="bi bi-kanban text-info me-2"></i>Previous Opportunities (3 Kinds)</h6>
-                                <div class="small text-muted">Classified by kind with pending follow-up deliverables</div>
+                                <h6 class="fw-bold text-white mb-0"><i class="bi bi-kanban text-info me-2"></i>Deals Needing Follow-up (3 Kinds)</h6>
+                                <div class="small text-muted">Showing active follow-up deals only (all completed deals hidden)</div>
                             </div>
                             <button class="btn btn-sm btn-outline-info d-flex align-items-center gap-1" onclick="loadFollowupOpportunities()" id="loadOppsBtn">
                                 <i class="bi bi-arrow-repeat"></i> Refresh
@@ -1618,12 +1622,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 }
                 currentFollowupData = data;
                 
-                // Update badge counts on filter buttons
+                // Update badge counts on filter buttons (strictly deals needing follow-up)
                 const c = data.counts || {};
-                document.getElementById('count-ALL').textContent = c.total_opportunities || 0;
-                document.getElementById('count-RFP_OWNERSHIP').textContent = `${c.rfp_ownership_followup_count || 0}/${c.rfp_ownership_count || 0}`;
-                document.getElementById('count-RFP_DISTRIBUTED_SCOPE').textContent = `${c.rfp_distributed_scope_followup_count || 0}/${c.rfp_distributed_scope_count || 0}`;
-                document.getElementById('count-GENERAL_ACTION').textContent = `${c.general_action_followup_count || 0}/${c.general_action_count || 0}`;
+                document.getElementById('count-ALL').textContent = c.with_followup_tasks || 0;
+                document.getElementById('count-RFP_OWNERSHIP').textContent = c.rfp_ownership_followup_count || 0;
+                document.getElementById('count-RFP_DISTRIBUTED_SCOPE').textContent = c.rfp_distributed_scope_followup_count || 0;
+                document.getElementById('count-GENERAL_ACTION').textContent = c.general_action_followup_count || 0;
 
                 renderFollowupOpportunities(activeKindFilter);
             } catch (err) {
@@ -1656,13 +1660,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 return;
             }
 
-            let opps = currentFollowupData.all_opportunities;
+            // Exclude any deals where all tasks are done - show ONLY deals with active follow-up tasks
+            let opps = currentFollowupData.all_opportunities.filter(o => o.has_followup_tasks && (o.followup_tasks_count > 0));
             if (kindFilter && kindFilter !== 'ALL') {
                 opps = opps.filter(o => o.kind === kindFilter);
             }
 
             if (!opps.length) {
-                container.innerHTML = `<div class="text-muted small text-center py-5"><i class="bi bi-inbox fs-2 d-block mb-2"></i>No deals found matching filter "${kindFilter}".</div>`;
+                container.innerHTML = `<div class="text-muted small text-center py-5"><i class="bi bi-check2-all fs-2 d-block mb-2 text-success"></i>All tasks completed! No deals pending follow-up deliverables in "${kindFilter === 'ALL' ? 'Any Category' : kindFilter}".</div>`;
                 return;
             }
 

@@ -964,6 +964,38 @@ def update_deal(deal_id: int, payload: DealUpdate):
     )
 
 
+@app.delete("/api/deals/{deal_id}", tags=["Deals"])
+def delete_deal(deal_id: int):
+    """Deletes a deal by ID and unlinks associated tasks."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT deal_id, deal_name FROM deals WHERE deal_id = ?;", (deal_id,))
+    deal = cursor.fetchone()
+    if not deal:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Deal with ID {deal_id} not found.")
+
+    cursor.execute("DELETE FROM deals WHERE deal_id = ?;", (deal_id,))
+    conn.commit()
+    conn.close()
+
+    # If tasks.db exists, unlink tasks associated with this deal
+    if TASKS_DB_FILE.exists():
+        try:
+            t_conn = sqlite3.connect(TASKS_DB_FILE)
+            t_conn.execute("UPDATE tasks SET related_deal_id = NULL WHERE related_deal_id = ?;", (deal_id,))
+            t_conn.commit()
+            t_conn.close()
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "message": f"Deal #{deal_id} '{deal['deal_name']}' deleted successfully.",
+        "deal_id": deal_id
+    }
+
+
 # -----------------------------------------------------------------------------
 # Analytics & Metrics Aggregation Endpoints
 # -----------------------------------------------------------------------------
@@ -1628,31 +1660,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <!-- Vendor Quick-Filter Pills Row -->
-                    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
-                        <span class="small text-muted fw-bold me-1"><i class="bi bi-cpu me-1"></i>Filter by Vendor:</span>
-                        <div class="btn-group btn-group-sm flex-wrap" role="group" id="vendorPillsGroup">
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn active" data-vendor="" onclick="setVendorFilter('', this)">
-                                All Vendors <span class="badge bg-light text-dark ms-1 rounded-pill" id="vendor-count-all">0</span>
-                            </button>
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="HPE" onclick="setVendorFilter('HPE', this)">
-                                HPE <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-HPE">0</span>
-                            </button>
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Dell" onclick="setVendorFilter('Dell', this)">
-                                Dell <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Dell">0</span>
-                            </button>
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Veeam" onclick="setVendorFilter('Veeam', this)">
-                                Veeam <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Veeam">0</span>
-                            </button>
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="VMware" onclick="setVendorFilter('VMware', this)">
-                                VMware <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-VMware">0</span>
-                            </button>
-                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Nutanix" onclick="setVendorFilter('Nutanix', this)">
-                                Nutanix <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Nutanix">0</span>
-                            </button>
-                        </div>
-                    </div>
-
                     <!-- Search & Dropdown Select Controls Row -->
                     <div class="row g-2 align-items-center">
                         <div class="col-12 col-lg-4">
@@ -1984,9 +1991,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             </div>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary"><i class="bi bi-save me-1"></i>Save Changes</button>
+                    <div class="modal-footer d-flex justify-content-between">
+                        <button type="button" class="btn btn-outline-danger" onclick="deleteCurrentEditDeal()">
+                            <i class="bi bi-trash3 me-1"></i>Delete Deal
+                        </button>
+                        <div>
+                            <button type="button" class="btn btn-light me-1" data-bs-dismiss="modal">Cancel</button>
+                            <button type="submit" class="btn btn-primary"><i class="bi bi-save me-1"></i>Save Changes</button>
+                        </div>
                     </div>
                 </form>
             </div>
@@ -2923,7 +2935,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <li><hr class="dropdown-divider"></li>
                                     <li><a class="dropdown-item text-success fw-semibold" href="#" onclick="quickSetStage(${d.deal_id}, 'Closed-Won')"><i class="bi bi-check2-circle me-1"></i>Closed-Won</a></li>
                                     <li><a class="dropdown-item text-danger" href="#" onclick="quickSetStage(${d.deal_id}, 'Closed-Lost')"><i class="bi bi-x-circle me-1"></i>Closed-Lost</a></li>
+                                    <li><hr class="dropdown-divider"></li>
+                                    <li><a class="dropdown-item text-danger fw-semibold" href="#" onclick="deleteDealConfirm(${d.deal_id})"><i class="bi bi-trash3 me-1"></i>Delete Deal</a></li>
                                 </ul>
+                                <button class="btn btn-outline-danger" onclick="deleteDealConfirm(${d.deal_id})" title="Delete Deal">
+                                    <i class="bi bi-trash3"></i>
+                                </button>
                             </div>
                         </td>
                     </tr>
@@ -3040,6 +3057,33 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             } catch (err) {
                 console.error("Error setting stage:", err);
             }
+        }
+
+        async function deleteDealConfirm(dealId) {
+            const deal = allDeals.find(d => d.deal_id === dealId);
+            const dealName = deal ? deal.deal_name : `#${dealId}`;
+            if (!confirm(`Are you sure you want to delete deal #${dealId}: "${dealName}"?\n\nThis action cannot be undone.`)) {
+                return;
+            }
+            try {
+                const res = await fetch(`/api/deals/${dealId}`, { method: 'DELETE' });
+                if (!res.ok) {
+                    const err = await res.json();
+                    alert('Error deleting deal: ' + JSON.stringify(err.detail || err));
+                    return;
+                }
+                await loadAllData();
+            } catch (err) {
+                console.error("Failed to delete deal:", err);
+                alert('Connection error occurred while deleting deal.');
+            }
+        }
+
+        function deleteCurrentEditDeal() {
+            const dealId = parseInt(document.getElementById('editDealId').value);
+            if (!dealId) return;
+            editModal.hide();
+            deleteDealConfirm(dealId);
         }
 
         function openNewCustomerModal() {

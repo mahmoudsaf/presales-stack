@@ -746,35 +746,6 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         })
         existing_titles.append(act_low)
 
-    # 2. Reconcile any onboarding / scope mentioned in today_progress
-    for prog in progress:
-        prog_text = str(prog).strip()
-        prog_low = prog_text.lower()
-        if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low or "مناقصة" in prog_low:
-            if not any(len(prog_low) > 8 and (prog_low[:20] in et or et in prog_low) for et in existing_titles):
-                d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(prog_text)
-                cat_key, cat_name = detect_category(prog_text)
-                closing_dt = c_date or detect_closing_date(prog_text)
-                task_updates.append({
-                    "method": "POST",
-                    "payload": {
-                        "task_title": prog_text,
-                        "category": cat_key,
-                        "deal_category": d_cat or cat_name,
-                        "closing_date": closing_dt,
-                        "assigned_to": detect_assigned(prog_text),
-                        "vendor_domain": detect_vendor(prog_text),
-                        "status": "In Progress",
-                        "priority": "High",
-                        "related_deal_id": d_id,
-                        "deal_name": d_name,
-                        "customer_id": c_id,
-                        "customer_name": c_name,
-                        "changed_by": "Voice Agent",
-                    }
-                })
-                existing_titles.append(prog_low)
-
     return task_updates
 
 
@@ -1432,20 +1403,28 @@ Your responsibilities:
      * estimated_value: Numeric float in SAR/USD (e.g. 1.25M to 1.5M -> 1350000.0, 10M -> 10000000.0). Remember 1 million = 1000000.0.
      * vendor_notes: Technical requirements, scope, target close dates, in original spoken language.
    - `task_updates`: Array of task updates.
-     CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
-     IMPORTANT CONSTRAINTS FOR TASKS:
-     * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "إعداد وتدقيق المقترح الفني لفرصة كاست بالتنسيق مع Hitachi Vantara").
-     * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
-     * deal_name: Descriptive deal/project title.
-     * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
-     * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
-     * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-     * assigned_to: MUST be: "Presales 1" or "Presales 2".
-     * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
-     * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
-     * priority: MUST be one of: ["High", "Medium", "Low"].
-     * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
-     * changed_by: "Voice Agent" (or the speaking engineer).
+      STRICT TASK EXTRACTION RULES (FOLLOW-UP ONLY - NO SPECULATIVE PLAYBOOK SUGGESTIONS):
+      * DO NOT suggest or invent playbook tasks that were not explicitly spoken in the meeting.
+      * Extract a task ONLY if:
+        1. A manager/lead explicitly instructs someone ("do this", "prepare the scope", "Ahmed do site survey").
+        2. A presales engineer explicitly commits to an action ("I am handling the deal by distributing the scope", "ask for site survey", "I will deliver the BOM").
+        3. A concrete next action was agreed upon during the standup meeting as a follow-up item for a deal.
+      * DO NOT extract tasks from casual discussion, past accomplishments, or generic stage progression without an assigned next step.
+      * EVERY task MUST be linked to its referenced Deal (`related_deal_id`, `deal_name`, `customer_name`, `deal_category`, `closing_date`).
+      * Set `assigned_to` strictly to the engineer responsible ("Presales 1" or "Presales 2").
+      IMPORTANT CONSTRAINTS FOR TASKS:
+      * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية", "طلب زيارة ميدانية Site Survey للموقع").
+      * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
+      * deal_name: Descriptive deal/project title.
+      * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
+      * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
+      * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
+      * assigned_to: MUST be: "Presales 1" or "Presales 2".
+      * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
+      * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
+      * priority: MUST be one of: ["High", "Medium", "Low"].
+      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
+      * changed_by: "Voice Agent" (or the speaking engineer).
 4. Produce an Executive Briefing Report in the original spoken language without translation:
    - `today_progress`: Array of key accomplishments in the spoken language.
    - `tomorrow_actions`: Array of prioritized next steps in the spoken language.

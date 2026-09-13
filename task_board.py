@@ -324,7 +324,7 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, c.company_name as customer_name
+            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, d.assigned_presales, d.stage, d.estimated_value, c.company_name as customer_name
             FROM deals d
             LEFT JOIN customers c ON d.customer_id = c.customer_id
             ORDER BY d.deal_id ASC
@@ -338,6 +338,9 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
                 "primary_vendors": r["primary_vendors"] or "",
                 "deal_category": r["deal_category"] or "",
                 "closing_date": r["closing_date"] or "",
+                "assigned_presales": r["assigned_presales"] or "Presales 1",
+                "stage": r["stage"] or "Discovery",
+                "estimated_value": r["estimated_value"] or 0.0,
             }
         conn.close()
     except Exception:
@@ -648,6 +651,28 @@ class TaskUpdate(BaseModel):
         if nums:
             return int(nums[0])
         return None
+
+
+class TaskStatusPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    status: Union[TaskStatus, str]
+    changed_by: Optional[str] = Field(default="Presales Board", description="User or agent changing status")
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v):
+        if hasattr(v, "value"):
+            return v
+        v_str = str(v).strip().lower()
+        if "completed" in v_str or "done" in v_str or "closed" in v_str or "finished" in v_str:
+            return TaskStatus.COMPLETED
+        if "waiting" in v_str or "vendor" in v_str:
+            return TaskStatus.WAITING_ON_VENDOR
+        if "review" in v_str or "pending" in v_str:
+            return TaskStatus.PENDING_REVIEW
+        if "progress" in v_str or "ongoing" in v_str or "active" in v_str or "started" in v_str:
+            return TaskStatus.IN_PROGRESS
+        return TaskStatus.NOT_STARTED
 
 
 class TaskOut(TaskBase):
@@ -1187,9 +1212,18 @@ def update_task(task_id: int, payload: TaskUpdate):
     return row_to_task(row, deal_map)
 
 
+@app.patch("/api/tasks/{task_id}/status", response_model=TaskOut, tags=["Tasks"])
+def patch_task_status(task_id: int, payload: TaskStatusPatch):
+    """
+    Quick status progression endpoint for instant interactive task board updates.
+    Updates task status, started_at / completed_at timestamps, and logs the change.
+    """
+    return update_task(task_id, TaskUpdate(status=payload.status, changed_by=payload.changed_by))
+
+
 @app.get("/api/deals-lookup", tags=["Deals"])
 def get_deals_lookup():
-    """Returns simplified deal and customer list for task linking dropdowns."""
+    """Returns simplified deal and customer list for task linking dropdowns and deal-centric board grouping."""
     deal_map = get_deal_customer_map()
     return [
         {
@@ -1200,6 +1234,9 @@ def get_deals_lookup():
             "primary_vendors": d.get("primary_vendors"),
             "deal_category": d.get("deal_category"),
             "closing_date": d.get("closing_date"),
+            "assigned_presales": d.get("assigned_presales"),
+            "stage": d.get("stage"),
+            "estimated_value": d.get("estimated_value"),
         }
         for did, d in sorted(deal_map.items())
     ]
@@ -1647,6 +1684,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <span>3- Opportunity Efforts & PO</span>
                         <span class="badge rounded-pill bg-success ms-1" id="tabCountEfforts">0</span>
                     </button>
+                    <button type="button" class="category-tab-btn tab-all text-secondary" id="tab-btn-ALL" onclick="switchCategoryTab('ALL')">
+                        <i class="bi bi-collection-fill fs-5 text-secondary"></i>
+                        <span>All Deals</span>
+                        <span class="badge rounded-pill bg-secondary ms-1" id="tabCountAll">0</span>
+                    </button>
                 </div>
                 <div>
                     <button class="btn btn-primary px-3 py-2 fw-semibold shadow-sm d-flex align-items-center gap-2" onclick="openNewTaskModal()">
@@ -1657,9 +1699,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Single Active Tab Table Container -->
-        <div id="activeTabContainer" class="card border-0 shadow-sm bg-white mb-4" style="border-radius: 10px; overflow: hidden; border: 1px solid var(--monday-border) !important;">
-            <div class="group-header py-3 px-3 border-bottom d-flex align-items-center justify-content-between bg-light" id="activeTabHeader">
+        <!-- Single Active Tab Container: Deals > Tasks > Presales 1 or 2 -->
+        <div id="activeTabContainer" class="card border-0 shadow-sm bg-transparent mb-4">
+            <div class="group-header py-3 px-3 border rounded-3 d-flex align-items-center justify-content-between bg-white shadow-sm mb-3" id="activeTabHeader">
                 <div class="d-flex align-items-center gap-2">
                     <span class="fw-bold fs-6" id="currentTabHeading">1- RFP Ownership & Prime Proposals</span>
                     <span class="badge bg-secondary-subtle text-dark border" id="currentTabItemCount">0 items</span>
@@ -1668,31 +1710,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     Prime proposals & tenders owned end-to-end
                 </div>
             </div>
-            <div class="table-responsive">
-                <table class="table task-table mb-0">
-                    <thead>
-                        <tr>
-                            <th class="text-start" style="width: 22%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name & Closing</th>
-                            <th class="text-start" style="width: 24%;"><i class="bi bi-card-text me-1 text-secondary"></i>Description (What it's about)</th>
-                            <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
-                            <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
-                            <th style="width: 8%;">Assignee</th>
-                            <th style="width: 9%;">Status</th>
-                            <th style="width: 6%;">Priority</th>
-                            <th style="width: 7%;">Timing</th>
-                            <th style="width: 6%;">Due Date</th>
-                            <th style="width: 3%;">Log</th>
-                        </tr>
-                    </thead>
-                    <tbody id="taskTableBody">
-                        <tr>
-                            <td colspan="10" class="text-center py-4 text-muted">
-                                <div class="spinner-border text-primary spinner-border-sm me-2"></div>Loading Task Board...
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
+
+            <!-- Deals Container (Hierarchy: Deals > Tasks > Presales 1 or 2 with Opportunity Progress Bars) -->
+            <div id="dealsContainer" class="d-flex flex-column gap-3">
+                <div class="text-center py-5 text-muted bg-white rounded-3 border">
+                    <div class="spinner-border text-primary spinner-border-sm me-2"></div>Loading Deals & Task Board...
+                </div>
             </div>
+
+            <!-- Hidden Task Table Body for backward compatibility with checks -->
+            <table class="d-none">
+                <tbody id="taskTableBody"></tbody>
+            </table>
         </div>
 
     </main>
@@ -1952,6 +1981,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             if (activeBtn) activeBtn.classList.add('active');
 
             const headings = {
+                'ALL': {
+                    title: 'All Active Deals & Workstreams',
+                    subtext: 'Overview of all customer deals, assigned presales, and action items'
+                },
                 'RFP_OWNERSHIP': {
                     title: '1- RFP Ownership & Prime Proposals',
                     subtext: 'Prime proposals & tenders owned end-to-end (strict closing deadlines)'
@@ -2253,17 +2286,35 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             renderBoard();
         }
 
+        function getDealCategoryKey(catStr) {
+            if (!catStr) return 'GENERAL_ACTION';
+            const low = String(catStr).toLowerCase();
+            if (low.includes('owner') || low.includes('prime') || low.includes('1-')) return 'RFP_OWNERSHIP';
+            if (low.includes('distribut') || low.includes('scope') || low.includes('2-')) return 'RFP_DISTRIBUTED_SCOPE';
+            return 'GENERAL_ACTION';
+        }
+
+        function getCategoryBadge(catStr) {
+            const key = getDealCategoryKey(catStr);
+            if (key === 'RFP_OWNERSHIP') {
+                return '<span class="badge bg-primary-subtle text-primary border border-primary-subtle"><i class="bi bi-award-fill me-1"></i>1- RFP Ownership</span>';
+            } else if (key === 'RFP_DISTRIBUTED_SCOPE') {
+                return '<span class="badge border" style="background-color: #f3e8ff; color: #7e22ce; border-color: #d8b4fe !important;"><i class="bi bi-diagram-3-fill me-1"></i>2- Distributed Scope</span>';
+            }
+            return '<span class="badge bg-success-subtle text-success border border-success-subtle"><i class="bi bi-bullseye me-1"></i>3- Opportunity Efforts & PO</span>';
+        }
+
         function renderBoard() {
             const search = document.getElementById('searchInput').value.toLowerCase().trim();
 
             const filtered = allTasks.filter(t => {
                 const matchesSearch = !search ||
-                    t.task_title.toLowerCase().includes(search) ||
+                    (t.task_title && t.task_title.toLowerCase().includes(search)) ||
                     (t.customer_name && t.customer_name.toLowerCase().includes(search)) ||
                     (t.deal_name && t.deal_name.toLowerCase().includes(search)) ||
                     (t.management_blockers && t.management_blockers.toLowerCase().includes(search)) ||
-                    t.vendor_domain.toLowerCase().includes(search) ||
-                    t.assigned_to.toLowerCase().includes(search);
+                    (t.vendor_domain && t.vendor_domain.toLowerCase().includes(search)) ||
+                    (t.assigned_to && t.assigned_to.toLowerCase().includes(search));
 
                 let matchesFilter = true;
                 if (currentFilter === 'RFP_ONLY') {
@@ -2301,37 +2352,344 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             updateVendorCounts(allTasks);
             updateMacroProgress(allTasks);
 
-            // Tab badge counts across all tasks (or filtered)
-            const countOwner = allTasks.filter(t => t.category === 'RFP_OWNERSHIP').length;
-            const countScope = allTasks.filter(t => t.category === 'RFP_DISTRIBUTED_SCOPE').length;
-            const countEfforts = allTasks.filter(t => t.category === 'GENERAL_ACTION').length;
+            // Tab badge counts across all deals
+            const countOwnerDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_OWNERSHIP').length;
+            const countScopeDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_DISTRIBUTED_SCOPE').length;
+            const countEffortsDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'GENERAL_ACTION').length;
 
             const bOwner = document.getElementById('tabCountOwner');
             const bScope = document.getElementById('tabCountScope');
             const bEfforts = document.getElementById('tabCountEfforts');
-            if (bOwner) bOwner.textContent = countOwner;
-            if (bScope) bScope.textContent = countScope;
-            if (bEfforts) bEfforts.textContent = countEfforts;
+            const bAll = document.getElementById('tabCountAll');
+            if (bOwner) bOwner.textContent = countOwnerDeals;
+            if (bScope) bScope.textContent = countScopeDeals;
+            if (bEfforts) bEfforts.textContent = countEffortsDeals;
+            if (bAll) bAll.textContent = allDeals.length;
 
-            // Filter for current active tab
-            const tabItems = filtered.filter(t => t.category === currentCategoryTab);
-            const countLabel = document.getElementById('currentTabItemCount');
-            if (countLabel) countLabel.textContent = `${tabItems.length} items`;
-
+            // Also keep taskTableBody populated for compatibility
+            const tabItems = filtered.filter(t => currentCategoryTab === 'ALL' || t.category === currentCategoryTab);
             const tbody = document.getElementById('taskTableBody');
-            if (!tbody) return;
-
-            if (tabItems.length === 0) {
-                tbody.innerHTML = `
-                    <tr>
-                        <td colspan="10" class="text-center py-5 text-muted fst-italic">
-                            <i class="bi bi-inbox fs-2 d-block mb-2 text-secondary opacity-50"></i>
-                            No tasks in this category matching current filters.
-                        </td>
-                    </tr>
-                `;
-            } else {
+            if (tbody) {
                 tbody.innerHTML = tabItems.map(t => renderTaskRow(t)).join('');
+            }
+
+            const container = document.getElementById('dealsContainer');
+            if (!container) return;
+
+            // Filter deals matching current category tab
+            const tabDeals = allDeals.filter(d => {
+                if (currentCategoryTab !== 'ALL' && getDealCategoryKey(d.deal_category) !== currentCategoryTab) {
+                    return false;
+                }
+                if (!search) return true;
+                const dNameMatch = (d.deal_name && d.deal_name.toLowerCase().includes(search));
+                const cNameMatch = (d.customer_name && d.customer_name.toLowerCase().includes(search));
+                const hasTaskMatch = filtered.some(t => t.related_deal_id === d.deal_id);
+                return dNameMatch || cNameMatch || hasTaskMatch;
+            });
+
+            const countLabel = document.getElementById('currentTabItemCount');
+            if (countLabel) countLabel.textContent = `${tabDeals.length} Deals`;
+
+            // Tasks unlinked to any deal
+            const unlinkedTasks = filtered.filter(t => !t.related_deal_id || !allDeals.some(d => d.deal_id === t.related_deal_id));
+
+            if (tabDeals.length === 0 && unlinkedTasks.length === 0) {
+                container.innerHTML = `
+                    <div class="card border-0 shadow-sm p-5 text-center text-muted bg-white" style="border-radius: 12px;">
+                        <i class="bi bi-inbox fs-1 d-block mb-3 text-secondary opacity-50"></i>
+                        <h6 class="fw-bold text-dark">No deals found in this category</h6>
+                        <p class="small text-muted mb-3">There are no deals or tasks matching current search / filters.</p>
+                        <div>
+                            <button class="btn btn-sm btn-primary" onclick="openNewTaskModal()">
+                                <i class="bi bi-plus-circle me-1"></i>Create New Task
+                            </button>
+                        </div>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+
+            // Render each Deal as a section containing its tasks (Deals > Tasks > Presales 1 or 2)
+            tabDeals.forEach(deal => {
+                const dealTasks = filtered.filter(t => t.related_deal_id === deal.deal_id || (!t.related_deal_id && t.deal_name && t.deal_name === deal.deal_name));
+                const totalTasks = dealTasks.length;
+                const completedTasks = dealTasks.filter(t => t.status === 'Completed').length;
+                const inProgressTasks = dealTasks.filter(t => t.status === 'In Progress' || t.status === 'Waiting on Vendor' || t.status === 'Pending Review').length;
+                const progressPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+                const progressColor = progressPct === 100 ? 'bg-success' : (progressPct >= 50 ? 'bg-primary' : (progressPct > 0 ? 'bg-warning' : 'bg-secondary'));
+
+                const closingBadge = deal.closing_date ? `
+                    <span class="badge bg-danger-subtle text-danger border border-danger-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem; font-weight: 700;" title="RFP Submission Deadline">
+                        <i class="bi bi-alarm-fill"></i>Closing: ${deal.closing_date}
+                    </span>
+                ` : '';
+
+                html += `
+                    <div class="card border shadow-sm bg-white mb-3" style="border-radius: 12px; overflow: hidden; border: 1px solid var(--monday-border) !important;">
+                        <!-- Deal Header -->
+                        <div class="card-header bg-white border-bottom p-3">
+                            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+                                <div class="d-flex align-items-center flex-wrap gap-2">
+                                    <span class="badge bg-primary-subtle text-primary border py-1 px-2" style="font-family: monospace; font-size: 0.85rem;" title="Deal ID">#${deal.deal_id}</span>
+                                    <h5 class="mb-0 fw-bold text-dark d-inline-flex align-items-center gap-2">
+                                        <i class="bi bi-briefcase-fill text-success"></i>
+                                        <span>${deal.deal_name}</span>
+                                    </h5>
+                                    <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem;">
+                                        <i class="bi bi-building text-primary me-1"></i>${deal.customer_name || 'Customer'}
+                                    </span>
+                                    ${getCategoryBadge(deal.deal_category)}
+                                    ${closingBadge}
+                                    <span class="badge bg-light text-secondary border px-2 py-1" style="font-size: 0.75rem;">
+                                        <i class="bi bi-person-fill text-primary me-1"></i>Lead: <strong class="text-dark">${deal.assigned_presales || 'Presales 1'}</strong>
+                                    </span>
+                                    <span class="badge bg-info-subtle text-info-emphasis border px-2 py-1" style="font-size: 0.75rem;">
+                                        ${deal.stage || 'Discovery'}
+                                    </span>
+                                </div>
+                                <div class="d-flex align-items-center gap-2">
+                                    <button class="btn btn-sm btn-outline-primary fw-semibold d-inline-flex align-items-center gap-1" onclick="openNewTaskModalWithDeal(${deal.deal_id})" title="Add a task under this deal">
+                                        <i class="bi bi-plus-circle"></i>Add Task
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Opportunity Progress Bar -->
+                            <div class="mt-3 p-2 rounded bg-light border">
+                                <div class="d-flex align-items-center justify-content-between mb-1">
+                                    <div class="small fw-bold text-secondary d-flex align-items-center gap-1">
+                                        <i class="bi bi-bar-chart-steps text-primary"></i>
+                                        <span>Opportunity Progress:</span>
+                                        <strong class="${progressPct === 100 ? 'text-success' : 'text-primary'}">
+                                            ${completedTasks} of ${totalTasks} Tasks Completed (${progressPct}%)
+                                        </strong>
+                                    </div>
+                                    <div class="small text-muted">
+                                        ${totalTasks === 0 ? '<span class="fst-italic text-secondary">No tasks recorded yet</span>' : `<span class="fw-semibold text-dark">${inProgressTasks}</span> in-flight / pending`}
+                                    </div>
+                                </div>
+                                <div class="progress" style="height: 10px; border-radius: 6px; background-color: #e2e8f0;">
+                                    <div class="progress-bar ${progressColor} progress-bar-striped ${progressPct > 0 && progressPct < 100 ? 'progress-bar-animated' : ''}" 
+                                         role="progressbar" style="width: ${progressPct}%" aria-valuenow="${progressPct}" aria-valuemin="0" aria-valuemax="100">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Nested Tasks List (Deals > Tasks > Presales 1 or 2) -->
+                        <div class="card-body p-0">
+                            ${dealTasks.length === 0 ? `
+                                <div class="p-4 text-center text-muted bg-white">
+                                    <i class="bi bi-card-checklist fs-3 text-secondary opacity-50 d-block mb-1"></i>
+                                    <span class="small fst-italic">No tasks created for this deal yet.</span>
+                                    <div class="mt-2">
+                                        <button class="btn btn-sm btn-outline-secondary" onclick="openNewTaskModalWithDeal(${deal.deal_id})">
+                                            <i class="bi bi-plus me-1"></i>+ Add First Task
+                                        </button>
+                                    </div>
+                                </div>
+                            ` : `
+                                <div class="table-responsive">
+                                    <table class="table task-table mb-0 align-middle">
+                                        <thead class="bg-light text-muted small text-uppercase" style="font-size: 0.72rem; letter-spacing: 0.5px;">
+                                            <tr>
+                                                <th class="text-start ps-3" style="width: 32%;"><i class="bi bi-card-text me-1 text-primary"></i>Task Description (Spoken Action / What it's about)</th>
+                                                <th style="width: 14%;"><i class="bi bi-person-badge me-1 text-info"></i>Presales Assignee</th>
+                                                <th style="width: 10%;"><i class="bi bi-cpu me-1 text-secondary"></i>Vendor</th>
+                                                <th style="width: 18%;"><i class="bi bi-arrow-repeat me-1 text-primary"></i>Status / Progress</th>
+                                                <th style="width: 8%;"><i class="bi bi-flag me-1"></i>Priority</th>
+                                                <th style="width: 10%;"><i class="bi bi-calendar-event me-1"></i>Due Date</th>
+                                                <th class="text-end pe-3" style="width: 8%;">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${dealTasks.map(t => renderDealTaskRow(t)).join('')}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                `;
+            });
+
+            // If there are unlinked tasks, render them in an Unassigned Tasks card
+            if (unlinkedTasks.length > 0 && (currentCategoryTab === 'ALL' || currentCategoryTab === 'GENERAL_ACTION')) {
+                const totalUnlinked = unlinkedTasks.length;
+                const completedUnlinked = unlinkedTasks.filter(t => t.status === 'Completed').length;
+                const unlinkedPct = Math.round((completedUnlinked / totalUnlinked) * 100);
+
+                html += `
+                    <div class="card border shadow-sm bg-white mb-3" style="border-radius: 12px; overflow: hidden; border: 1px dashed #94a3b8 !important;">
+                        <div class="card-header bg-light border-bottom p-3">
+                            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+                                <div class="d-flex align-items-center gap-2">
+                                    <i class="bi bi-puzzle fs-4 text-warning"></i>
+                                    <div>
+                                        <h5 class="mb-0 fw-bold text-dark">General Presales Operations (Standalone Tasks)</h5>
+                                        <small class="text-muted">Tasks not yet associated with a specific CRM deal</small>
+                                    </div>
+                                    <span class="badge bg-secondary text-white ms-2">${totalUnlinked} Tasks</span>
+                                </div>
+                                <div>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="openNewTaskModal()">
+                                        <i class="bi bi-plus-circle me-1"></i>New Standalone Task
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="mt-2">
+                                <div class="small fw-semibold text-secondary mb-1">Progress: ${completedUnlinked} / ${totalUnlinked} Completed (${unlinkedPct}%)</div>
+                                <div class="progress" style="height: 8px;">
+                                    <div class="progress-bar bg-success" style="width: ${unlinkedPct}%"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card-body p-0">
+                            <div class="table-responsive">
+                                <table class="table task-table mb-0 align-middle">
+                                    <thead class="bg-light text-muted small text-uppercase" style="font-size: 0.72rem;">
+                                        <tr>
+                                            <th class="text-start ps-3" style="width: 32%;">Task Description</th>
+                                            <th style="width: 14%;">Presales Assignee</th>
+                                            <th style="width: 10%;">Vendor</th>
+                                            <th style="width: 18%;">Status / Progress</th>
+                                            <th style="width: 8%;">Priority</th>
+                                            <th style="width: 10%;">Due Date</th>
+                                            <th class="text-end pe-3" style="width: 8%;">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${unlinkedTasks.map(t => renderDealTaskRow(t)).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            container.innerHTML = html;
+        }
+
+        function renderDealTaskRow(t) {
+            const statusClass = 'status-' + (t.status || 'Not-Started').replace(/\\s+/g, '-');
+            const priorityClass = 'priority-' + (t.priority || 'Medium');
+
+            const blockerDisplay = t.management_blockers 
+                ? `<div class="mt-1"><span class="blocker-chip" title="${t.management_blockers}" onclick="openEditTaskModal(${t.task_id})"><i class="bi bi-exclamation-triangle-fill me-1"></i>${t.management_blockers}</span></div>`
+                : '';
+
+            const vendorDomain = t.vendor_domain || 'General';
+            const vendorClass = 'vendor-' + vendorDomain;
+
+            const isDone = t.status === 'Completed';
+
+            return `
+                <tr class="${isDone ? 'table-light bg-opacity-50' : ''}">
+                    <!-- 1. Task Description -->
+                    <td class="text-start ps-3">
+                        <div class="d-flex align-items-start gap-2">
+                            <button class="btn btn-sm ${isDone ? 'btn-success' : 'btn-outline-secondary'} rounded-circle p-0 d-flex align-items-center justify-content-center" 
+                                    style="width: 24px; height: 24px; min-width: 24px; margin-top: 2px;"
+                                    onclick="quickUpdateStatus(${t.task_id}, '${isDone ? 'In Progress' : 'Completed'}')"
+                                    title="${isDone ? 'Mark In Progress (Reopen)' : 'Mark Completed'}">
+                                <i class="bi ${isDone ? 'bi-check-lg text-white' : 'bi-check'}"></i>
+                            </button>
+                            <div>
+                                <a href="javascript:void(0)" class="text-dark text-decoration-none fw-medium ${isDone ? 'text-decoration-line-through text-muted' : ''}" 
+                                   onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task details">
+                                    ${t.task_title}
+                                </a>
+                                ${blockerDisplay}
+                            </div>
+                        </div>
+                    </td>
+
+                    <!-- 2. Presales Assignee (Presales 1 or 2) -->
+                    <td>
+                        <span class="badge ${t.assigned_to === 'Presales 2' ? 'bg-info-subtle text-info-emphasis border border-info-subtle' : 'bg-primary-subtle text-primary border border-primary-subtle'} py-1 px-2" style="font-size: 0.78rem;">
+                            <i class="bi bi-person-badge-fill me-1"></i>${t.assigned_to}
+                        </span>
+                    </td>
+
+                    <!-- 3. Vendor -->
+                    <td>
+                        <span class="badge vendor-badge ${vendorClass}" onclick="setVendorFilter('${vendorDomain}')" style="cursor: pointer;" title="Click to filter by ${vendorDomain}">
+                            <i class="bi bi-cpu me-1"></i>${vendorDomain}
+                        </span>
+                    </td>
+
+                    <!-- 4. Status / Progress Dropdown -->
+                    <td>
+                        <div class="d-flex align-items-center gap-1 justify-content-center">
+                            <select class="form-select form-select-sm fw-semibold" 
+                                    style="max-width: 155px; font-size: 0.76rem; border-radius: 6px; ${isDone ? 'background-color: #ecfdf5; color: #047857; border-color: #6ee7b7;' : (t.status === 'In Progress' ? 'background-color: #eff6ff; color: #1d4ed8; border-color: #93c5fd;' : '')}" 
+                                    onchange="quickUpdateStatus(${t.task_id}, this.value)">
+                                <option value="Not Started" ${t.status === 'Not Started' ? 'selected' : ''}>⏳ Not Started</option>
+                                <option value="In Progress" ${t.status === 'In Progress' ? 'selected' : ''}>🚀 In Progress</option>
+                                <option value="Waiting on Vendor" ${t.status === 'Waiting on Vendor' ? 'selected' : ''}>⏸️ Waiting on Vendor</option>
+                                <option value="Pending Review" ${t.status === 'Pending Review' ? 'selected' : ''}>🔍 Pending Review</option>
+                                <option value="Completed" ${t.status === 'Completed' ? 'selected' : ''}>✅ Completed</option>
+                            </select>
+                        </div>
+                    </td>
+
+                    <!-- 5. Priority -->
+                    <td>
+                        <span class="monday-pill ${priorityClass}" style="min-width: 70px; font-size: 0.72rem;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
+                            ${t.priority}
+                        </span>
+                    </td>
+
+                    <!-- 6. Due Date -->
+                    <td>
+                        <span class="small ${isOverdue(t.due_date, t.status) ? 'text-danger fw-bold' : 'text-muted'}" style="font-size: 0.78rem;">
+                            ${t.due_date || '-'}
+                        </span>
+                    </td>
+
+                    <!-- 7. Actions -->
+                    <td class="text-end pe-3">
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-secondary py-1 px-2" title="Edit Task" onclick="openEditTaskModal(${t.task_id})">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-outline-secondary py-1 px-2" title="Task Lifecycle History" onclick="openHistoryModal(${t.task_id}, '${t.task_title.replace(/'/g, "\\'")}')">
+                                <i class="bi bi-clock-history text-primary"></i>
+                            </button>
+                            <button class="btn btn-outline-danger py-1 px-2" title="Delete Task" onclick="deleteTaskConfirm(${t.task_id})">
+                                <i class="bi bi-trash3"></i>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+            `;
+        }
+
+        function openNewTaskModalWithDeal(dealId) {
+            openNewTaskModal();
+            const dealSel = document.getElementById('newDealId');
+            if (dealSel) {
+                dealSel.value = dealId;
+                onNewDealChange();
+            }
+        }
+
+        async function deleteTaskConfirm(taskId) {
+            if (!confirm(`Are you sure you want to delete task #${taskId}?`)) return;
+            try {
+                const res = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+                if (res.ok) {
+                    await loadTasks();
+                } else {
+                    alert('Failed to delete task.');
+                }
+            } catch (err) {
+                console.error("Error deleting task:", err);
             }
         }
 

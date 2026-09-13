@@ -745,14 +745,15 @@ def get_tasks(
     group_by: Optional[str] = Query(None, description="Optional grouping: 'status', 'assigned_to', or 'category'"),
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by status"),
     assigned_to: Optional[str] = Query(None, description="Filter by assigned user"),
+    vendor: Optional[str] = Query(None, description="Filter items by vendor domain (e.g. HPE, Dell, Veeam, VMware, Nutanix, Cisco, General)"),
     active_only: bool = Query(False, description="Exclude completed tasks"),
     created_today: bool = Query(False, description="Filter items created today"),
     completed_today: bool = Query(False, description="Filter items completed today"),
     completed_this_week: bool = Query(False, description="Filter items completed in the past 7 days"),
 ):
     """
-    Retrieve all tasks, with filtering by daily velocity (created today, completed this week)
-    and optional grouping by status or assigned user.
+    Retrieve all tasks, with filtering by daily velocity (created today, completed this week),
+    vendor domain, and optional grouping by status or assigned user.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -768,6 +769,9 @@ def get_tasks(
     if assigned_to:
         query += " AND assigned_to = ?"
         params.append(assigned_to)
+    if vendor:
+        query += " AND LOWER(vendor_domain) = LOWER(?)"
+        params.append(vendor.strip())
     if created_today:
         query += " AND date(created_at) = date('now')"
     if completed_today:
@@ -1342,6 +1346,59 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             border-color: var(--monday-blue);
         }
 
+        .vendor-badge {
+            font-size: 0.76rem;
+            font-weight: 600;
+            border-radius: 4px;
+            padding: 3px 7px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            border: 1px solid transparent;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+        .vendor-badge:hover {
+            opacity: 0.85;
+            transform: translateY(-1px);
+        }
+        .vendor-HPE { background-color: #e6f7f3; color: #007a5a; border-color: #a3e3d2 !important; }
+        .vendor-Dell { background-color: #e8f4fc; color: #006097; border-color: #b0daf6 !important; }
+        .vendor-Veeam { background-color: #e8f8ed; color: #008728; border-color: #abebb9 !important; }
+        .vendor-VMware { background-color: #f1f3f7; color: #475569; border-color: #cbd5e1 !important; }
+        .vendor-Nutanix { background-color: #edf2fc; color: #023877; border-color: #b2ccf6 !important; }
+        .vendor-Cisco { background-color: #e6f6fc; color: #027a9e; border-color: #a2e2f7 !important; }
+        .vendor-General { background-color: #f1f5f9; color: #475569; border-color: #e2e8f0 !important; }
+
+        .vendor-pill-btn {
+            font-size: 0.78rem;
+            font-weight: 600;
+            border-radius: 16px;
+            padding: 3px 10px;
+            border: 1px solid #d0d7de;
+            background: #ffffff;
+            color: #475569;
+            transition: all 0.15s ease;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+        }
+        .vendor-pill-btn:hover {
+            background-color: #f0f7ff;
+            border-color: #0969da;
+            color: #0969da;
+        }
+        .vendor-pill-btn.active {
+            background-color: #0969da !important;
+            border-color: #0969da !important;
+            color: #ffffff !important;
+        }
+        .vendor-pill-btn.active .badge {
+            background-color: rgba(255, 255, 255, 0.25) !important;
+            color: #ffffff !important;
+            border-color: transparent !important;
+        }
+
         .progress-bar-segment {
             height: 8px;
             transition: width 0.3s;
@@ -1386,13 +1443,60 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('ACTIVE_ONLY', this)">Active Only</button>
             </div>
 
-            <div class="d-flex align-items-center gap-2">
-                <div class="input-group input-group-sm" style="width: 250px;">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <!-- Vendor Dropdown Filter -->
+                <div class="input-group input-group-sm" style="width: auto;">
+                    <span class="input-group-text bg-white fw-semibold text-secondary">
+                        <i class="bi bi-funnel-fill text-primary me-1"></i>Vendor:
+                    </span>
+                    <select id="vendorFilterSelect" class="form-select form-select-sm fw-semibold" style="width: 135px; cursor: pointer;" onchange="setVendorFilter(this.value)">
+                        <option value="">All Vendors</option>
+                        <option value="HPE">HPE</option>
+                        <option value="Dell">Dell</option>
+                        <option value="Veeam">Veeam</option>
+                        <option value="VMware">VMware</option>
+                        <option value="Nutanix">Nutanix</option>
+                        <option value="Cisco">Cisco</option>
+                        <option value="General">General</option>
+                    </select>
+                </div>
+
+                <div class="input-group input-group-sm" style="width: 220px;">
                     <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
-                    <input type="text" id="searchInput" class="form-control" placeholder="Search tasks, blockers..." oninput="renderBoard()">
+                    <input type="text" id="searchInput" class="form-control" placeholder="Search tasks, deals, customers..." oninput="renderBoard()">
                 </div>
                 <button class="btn btn-sm btn-light border" onclick="loadTasks()" title="Reload Data">
                     <i class="bi bi-arrow-clockwise"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Vendor Quick-Filter Pill Buttons -->
+        <div class="d-flex flex-wrap align-items-center gap-2 mt-2 pt-2 border-top">
+            <span class="small fw-semibold text-muted d-flex align-items-center gap-1">
+                <i class="bi bi-cpu-fill text-primary"></i>Vendor Filter:
+            </span>
+            <div class="d-flex flex-wrap align-items-center gap-1" id="vendorPillsBar">
+                <button type="button" class="vendor-pill-btn active" data-vendor="" onclick="setVendorFilter('', this)">
+                    All Vendors <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorAll">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="HPE" onclick="setVendorFilter('HPE', this)">
+                    HPE <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorHPE">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="Dell" onclick="setVendorFilter('Dell', this)">
+                    Dell <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorDell">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="Veeam" onclick="setVendorFilter('Veeam', this)">
+                    Veeam <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorVeeam">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="VMware" onclick="setVendorFilter('VMware', this)">
+                    VMware <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorVMware">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="Nutanix" onclick="setVendorFilter('Nutanix', this)">
+                    Nutanix <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorNutanix">0</span>
+                </button>
+                <button type="button" class="vendor-pill-btn" data-vendor="General" onclick="setVendorFilter('General', this)">
+                    General <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorGeneral">0</span>
                 </button>
             </div>
         </div>
@@ -1497,7 +1601,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold"><i class="bi bi-cpu text-info me-1"></i>Vendor Domain *</label>
+                                <select id="newVendor" class="form-select" required>
+                                    <option value="General" selected>General</option>
+                                    <option value="HPE">HPE</option>
+                                    <option value="Dell">Dell</option>
+                                    <option value="Veeam">Veeam</option>
+                                    <option value="VMware">VMware</option>
+                                    <option value="Nutanix">Nutanix</option>
+                                    <option value="Cisco">Cisco</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Workstream Category *</label>
                                 <select id="newCategory" class="form-select" required>
                                     <option value="RFP_OWNERSHIP">RFP Ownership</option>
@@ -1505,7 +1621,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="GENERAL_ACTION">General Action</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Assigned Presales Lead *</label>
                                 <select id="newAssigned" class="form-select" required>
                                     <option value="Presales 1">Presales 1</option>
@@ -1577,7 +1693,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
+                                <label class="form-label small fw-semibold"><i class="bi bi-cpu text-info me-1"></i>Vendor Domain *</label>
+                                <select id="editVendor" class="form-select" required>
+                                    <option value="General">General</option>
+                                    <option value="HPE">HPE</option>
+                                    <option value="Dell">Dell</option>
+                                    <option value="Veeam">Veeam</option>
+                                    <option value="VMware">VMware</option>
+                                    <option value="Nutanix">Nutanix</option>
+                                    <option value="Cisco">Cisco</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Category *</label>
                                 <select id="editCategory" class="form-select" required>
                                     <option value="RFP_OWNERSHIP">RFP Ownership</option>
@@ -1585,7 +1713,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="GENERAL_ACTION">General Action</option>
                                 </select>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Assigned To *</label>
                                 <select id="editAssigned" class="form-select" required>
                                     <option value="Presales 1">Presales 1</option>
@@ -1669,6 +1797,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         let allDeals = [];
         let allCustomers = [];
         let currentFilter = 'ALL';
+        let currentVendorFilter = '';
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
         const historyModal = new bootstrap.Modal(document.getElementById('historyModal'));
@@ -1679,6 +1808,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.addEventListener('DOMContentLoaded', () => {
             loadTasks();
         });
+
+        function setVendorFilter(vendorName, btn) {
+            currentVendorFilter = vendorName || '';
+            const selectEl = document.getElementById('vendorFilterSelect');
+            if (selectEl) selectEl.value = currentVendorFilter;
+
+            document.querySelectorAll('.vendor-pill-btn').forEach(b => {
+                if ((b.getAttribute('data-vendor') || '') === currentVendorFilter) {
+                    b.classList.add('active');
+                } else {
+                    b.classList.remove('active');
+                }
+            });
+
+            renderBoard();
+        }
 
         async function loadLookups() {
             try {
@@ -1729,7 +1874,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     : allDeals;
                 filtered.forEach(d => {
                     const custLabel = d.customer_name ? ` (#${d.customer_id || ''} ${d.customer_name})` : '';
-                    const label = `Deal #${d.deal_id}: ${d.deal_name}${custLabel}`;
+                    const vendorLabel = d.primary_vendors ? ` [${d.primary_vendors}]` : '';
+                    const label = `Deal #${d.deal_id}: ${d.deal_name}${custLabel}${vendorLabel}`;
                     opts.push(`<option value="${d.deal_id}">${label}</option>`);
                 });
                 return opts.join('');
@@ -1771,13 +1917,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const dealId = parseInt(document.getElementById('newDealId').value) || null;
             if (!dealId) return;
             const deal = allDeals.find(d => d.deal_id === dealId);
-            if (deal && deal.customer_id) {
-                const newCustSel = document.getElementById('newCustomerId');
-                if (newCustSel) {
-                    newCustSel.value = deal.customer_id;
-                    populateDealSelects(deal.customer_id, 'new');
-                    newCustSel.value = deal.customer_id;
-                    document.getElementById('newDealId').value = dealId;
+            if (deal) {
+                if (deal.customer_id) {
+                    const newCustSel = document.getElementById('newCustomerId');
+                    if (newCustSel) {
+                        newCustSel.value = deal.customer_id;
+                        populateDealSelects(deal.customer_id, 'new');
+                        newCustSel.value = deal.customer_id;
+                        document.getElementById('newDealId').value = dealId;
+                    }
+                }
+                if (deal.primary_vendors) {
+                    const firstV = deal.primary_vendors.split(',')[0].trim();
+                    const newVSel = document.getElementById('newVendor');
+                    if (newVSel && Array.from(newVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
+                        newVSel.value = firstV;
+                    }
                 }
             }
         }
@@ -1802,13 +1957,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 return;
             }
             const deal = allDeals.find(d => d.deal_id === dealId);
-            if (deal && deal.customer_id) {
-                const editCustSel = document.getElementById('editCustomerId');
-                if (editCustSel) {
-                    editCustSel.value = deal.customer_id;
-                    populateDealSelects(deal.customer_id, 'edit');
-                    editCustSel.value = deal.customer_id;
-                    document.getElementById('editDealId').value = dealId;
+            if (deal) {
+                if (deal.customer_id) {
+                    const editCustSel = document.getElementById('editCustomerId');
+                    if (editCustSel) {
+                        editCustSel.value = deal.customer_id;
+                        populateDealSelects(deal.customer_id, 'edit');
+                        editCustSel.value = deal.customer_id;
+                        document.getElementById('editDealId').value = dealId;
+                    }
+                }
+                if (deal.primary_vendors) {
+                    const firstV = deal.primary_vendors.split(',')[0].trim();
+                    const editVSel = document.getElementById('editVendor');
+                    if (editVSel && Array.from(editVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
+                        editVSel.value = firstV;
+                    }
                 }
             }
             updateEditBanner();
@@ -1819,14 +1983,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             if (!banner) return;
             const custId = parseInt(document.getElementById('editCustomerId').value) || null;
             const dealId = parseInt(document.getElementById('editDealId').value) || null;
+            const vendor = document.getElementById('editVendor') ? document.getElementById('editVendor').value : null;
             const cust = allCustomers.find(c => c.customer_id === custId);
             const deal = allDeals.find(d => d.deal_id === dealId);
 
-            if (cust || deal) {
+            if (cust || deal || vendor) {
                 banner.innerHTML = `
-                    <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3">
+                    <div class="alert alert-light border py-2 px-3 small d-flex flex-wrap align-items-center gap-3 mb-0">
                         <span><i class="bi bi-building text-primary me-1"></i>Customer: <strong class="text-dark">${cust ? '#' + cust.customer_id + ' ' + cust.company_name : 'None'}</strong></span>
                         <span><i class="bi bi-briefcase text-success me-1"></i>Deal: <strong class="text-dark">${deal ? '#' + deal.deal_id + ' ' + deal.deal_name : 'None'}</strong></span>
+                        <span><i class="bi bi-cpu text-info me-1"></i>Vendor: <strong class="text-dark">${vendor || 'General'}</strong></span>
                     </div>
                 `;
             } else {
@@ -1916,9 +2082,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     }
                 }
 
-                return matchesSearch && matchesFilter;
+                let matchesVendor = true;
+                if (currentVendorFilter) {
+                    const vf = currentVendorFilter.toLowerCase();
+                    const tv = (t.vendor_domain || '').toLowerCase();
+                    matchesVendor = (tv === vf) || (vf === 'hpe' && tv === 'hp');
+                }
+
+                return matchesSearch && matchesFilter && matchesVendor;
             });
 
+            updateVendorCounts(allTasks);
             updateMacroProgress(allTasks);
 
             const groups = {
@@ -1956,20 +2130,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <table class="table task-table">
                             <thead>
                                 <tr>
-                                    <th class="text-start" style="width: 28%;">Item Title</th>
-                                    <th class="text-start" style="width: 15%;">Customer (ID & Name)</th>
-                                    <th style="width: 11%;">Assignee</th>
-                                    <th style="width: 12%;">Status</th>
-                                    <th style="width: 9%;">Priority</th>
-                                    <th style="width: 13%;">Timing & Velocity</th>
-                                    <th style="width: 8%;">Due Date</th>
-                                    <th style="width: 5%;">Log</th>
+                                    <th class="text-start" style="width: 22%;">Item Title</th>
+                                    <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
+                                    <th class="text-start" style="width: 16%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name</th>
+                                    <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
+                                    <th style="width: 8%;">Assignee</th>
+                                    <th style="width: 10%;">Status</th>
+                                    <th style="width: 7%;">Priority</th>
+                                    <th style="width: 8%;">Timing & Velocity</th>
+                                    <th style="width: 4%;">Due Date</th>
+                                    <th style="width: 3%;">Log</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 ${group.tasks.length === 0 ? `
                                     <tr>
-                                        <td colspan="8" class="text-center py-4 text-muted fst-italic">
+                                        <td colspan="10" class="text-center py-4 text-muted fst-italic">
                                             No tasks in this workstream matching filters.
                                         </td>
                                     </tr>
@@ -1981,14 +2157,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             `).join('');
         }
 
+        function updateVendorCounts(tasks) {
+            const counts = { '': tasks.length, 'HPE': 0, 'Dell': 0, 'Veeam': 0, 'VMware': 0, 'Nutanix': 0, 'General': 0 };
+            tasks.forEach(t => {
+                const vd = t.vendor_domain || 'General';
+                if (vd in counts) {
+                    counts[vd]++;
+                } else {
+                    counts[vd] = 1;
+                }
+            });
+            const setBadge = (id, count) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = count ?? 0;
+            };
+            setBadge('badgeVendorAll', counts[''] || 0);
+            setBadge('badgeVendorHPE', counts['HPE'] || 0);
+            setBadge('badgeVendorDell', counts['Dell'] || 0);
+            setBadge('badgeVendorVeeam', counts['Veeam'] || 0);
+            setBadge('badgeVendorVMware', counts['VMware'] || 0);
+            setBadge('badgeVendorNutanix', counts['Nutanix'] || 0);
+            setBadge('badgeVendorGeneral', counts['General'] || 0);
+        }
+
         function renderTaskRow(t) {
             const statusClass = 'status-' + t.status.replace(/\\s+/g, '-');
             const priorityClass = 'priority-' + t.priority;
-
-            const dealLabel = t.deal_name ? t.deal_name : (t.related_deal_id ? `Deal #${t.related_deal_id}` : '');
-            const dealBadge = dealLabel 
-                ? `<span class="deal-tag" style="font-size: 0.73rem;" title="Associated Deal"><i class="bi bi-briefcase me-1"></i>Deal: ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.7rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}<strong class="text-primary">${dealLabel}</strong></span>` 
-                : '';
 
             const blockerDisplay = t.management_blockers 
                 ? `<div class="mt-1"><span class="blocker-chip" title="${t.management_blockers}" onclick="openEditTaskModal(${t.task_id})"><i class="bi bi-exclamation-triangle-fill me-1"></i>${t.management_blockers}</span></div>`
@@ -2000,64 +2194,80 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 const lead = t.lead_time || '-';
                 velocityBadge = `
                     <div class="d-flex flex-column gap-1 align-items-center">
-                        <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.75rem;" title="Cycle Time (Working duration)">
-                            <i class="bi bi-stopwatch me-1"></i>Cycle: ${cycle}
-                        </span>
-                        <span class="badge bg-light text-muted border py-1 px-2" style="font-size: 0.72rem;" title="Lead Time (Total turnaround)">
-                            <i class="bi bi-flag me-1"></i>Lead: ${lead}
+                        <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.72rem;" title="Cycle Time (Working duration)">
+                            <i class="bi bi-stopwatch me-1"></i>${cycle}
                         </span>
                     </div>
                 `;
             } else if (t.started_at) {
                 const startedDate = t.started_at.substring(0, 10);
                 velocityBadge = `
-                    <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2" style="font-size: 0.75rem;" title="Initiated at ${t.started_at}">
-                        <i class="bi bi-play-fill text-warning me-1"></i>Started ${startedDate}
+                    <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-1" style="font-size: 0.72rem;" title="Initiated at ${t.started_at}">
+                        <i class="bi bi-play-fill text-warning me-1"></i>${startedDate}
                     </span>
                 `;
             } else {
                 const createdDate = t.created_at.substring(0, 10);
                 velocityBadge = `
-                    <span class="badge bg-light text-secondary border py-1 px-2" style="font-size: 0.75rem;" title="Created at ${t.created_at}">
-                        <i class="bi bi-hourglass me-1"></i>Queued ${createdDate}
+                    <span class="badge bg-light text-secondary border py-1 px-1" style="font-size: 0.72rem;" title="Created at ${t.created_at}">
+                        <i class="bi bi-hourglass me-1"></i>${createdDate}
                     </span>
                 `;
             }
 
+            const vendorDomain = t.vendor_domain || 'General';
+            const vendorClass = 'vendor-' + vendorDomain;
+
+            const dealDisplay = t.deal_name || (t.related_deal_id ? `Deal #${t.related_deal_id}` : 'Internal Presales');
+            const customerDisplay = t.customer_name || 'Internal / General';
+
             return `
                 <tr>
+                    <!-- 1. Item Title -->
                     <td class="text-start">
                         <div class="d-flex flex-wrap align-items-center gap-1">
                             <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
                                 ${t.task_title}
                             </a>
                         </div>
-                        ${dealBadge ? `
-                            <div class="d-flex flex-wrap align-items-center gap-1 mt-1">
-                                ${dealBadge}
-                            </div>
-                        ` : ''}
                         ${blockerDisplay}
                     </td>
+
+                    <!-- 2. Customer Name -->
                     <td class="text-start">
-                        ${t.customer_name ? `
-                            <div class="d-flex align-items-center gap-1">
-                                ${t.customer_id ? `<span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>` : ''}
-                                <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem; font-weight: 600;" title="${t.customer_name}">
-                                    <i class="bi bi-building text-primary me-1"></i>${t.customer_name}
-                                </span>
-                            </div>
-                        ` : (t.customer_id ? `
-                            <span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>
-                        ` : `
-                            <span class="text-muted small fst-italic">-</span>
-                        `)}
+                        <div class="d-flex align-items-center gap-1">
+                            ${t.customer_id ? `<span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>` : ''}
+                            <span class="badge bg-light text-dark border px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.82rem; font-weight: 600;" title="Customer: ${customerDisplay}">
+                                <i class="bi bi-building text-primary"></i>
+                                <span class="text-truncate" style="max-width: 140px;">${customerDisplay}</span>
+                            </span>
+                        </div>
                     </td>
+
+                    <!-- 3. Deal Name -->
+                    <td class="text-start">
+                        <span class="badge border px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.82rem; font-weight: 600; background-color: #f8fafc; color: #0f172a; border-color: #cbd5e1 !important;" title="Deal: ${dealDisplay}">
+                            <i class="bi bi-briefcase text-success"></i>
+                            ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.7rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}
+                            <span class="text-truncate" style="max-width: 150px;">${dealDisplay}</span>
+                        </span>
+                    </td>
+
+                    <!-- 4. Vendor -->
+                    <td>
+                        <span class="badge vendor-badge ${vendorClass}" onclick="setVendorFilter('${vendorDomain}')" style="cursor: pointer;" title="Click to filter by ${vendorDomain}">
+                            <i class="bi bi-cpu me-1"></i>${vendorDomain}
+                        </span>
+                    </td>
+
+                    <!-- 5. Assignee -->
                     <td>
                         <span class="avatar-badge">
                             <i class="bi bi-person-fill text-primary"></i>${t.assigned_to}
                         </span>
                     </td>
+
+                    <!-- 6. Status -->
                     <td>
                         <div class="dropdown">
                             <span class="monday-pill ${statusClass} dropdown-toggle" data-bs-toggle="dropdown">
@@ -2070,19 +2280,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             </ul>
                         </div>
                     </td>
+
+                    <!-- 7. Priority -->
                     <td>
-                        <span class="monday-pill ${priorityClass}" style="min-width: 80px;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
+                        <span class="monday-pill ${priorityClass}" style="min-width: 75px;" onclick="cyclePriority(${t.task_id}, '${t.priority}')" title="Click to cycle priority">
                             ${t.priority}
                         </span>
                     </td>
+
+                    <!-- 8. Timing & Velocity -->
                     <td>
                         ${velocityBadge}
                     </td>
+
+                    <!-- 9. Due Date -->
                     <td>
                         <span class="small ${isOverdue(t.due_date, t.status) ? 'text-danger fw-bold' : 'text-muted'}">
                             ${t.due_date || '-'}
                         </span>
                     </td>
+
+                    <!-- 10. Log -->
                     <td>
                         <button class="btn btn-sm btn-outline-secondary py-1 px-2 border-0" title="Lifecycle Audit Log" onclick="openHistoryModal(${t.task_id}, '${t.task_title.replace(/'/g, "\\'")}')">
                             <i class="bi bi-clock-history text-primary fs-6"></i>
@@ -2172,6 +2390,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 task_title: document.getElementById('newTitle').value,
                 category: document.getElementById('newCategory').value,
                 assigned_to: document.getElementById('newAssigned').value,
+                vendor_domain: document.getElementById('newVendor').value,
                 customer_id: custId,
                 customer_name: custObj ? custObj.company_name : (dealObj ? dealObj.customer_name : null),
                 status: document.getElementById('newStatus').value,
@@ -2214,6 +2433,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             populateDealSelects(custId || null, 'edit');
             document.getElementById('editDealId').value = task.related_deal_id || '';
 
+            document.getElementById('editVendor').value = task.vendor_domain || 'General';
             document.getElementById('editCategory').value = task.category;
             document.getElementById('editAssigned').value = task.assigned_to;
             document.getElementById('editStatus').value = task.status;
@@ -2237,6 +2457,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 task_title: document.getElementById('editTitle').value,
                 category: document.getElementById('editCategory').value,
                 assigned_to: document.getElementById('editAssigned').value,
+                vendor_domain: document.getElementById('editVendor').value,
                 customer_id: custId,
                 customer_name: custObj ? custObj.company_name : (dealObj ? dealObj.customer_name : null),
                 status: document.getElementById('editStatus').value,
@@ -2332,8 +2553,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def serve_dashboard():
-    """Serves the Monday.com-style visual Task Board."""
-    return HTML_DASHBOARD
+    """Serves the Monday.com-style visual Task Board with cache prevention."""
+    response = HTMLResponse(content=HTML_DASHBOARD)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 # -----------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -18,6 +19,46 @@ from pydantic import BaseModel, Field
 # -----------------------------------------------------------------------------
 # Configuration & Persistence
 # -----------------------------------------------------------------------------
+class DealCategory(str, Enum):
+    RFP_OWNERSHIP = "1- RFP Ownership & Prime Proposals"
+    RFP_DISTRIBUTED_SCOPE = "2- RFP Distributed Scope Items"
+    OPPORTUNITY_EFFORTS = "3- Opportunity Efforts & PO"
+
+
+def normalize_deal_category(v: Optional[Any]) -> str:
+    if not v:
+        return DealCategory.OPPORTUNITY_EFFORTS.value
+    v_str = str(v).strip().lower()
+    if "owner" in v_str or "prime" in v_str or "رئيسية" in v_str or "كراسة" in v_str or "1-" in v_str or v_str == "rfp_ownership":
+        return DealCategory.RFP_OWNERSHIP.value
+    if "scope" in v_str or "distributed" in v_str or "موزع" in v_str or "نطاق" in v_str or "2-" in v_str or v_str == "rfp_distributed_scope":
+        return DealCategory.RFP_DISTRIBUTED_SCOPE.value
+    if "opp" in v_str or "effort" in v_str or "po" in v_str or "فرصة" in v_str or "3-" in v_str or "general" in v_str or v_str == "general_action":
+        return DealCategory.OPPORTUNITY_EFFORTS.value
+    for cat in DealCategory:
+        if v_str == cat.value.lower():
+            return cat.value
+    return DealCategory.OPPORTUNITY_EFFORTS.value
+
+
+def normalize_closing_date(v: Optional[Any]) -> Optional[str]:
+    if not v:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("none", "null", "-", "undefined"):
+        return None
+    # ISO YYYY-MM-DD
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m_iso:
+        y, m, d = m_iso.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    # DD/MM/YYYY or DD-MM-YYYY
+    m_dmy = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", s)
+    if m_dmy:
+        d, m, y = m_dmy.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    return s[:20]
+
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 PLACEHOLDER_SUBSTRINGS = ["your_actual", "placeholder", "aizasyyouractual"]
@@ -206,7 +247,9 @@ async def fetch_baseline_state() -> Dict[str, Any]:
             deals_by_id[did] = {
                 "deal_name": d.get("deal_name") or "",
                 "customer_name": d.get("company_name") or d.get("customer_name") or "",
-                "customer_id": d.get("customer_id")
+                "customer_id": d.get("customer_id"),
+                "deal_category": d.get("deal_category"),
+                "closing_date": d.get("closing_date"),
             }
 
     for t in tasks:
@@ -216,6 +259,10 @@ async def fetch_baseline_state() -> Dict[str, Any]:
             t["deal_name"] = t.get("deal_name") or d_info["deal_name"]
             t["customer_name"] = t.get("customer_name") or d_info["customer_name"]
             t["customer_id"] = t.get("customer_id") or d_info.get("customer_id")
+            if not t.get("deal_category") and d_info.get("deal_category"):
+                t["deal_category"] = d_info.get("deal_category")
+            if not t.get("closing_date") and d_info.get("closing_date"):
+                t["closing_date"] = d_info.get("closing_date")
 
         # Fallback keyword match if deal_name or customer_name still missing
         if not t.get("deal_name") or not t.get("customer_name") or not t.get("customer_id"):
@@ -240,6 +287,10 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                     t["deal_name"] = t.get("deal_name") or d_name
                     t["customer_name"] = t.get("customer_name") or c_name
                     t["customer_id"] = t.get("customer_id") or c_id
+                    if not t.get("deal_category") and d_info.get("deal_category"):
+                        t["deal_category"] = d_info.get("deal_category")
+                    if not t.get("closing_date") and d_info.get("closing_date"):
+                        t["closing_date"] = d_info.get("closing_date")
                     if not t.get("related_deal_id"):
                         t["related_deal_id"] = did
                     matched = True
@@ -249,6 +300,10 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                         t["deal_name"] = t.get("deal_name") or d_name
                         t["customer_name"] = t.get("customer_name") or c_name
                         t["customer_id"] = t.get("customer_id") or c_id
+                        if not t.get("deal_category") and d_info.get("deal_category"):
+                            t["deal_category"] = d_info.get("deal_category")
+                        if not t.get("closing_date") and d_info.get("closing_date"):
+                            t["closing_date"] = d_info.get("closing_date")
                         if not t.get("related_deal_id"):
                             t["related_deal_id"] = did
                         matched = True
@@ -397,6 +452,31 @@ def sanitize_crm_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         p["assigned_presales"] = "Presales 1"
 
+    # 7. Deal Category normalization
+    cat_val = p.get("deal_category") or p.get("category")
+    if not cat_val:
+        d_text = f"{p.get('deal_name', '')} {p.get('vendor_notes', '')}".lower()
+        if any(w in d_text for w in ["prime", "رئيسية", "كراسة", "مناقصة", "منافسة", "owner", "tender"]):
+            cat_val = "1- RFP Ownership & Prime Proposals"
+        elif any(w in d_text for w in ["scope", "نطاق", "موزع", "renewal", "تجديد", "شريك", "partner", "distributed"]):
+            cat_val = "2- RFP Distributed Scope Items"
+        else:
+            cat_val = "3- Opportunity Efforts & PO"
+    p["deal_category"] = normalize_deal_category(cat_val)
+
+    # 8. Closing Date normalization
+    c_date = p.get("closing_date") or p.get("due_date")
+    if not c_date:
+        d_text = f"{p.get('vendor_notes', '')} {p.get('deal_name', '')}"
+        m_date = re.search(r"(?:إغلاق|اغلاق|حتسكر|closing|due|deadline)[\s:ب]*([0-9]{1,4}[-/][0-9]{1,2}[-/][0-9]{1,4})", d_text, re.IGNORECASE)
+        if m_date:
+            c_date = m_date.group(1)
+        else:
+            m_date2 = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b", d_text)
+            if m_date2:
+                c_date = m_date2.group(1)
+    p["closing_date"] = normalize_closing_date(c_date)
+
     return p
 
 
@@ -411,13 +491,16 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     p["task_title"] = str(title).strip()
 
     # 2. Category handling
-    cat = str(p.get("category", "")).strip().lower()
-    if "owner" in cat:
+    cat = str(p.get("category", "") or p.get("deal_category", "")).strip().lower()
+    if "owner" in cat or "prime" in cat or "1-" in cat:
         p["category"] = "RFP_OWNERSHIP"
-    elif "distribut" in cat or "scope" in cat or "rfp" in cat:
+        p["deal_category"] = "1- RFP Ownership & Prime Proposals"
+    elif "distribut" in cat or "scope" in cat or "2-" in cat:
         p["category"] = "RFP_DISTRIBUTED_SCOPE"
+        p["deal_category"] = "2- RFP Distributed Scope Items"
     else:
         p["category"] = "GENERAL_ACTION"
+        p["deal_category"] = "3- Opportunity Efforts & PO"
 
     # 3. Assigned To handling
     assigned = str(p.get("assigned_to", "")).strip().lower()
@@ -497,7 +580,11 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         p["management_blockers"] = None
 
-    # 9. Changed By
+    # 9. Closing date handling
+    c_date = p.get("closing_date") or p.get("due_date")
+    p["closing_date"] = normalize_closing_date(c_date)
+
+    # 10. Changed By
     p["changed_by"] = p.get("changed_by") or "Voice Agent"
     return p
 
@@ -506,7 +593,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     """
     Ensures that EVERY actionable deliverable, tender, or next step mentioned in the conversation
     is captured as a task in task_updates, eliminating gaps between executive report and task board.
-    Attaches deal_id, deal_name, and customer_name to tasks for full cross-system linkage.
+    Attaches deal_id, deal_name, customer_name, deal_category, and closing_date to tasks for full cross-system linkage.
     """
     task_updates = list(ai_data.get("task_updates", []))
     existing_titles = [str(item.get("payload", {}).get("task_title", "")).lower() for item in task_updates]
@@ -524,6 +611,8 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             "deal_name": d.get("deal_name", ""),
             "customer_name": d.get("company_name", ""),
             "customer_id": d.get("customer_id"),
+            "deal_category": d.get("deal_category"),
+            "closing_date": d.get("closing_date"),
         })
 
     # Also check newly planned crm_updates (both POST and PUT)
@@ -534,12 +623,16 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         c_name = p.get("company_name") or p.get("customer_name") or p.get("customer") or ""
         d_id = cu.get("deal_id")
         c_id = cu.get("customer_id") or p.get("customer_id")
+        d_cat = p.get("deal_category") or p.get("category")
+        c_date = p.get("closing_date") or p.get("due_date")
         if d_name or c_name:
             known_deals.append({
                 "deal_id": d_id,
                 "deal_name": d_name,
                 "customer_name": c_name,
                 "customer_id": c_id,
+                "deal_category": d_cat,
+                "closing_date": c_date,
             })
 
     def find_related_deal_and_context(text: str):
@@ -549,19 +642,21 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             d_name = d.get("deal_name", "")
             c_name = d.get("customer_name", "")
             c_id = d.get("customer_id")
+            d_cat = d.get("deal_category")
+            c_date = d.get("closing_date")
 
             # Check customer name
             if c_name and len(c_name) > 2 and c_name.lower() in t_low:
-                return d_id, d_name, c_name, c_id
+                return d_id, d_name, c_name, c_id, d_cat, c_date
             # Check deal name
             if d_name and len(d_name) > 3 and (d_name.lower() in t_low or t_low in d_name.lower()):
-                return d_id, d_name, c_name, c_id
+                return d_id, d_name, c_name, c_id, d_cat, c_date
             # Check individual tokens of customer name (e.g. "كاست" or "المراعي")
             for token in c_name.split():
                 if len(token) > 2 and token.lower() in t_low:
-                    return d_id, d_name, c_name, c_id
+                    return d_id, d_name, c_name, c_id, d_cat, c_date
 
-        return None, None, None, None
+        return None, None, None, None, None, None
 
     def detect_vendor(text: str) -> str:
         t_low = text.lower()
@@ -583,28 +678,40 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             return "Presales 2"
         return "Presales 1"
 
-    def detect_category(text: str) -> str:
+    def detect_category(text: str):
         t_low = text.lower()
-        if "owner" in t_low or "platform" in t_low or "prime" in t_low:
-            return "RFP_OWNERSHIP"
-        if "scope" in t_low or "renewal" in t_low or "distributed" in t_low:
-            return "RFP_DISTRIBUTED_SCOPE"
-        return "GENERAL_ACTION"
+        if any(w in t_low for w in ["owner", "platform", "prime", "رئيسية", "كراسة", "مناقصة", "منافسة"]):
+            return "RFP_OWNERSHIP", "1- RFP Ownership & Prime Proposals"
+        if any(w in t_low for w in ["scope", "renewal", "distributed", "موزع", "نطاق", "تجديد", "شريك", "partner"]):
+            return "RFP_DISTRIBUTED_SCOPE", "2- RFP Distributed Scope Items"
+        return "GENERAL_ACTION", "3- Opportunity Efforts & PO"
+
+    def detect_closing_date(text: str) -> Optional[str]:
+        m = re.search(r"(?:إغلاق|اغلاق|حتسكر|closing|due|deadline)[\s:ب]*([0-9]{1,4}[-/][0-9]{1,2}[-/][0-9]{1,4})", text, re.IGNORECASE)
+        if m:
+            return normalize_closing_date(m.group(1))
+        m2 = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b", text)
+        if m2:
+            return normalize_closing_date(m2.group(1))
+        return None
 
     # Enrich any tasks generated directly by Gemini
     for tu in task_updates:
         p = tu.get("payload", {})
         t_text = f"{p.get('task_title', '')} {p.get('management_blockers', '')} {p.get('deal_name', '')} {p.get('customer_name', '')}"
-        if not p.get("customer_name") or not p.get("deal_name") or not p.get("related_deal_id") or not p.get("customer_id"):
-            d_id, d_name, c_name, c_id = find_related_deal_and_context(t_text)
-            if not p.get("related_deal_id") and d_id:
-                p["related_deal_id"] = d_id
-            if not p.get("deal_name") and d_name:
-                p["deal_name"] = d_name
-            if not p.get("customer_name") and c_name:
-                p["customer_name"] = c_name
-            if not p.get("customer_id") and c_id:
-                p["customer_id"] = c_id
+        d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(t_text)
+        if not p.get("related_deal_id") and d_id:
+            p["related_deal_id"] = d_id
+        if not p.get("deal_name") and d_name:
+            p["deal_name"] = d_name
+        if not p.get("customer_name") and c_name:
+            p["customer_name"] = c_name
+        if not p.get("customer_id") and c_id:
+            p["customer_id"] = c_id
+        if not p.get("deal_category"):
+            p["deal_category"] = d_cat or ("1- RFP Ownership & Prime Proposals" if p.get("category") == "RFP_OWNERSHIP" else "2- RFP Distributed Scope Items" if p.get("category") == "RFP_DISTRIBUTED_SCOPE" else "3- Opportunity Efforts & PO")
+        if not p.get("closing_date"):
+            p["closing_date"] = c_date or detect_closing_date(t_text)
 
     # 1. Reconcile tomorrow's actions
     for action in actions:
@@ -615,17 +722,21 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if any(len(act_low) > 8 and (act_low[:20] in et or et in act_low) for et in existing_titles):
             continue
 
-        d_id, d_name, c_name, c_id = find_related_deal_and_context(action_text)
+        d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(action_text)
+        cat_key, cat_name = detect_category(action_text)
+        closing_dt = c_date or detect_closing_date(action_text)
 
         task_updates.append({
             "method": "POST",
             "payload": {
                 "task_title": action_text,
-                "category": detect_category(action_text),
+                "category": cat_key,
+                "deal_category": d_cat or cat_name,
+                "closing_date": closing_dt,
                 "assigned_to": detect_assigned(action_text),
                 "vendor_domain": detect_vendor(action_text),
                 "status": "In Progress",
-                "priority": "High" if ("tender" in act_low or "rfp" in act_low) else "Medium",
+                "priority": "High" if ("tender" in act_low or "rfp" in act_low or "مناقصة" in act_low) else "Medium",
                 "related_deal_id": d_id,
                 "deal_name": d_name,
                 "customer_id": c_id,
@@ -639,14 +750,18 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     for prog in progress:
         prog_text = str(prog).strip()
         prog_low = prog_text.lower()
-        if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low:
+        if "tender" in prog_low or "scope" in prog_low or "onboard" in prog_low or "rfp" in prog_low or "مناقصة" in prog_low:
             if not any(len(prog_low) > 8 and (prog_low[:20] in et or et in prog_low) for et in existing_titles):
-                d_id, d_name, c_name, c_id = find_related_deal_and_context(prog_text)
+                d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(prog_text)
+                cat_key, cat_name = detect_category(prog_text)
+                closing_dt = c_date or detect_closing_date(prog_text)
                 task_updates.append({
                     "method": "POST",
                     "payload": {
                         "task_title": prog_text,
-                        "category": detect_category(prog_text),
+                        "category": cat_key,
+                        "deal_category": d_cat or cat_name,
+                        "closing_date": closing_dt,
                         "assigned_to": detect_assigned(prog_text),
                         "vendor_domain": detect_vendor(prog_text),
                         "status": "In Progress",
@@ -736,6 +851,10 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                             payload["customer_name"] = cd.get("company_name")
                         if not payload.get("customer_id") and c_cust_id:
                             payload["customer_id"] = c_cust_id
+                        if not payload.get("deal_category") and cd.get("deal_category"):
+                            payload["deal_category"] = cd.get("deal_category")
+                        if not payload.get("closing_date") and cd.get("closing_date"):
+                            payload["closing_date"] = cd.get("closing_date")
                         break
 
             try:
@@ -957,10 +1076,21 @@ async def get_followup_opportunities():
 
         # Determine the opportunity kind (one of the 3 kinds)
         kind = None
-        for t in linked_tasks:
-            if t.get("category") == "RFP_OWNERSHIP":
+        d_cat = d.get("deal_category")
+        if d_cat:
+            d_cat_low = d_cat.lower()
+            if "owner" in d_cat_low or "prime" in d_cat_low or "1-" in d_cat_low:
                 kind = "RFP_OWNERSHIP"
-                break
+            elif "distribut" in d_cat_low or "scope" in d_cat_low or "2-" in d_cat_low:
+                kind = "RFP_DISTRIBUTED_SCOPE"
+            elif "opp" in d_cat_low or "effort" in d_cat_low or "po" in d_cat_low or "3-" in d_cat_low:
+                kind = "GENERAL_ACTION"
+
+        if not kind:
+            for t in linked_tasks:
+                if t.get("category") == "RFP_OWNERSHIP":
+                    kind = "RFP_OWNERSHIP"
+                    break
         if not kind:
             for t in linked_tasks:
                 if t.get("category") == "RFP_DISTRIBUTED_SCOPE":
@@ -987,10 +1117,18 @@ async def get_followup_opportunities():
             for t in followup_tasks
         )
 
+        category_name = d.get("deal_category") or (
+            "1- RFP Ownership & Prime Proposals" if kind == "RFP_OWNERSHIP"
+            else "2- RFP Distributed Scope Items" if kind == "RFP_DISTRIBUTED_SCOPE"
+            else "3- Opportunity Efforts & PO"
+        )
+
         opportunities.append({
             "deal_id": deal_id,
             "deal_name": deal_name,
             "customer_name": customer_name,
+            "deal_category": category_name,
+            "closing_date": d.get("closing_date"),
             "stage": d.get("stage", "Gathering Requirements"),
             "estimated_value": d.get("estimated_value", 0),
             "primary_vendors": d.get("primary_vendors", "General"),
@@ -1020,11 +1158,18 @@ async def get_followup_opportunities():
             first_t = t_list[0]
             kind = first_t.get("category") or "GENERAL_ACTION"
             has_blk = any(t.get("is_blocked") or str(t.get("status", "")).strip().lower() in ("waiting on vendor", "blocked") or (t.get("management_blockers") and str(t.get("management_blockers")).strip()) for t in f_tasks)
+            first_cat = first_t.get("deal_category") or (
+                "1- RFP Ownership & Prime Proposals" if kind == "RFP_OWNERSHIP"
+                else "2- RFP Distributed Scope Items" if kind == "RFP_DISTRIBUTED_SCOPE"
+                else "3- Opportunity Efforts & PO"
+            )
 
             opportunities.append({
                 "deal_id": first_t.get("related_deal_id"),
                 "deal_name": first_t.get("deal_name") or key,
                 "customer_name": first_t.get("customer_name") or "Deliverables",
+                "deal_category": first_cat,
+                "closing_date": first_t.get("closing_date"),
                 "stage": "Active Execution",
                 "estimated_value": 0,
                 "primary_vendors": first_t.get("vendor_domain") or "General",
@@ -1064,7 +1209,7 @@ async def get_followup_opportunities():
         },
         "kinds": {
             "RFP_OWNERSHIP": {
-                "name_en": "RFP Ownership",
+                "name_en": "1- RFP Ownership & Prime Proposals",
                 "name_ar": "مناقصات رئيسية وتكليف كامل",
                 "badge": "badge-rfp-owner",
                 "description": "Prime tenders owned end-to-end requiring technical architecture, RFP response submission, and bid management.",
@@ -1072,7 +1217,7 @@ async def get_followup_opportunities():
                 "followup_opportunities": rfp_ownership_followup
             },
             "RFP_DISTRIBUTED_SCOPE": {
-                "name_en": "RFP Distributed Scope",
+                "name_en": "2- RFP Distributed Scope Items",
                 "name_ar": "نطاق موزع وشراكات التقنية",
                 "badge": "badge-rfp-dist",
                 "description": "Multi-vendor partner tenders (HPE, Dell, Veeam, Nutanix, VMware) requiring partner discounts, BoQ validations, and distributor scopes.",
@@ -1080,10 +1225,10 @@ async def get_followup_opportunities():
                 "followup_opportunities": rfp_distributed_followup
             },
             "GENERAL_ACTION": {
-                "name_en": "General Action",
-                "name_ar": "إجراءات وتجارب فنية عامة",
+                "name_en": "3- Opportunity Efforts & PO",
+                "name_ar": "جهود الفرص المبكرة والتعميد المباشر",
                 "badge": "badge-rfp-action",
-                "description": "PoC testing, hardware sizing, licensing migrations, and operational presales support deliverables.",
+                "description": "Early consultative assessment, customer visits, cooking RFP before public release, or direct PO.",
                 "opportunities": general_action_followup,
                 "followup_opportunities": general_action_followup
             }
@@ -1273,8 +1418,13 @@ Your responsibilities:
      * For existing baseline deals: Use "PUT" with "deal_id" and "payload".
      * For newly discussed projects/opportunities (e.g. "مشروع كاست", "مشروع المراعي"): Use "POST" with "payload".
      IMPORTANT REQUIREMENTS FOR CRM DEALS (CRITICAL):
-     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة").
-     * deal_name: REQUIRED for "POST". Descriptive deal/project title in original Arabic/English as spoken (e.g. "مشروع كاست - تحديث مركز البيانات", "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell").
+     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة", "MOI").
+     * deal_name: REQUIRED for "POST". Descriptive deal/project title in original Arabic/English as spoken (e.g. "تجديد الدعم الفني للأجهزة", "مشروع كاست - تحديث مركز البيانات", "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell").
+     * deal_category: MUST be one of the three standardized business categories:
+       1. "1- RFP Ownership & Prime Proposals": When presales mentions owning a prime RFP/tender end-to-end (e.g. "I got an RFP for customer MOI and the name is renewal for hardware" / "استلمت مناقصة" / "اعمل على مناقصة").
+       2. "2- RFP Distributed Scope Items": When receiving or working on a distributed vendor/partner scope within an RFP (e.g. "received a scope for the RFP name تجديد الدعم الفني للتجهيزات للعميل وزارة الداخلية").
+       3. "3- Opportunity Efforts & PO": For early discovery, consultative assessment visits prior to public RFP ("received request to visit customer", "met customer to identify opportunity", "working early to cook the RFP before release") or direct PO.
+     * closing_date: Tender closing date or submission deadline in format "YYYY-MM-DD" (e.g. if speaker says "تاريخ الاغلاق او حتسكر ب 21/8/2026", output "2026-08-21"). Mentioned especially for RFP tenders and distributed scopes. For early opportunity efforts without deadline, can be null.
      * primary_vendors: Array of vendor technologies (e.g. ["Hitachi Vantara"], ["Dell"], ["HPE"], ["Veeam"]).
      * stage: MUST be one of: ["Discovery", "Gathering Requirements", "RFP / Tender", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage).
      * RFP & REQUEST FOR PRICING RULE (STRICT): If the presales engineer mentions receiving an RFP (طلب تقديم عروض), RFQ, or a request for pricing (طلب تسعير / استدراج عروض أسعار / تسعيرة مباشرة), set the deal stage to "RFP / Tender". This represents a direct request for pricing or tender proposal, usually for opportunities or private/commercial accounts not related to the Eitimad (منصة اعتماد) portal which is designated for government tenders.
@@ -1285,11 +1435,13 @@ Your responsibilities:
      CRITICAL REQUIREMENT: For EVERY new tender, RFP ownership, vendor scope, or tomorrow's action item mentioned in the meeting, you MUST create a task using method "POST"! Never omit any discussed task or deliverable.
      IMPORTANT CONSTRAINTS FOR TASKS:
      * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "إعداد وتدقيق المقترح الفني لفرصة كاست بالتنسيق مع Hitachi Vantara").
-     * customer_name: Name of customer or organization (e.g. "كاست", "المراعي").
+     * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
      * deal_name: Descriptive deal/project title.
+     * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
+     * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
      * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
      * assigned_to: MUST be: "Presales 1" or "Presales 2".
-     * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION".
+     * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
      * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
      * priority: MUST be one of: ["High", "Medium", "Low"].
      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
@@ -1306,13 +1458,15 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "company_name": "المراعي",
-        "deal_name": "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell",
-        "primary_vendors": ["Dell"],
-        "stage": "Gathering Requirements",
+        "company_name": "MOI",
+        "deal_name": "تجديد الدعم الفني للأجهزة",
+        "deal_category": "1- RFP Ownership & Prime Proposals",
+        "closing_date": "2026-08-21",
+        "primary_vendors": ["Dell", "HPE"],
+        "stage": "RFP / Tender",
         "estimated_value": 10000000.0,
         "assigned_presales": "Presales 1",
-        "vendor_notes": "طلب العميل لحلول الأجهزة الشخصية كمبيوتر ولابتوبات وأكسسوارات متوقع إغلاقها بنهاية السنة"
+        "vendor_notes": "كراسة تجديد الدعم الفني للأجهزة، تاريخ الإغلاق 21/8/2026"
       }}
     }},
     {{
@@ -1320,6 +1474,8 @@ Return STRICT JSON matching this schema:
       "payload": {{
         "company_name": "كاست",
         "deal_name": "مشروع كاست - تحديث مركز البيانات",
+        "deal_category": "3- Opportunity Efforts & PO",
+        "closing_date": null,
         "primary_vendors": ["Hitachi Vantara"],
         "stage": "Gathering Requirements",
         "estimated_value": 1250000.0,
@@ -1332,9 +1488,11 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "متابعة تحديد المواصفات والكميات لأجهزة Dell المطلوبة لشركة المراعي وتحديد جدول التسليم",
-        "customer_name": "المراعي",
-        "deal_name": "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell",
+        "task_title": "إعداد كراسة الشروط والمواصفات لمناقصة تجديد الدعم الفني",
+        "customer_name": "MOI",
+        "deal_name": "تجديد الدعم الفني للأجهزة",
+        "deal_category": "1- RFP Ownership & Prime Proposals",
+        "closing_date": "2026-08-21",
         "category": "RFP_OWNERSHIP",
         "assigned_to": "Presales 1",
         "vendor_domain": "Dell",
@@ -1612,13 +1770,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 All (<span id="count-ALL">0</span>)
                             </button>
                             <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-RFP_OWNERSHIP" onclick="filterFollowupByKind('RFP_OWNERSHIP')">
-                                <span class="badge badge-rfp-owner me-1">RFP Ownership</span>(<span id="count-RFP_OWNERSHIP">0</span>)
+                                <span class="badge badge-rfp-owner me-1">1- RFP Ownership</span>(<span id="count-RFP_OWNERSHIP">0</span>)
                             </button>
                             <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-RFP_DISTRIBUTED_SCOPE" onclick="filterFollowupByKind('RFP_DISTRIBUTED_SCOPE')">
-                                <span class="badge badge-rfp-dist me-1">Distributed Scope</span>(<span id="count-RFP_DISTRIBUTED_SCOPE">0</span>)
+                                <span class="badge badge-rfp-dist me-1">2- Distributed Scope</span>(<span id="count-RFP_DISTRIBUTED_SCOPE">0</span>)
                             </button>
                             <button class="btn btn-sm btn-outline-secondary kind-filter-btn" id="filter-btn-GENERAL_ACTION" onclick="filterFollowupByKind('GENERAL_ACTION')">
-                                <span class="badge badge-rfp-action me-1">General Action</span>(<span id="count-GENERAL_ACTION">0</span>)
+                                <span class="badge badge-rfp-action me-1">3- Opportunity Efforts & PO</span>(<span id="count-GENERAL_ACTION">0</span>)
                             </button>
                         </div>
 
@@ -2046,16 +2204,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             container.innerHTML = opps.map(o => {
                 let kindBadgeClass = 'badge-rfp-action';
-                let kindName = 'General Action';
-                let kindNameAr = 'إجراءات فنية عامة';
+                let kindName = '3- Opportunity Efforts & PO';
+                let kindNameAr = 'جهود الفرص المبكرة والتعميد المباشر';
                 if (o.kind === 'RFP_OWNERSHIP') {
                     kindBadgeClass = 'badge-rfp-owner';
-                    kindName = 'RFP Ownership';
-                    kindNameAr = 'مناقصة رئيسية';
+                    kindName = '1- RFP Ownership & Prime Proposals';
+                    kindNameAr = 'مناقصة رئيسية وتكليف كامل';
                 } else if (o.kind === 'RFP_DISTRIBUTED_SCOPE') {
                     kindBadgeClass = 'badge-rfp-dist';
-                    kindName = 'RFP Distributed Scope';
-                    kindNameAr = 'نطاق موزع وشراكات';
+                    kindName = '2- RFP Distributed Scope Items';
+                    kindNameAr = 'نطاق موزع وشراكات التقنية';
                 }
 
                 const followCount = o.followup_tasks_count || 0;
@@ -2063,6 +2221,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                 const blockerBadge = o.has_blocker
                     ? `<span class="badge badge-blocker ms-1"><i class="bi bi-exclamation-triangle-fill me-1"></i>Blocked</span>`
+                    : '';
+
+                const closingBadge = o.closing_date
+                    ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle ms-1"><i class="bi bi-alarm-fill me-1"></i>Closing: ${o.closing_date}</span>`
                     : '';
 
                 // Render tasks needing follow-up
@@ -2084,6 +2246,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                             <span><i class="bi bi-building text-info me-1"></i>Customer: <strong class="text-light">${t.customer_name || o.customer_name || 'Customer'}</strong></span>
                                             <span><i class="bi bi-briefcase text-warning me-1"></i>Deal: <strong class="text-light">${t.deal_name || o.deal_name || 'Deal'}</strong></span>
                                             <span><i class="bi bi-person me-1"></i>${t.assigned_to || 'Assigned'}</span>
+                                            ${t.closing_date ? `<span><i class="bi bi-alarm text-danger me-1"></i>Closing: <strong class="text-danger">${t.closing_date}</strong></span>` : ''}
                                             ${t.is_blocked || t.management_blockers ? `<span class="text-danger"><i class="bi bi-slash-circle me-1"></i>${t.management_blockers || 'Blocked'}</span>` : ''}
                                         </div>
                                     </div>
@@ -2097,10 +2260,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <div class="card bg-dark bg-opacity-60 border border-secondary border-opacity-30 p-3 mb-3" style="border-radius: 11px;">
                         <div class="d-flex justify-content-between align-items-start mb-2">
                             <div>
-                                <span class="badge ${kindBadgeClass} me-1">${kindName}</span>
+                                <span class="badge ${kindBadgeClass} me-1">${o.deal_category || kindName}</span>
                                 <span class="font-arabic small text-muted">(${kindNameAr})</span>
                             </div>
-                            <div>
+                            <div class="d-flex flex-wrap gap-1 align-items-center">
+                                ${closingBadge}
                                 ${statusBadge}
                                 ${blockerBadge}
                             </div>

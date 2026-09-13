@@ -21,6 +21,48 @@ DB_FILE = Path(__file__).resolve().parent / "crm.db"
 VALID_VENDORS = ["HPE", "Veeam", "Dell", "Nutanix", "VMware"]
 
 
+class DealCategory(str, Enum):
+    RFP_OWNERSHIP = "1- RFP Ownership & Prime Proposals"
+    RFP_DISTRIBUTED_SCOPE = "2- RFP Distributed Scope Items"
+    OPPORTUNITY_EFFORTS = "3- Opportunity Efforts & PO"
+
+
+def normalize_deal_category(v: Optional[Any]) -> str:
+    if not v:
+        return DealCategory.OPPORTUNITY_EFFORTS.value
+    v_str = str(v).strip().lower()
+    if "owner" in v_str or "prime" in v_str or "رئيسية" in v_str or "كراسة" in v_str or "1-" in v_str or v_str == "rfp_ownership":
+        return DealCategory.RFP_OWNERSHIP.value
+    if "scope" in v_str or "distributed" in v_str or "موزع" in v_str or "نطاق" in v_str or "2-" in v_str or v_str == "rfp_distributed_scope":
+        return DealCategory.RFP_DISTRIBUTED_SCOPE.value
+    if "opp" in v_str or "effort" in v_str or "po" in v_str or "فرصة" in v_str or "3-" in v_str or "general" in v_str or v_str == "general_action":
+        return DealCategory.OPPORTUNITY_EFFORTS.value
+    for cat in DealCategory:
+        clean_cat = cat.value.lower().replace("1- ", "").replace("2- ", "").replace("3- ", "")
+        if v_str == cat.value.lower() or v_str == clean_cat:
+            return cat.value
+    return DealCategory.OPPORTUNITY_EFFORTS.value
+
+
+def normalize_closing_date(v: Optional[Any]) -> Optional[str]:
+    if not v:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("none", "null", "-", "undefined"):
+        return None
+    # ISO YYYY-MM-DD
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m_iso:
+        y, m, d = m_iso.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    # DD/MM/YYYY or DD-MM-YYYY
+    m_dmy = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", s)
+    if m_dmy:
+        d, m, y = m_dmy.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    return s[:20]
+
+
 class DealStage(str, Enum):
     DISCOVERY = "Discovery"
     GATHERING_REQUIREMENTS = "Gathering Requirements"
@@ -172,6 +214,52 @@ def init_db():
                 sample_deals,
             )
 
+    # Ensure deal_category and closing_date exist in deals table
+    cursor.execute("PRAGMA table_info(deals);")
+    existing_cols = [r["name"] for r in cursor.fetchall()]
+    if "deal_category" not in existing_cols:
+        cursor.execute("ALTER TABLE deals ADD COLUMN deal_category TEXT DEFAULT '3- Opportunity Efforts & PO';")
+    if "closing_date" not in existing_cols:
+        cursor.execute("ALTER TABLE deals ADD COLUMN closing_date TEXT;")
+
+    # Backfill intelligent category and closing date for existing deals
+    cursor.execute("SELECT deal_id, deal_name, stage, vendor_notes, deal_category, closing_date FROM deals;")
+    for row in cursor.fetchall():
+        d_id = row["deal_id"]
+        d_name = (row["deal_name"] or "").lower()
+        d_stage = row["stage"]
+        d_notes = (row["vendor_notes"] or "").lower()
+        text_corpus = f"{d_name} {d_notes}"
+
+        cat = row["deal_category"]
+        if not cat or cat in ("Opportunity Efforts & PO", "3- Opportunity Efforts & PO"):
+            if any(kw in text_corpus for kw in ["مناقصة", "كراسة", "tender", "rfp", "prime", "رئيسية"]):
+                if any(skw in text_corpus for skw in ["scope", "نطاق", "تجديد", "موزع", "تسعير"]):
+                    cat = DealCategory.RFP_DISTRIBUTED_SCOPE.value
+                else:
+                    cat = DealCategory.RFP_OWNERSHIP.value
+            elif d_stage == "RFP / Tender":
+                if any(skw in text_corpus for skw in ["scope", "نطاق", "تجديد", "موزع", "تسعير"]):
+                    cat = DealCategory.RFP_DISTRIBUTED_SCOPE.value
+                else:
+                    cat = DealCategory.RFP_OWNERSHIP.value
+            else:
+                cat = DealCategory.OPPORTUNITY_EFFORTS.value
+        else:
+            cat = normalize_deal_category(cat)
+
+        c_date = row["closing_date"]
+        if not c_date:
+            date_match = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})", text_corpus)
+            if date_match:
+                c_date = normalize_closing_date(date_match.group(1))
+
+        cursor.execute("""
+            UPDATE deals
+            SET deal_category = ?, closing_date = ?
+            WHERE deal_id = ?;
+        """, (cat, c_date, d_id))
+
     conn.commit()
     conn.close()
 
@@ -254,6 +342,11 @@ class DealCreate(BaseModel):
 
     # Deal details
     deal_name: str = Field(..., description="Descriptive deal or project name")
+    deal_category: Optional[Union[DealCategory, str]] = Field(
+        default=DealCategory.OPPORTUNITY_EFFORTS,
+        description="RFP Ownership & Prime Proposals, RFP Distributed Scope Items, or Opportunity Efforts & PO"
+    )
+    closing_date: Optional[str] = Field(None, description="Target closing or submission date (YYYY-MM-DD)")
     primary_vendors: Optional[Union[List[str], str]] = Field(
         default=[], description="Vendor array or CSV string (e.g. HPE, Veeam, Dell, Nutanix, VMware)"
     )
@@ -295,7 +388,31 @@ class DealCreate(BaseModel):
             if not data.get("deal_name"):
                 data["deal_name"] = f"مشروع {data.get('company_name', 'العميل')}"
 
+            # 3. Alias deal_category
+            if not data.get("deal_category"):
+                for key in ["category", "deal_cat", "opportunity_category", "type"]:
+                    if data.get(key) and str(data.get(key)).strip():
+                        data["deal_category"] = data.get(key)
+                        break
+
+            # 4. Alias closing_date
+            if not data.get("closing_date"):
+                for key in ["close_date", "submission_date", "deadline", "due_date", "اغلاق", "تاريخ_الاغلاق"]:
+                    if data.get(key) and str(data.get(key)).strip():
+                        data["closing_date"] = data.get(key)
+                        break
+
         return data
+
+    @field_validator("deal_category", mode="before")
+    @classmethod
+    def validate_deal_category(cls, v):
+        return normalize_deal_category(v)
+
+    @field_validator("closing_date", mode="before")
+    @classmethod
+    def validate_closing_date(cls, v):
+        return normalize_closing_date(v)
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -387,11 +504,27 @@ class DealCreate(BaseModel):
 class DealUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     deal_name: Optional[str] = None
+    deal_category: Optional[Union[DealCategory, str]] = None
+    closing_date: Optional[str] = None
     primary_vendors: Optional[Union[List[str], str]] = None
     stage: Optional[Union[DealStage, str]] = None
     estimated_value: Optional[Union[float, str]] = None
     assigned_presales: Optional[Union[PresalesRep, str]] = None
     vendor_notes: Optional[str] = None
+
+    @field_validator("deal_category", mode="before")
+    @classmethod
+    def normalize_deal_category_update(cls, v):
+        if v is None or v == "":
+            return None
+        return normalize_deal_category(v)
+
+    @field_validator("closing_date", mode="before")
+    @classmethod
+    def normalize_closing_date_update(cls, v):
+        if v is None or v == "":
+            return None
+        return normalize_closing_date(v)
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -487,6 +620,8 @@ class DealOut(BaseModel):
     contact_email: Optional[str] = None
     contact_phone: Optional[str] = None
     deal_name: str
+    deal_category: str = DealCategory.OPPORTUNITY_EFFORTS.value
+    closing_date: Optional[str] = None
     primary_vendors: str
     stage: str
     estimated_value: float
@@ -716,8 +851,11 @@ def update_customer(customer_id: int, payload: CustomerUpdate):
 
 
 @app.get("/api/deals", response_model=List[DealOut], tags=["Deals"])
-def get_deals(vendor: Optional[str] = Query(None, description="Filter deals by primary vendor")):
-    """Returns all deals with joined customer information. Optionally filters by vendor."""
+def get_deals(
+    vendor: Optional[str] = Query(None, description="Filter deals by primary vendor"),
+    category: Optional[str] = Query(None, description="Filter deals by deal category")
+):
+    """Returns all deals with joined customer information. Optionally filters by vendor or category."""
     conn = get_db_connection()
     cursor = conn.cursor()
     query = """
@@ -734,15 +872,24 @@ def get_deals(vendor: Optional[str] = Query(None, description="Filter deals by p
             d.estimated_value,
             d.assigned_presales,
             d.vendor_notes,
+            d.deal_category,
+            d.closing_date,
             d.created_at,
             d.updated_at
         FROM deals d
         JOIN customers c ON d.customer_id = c.customer_id
     """
+    conditions = []
     params = []
     if vendor:
-        query += " WHERE d.primary_vendors LIKE ? "
+        conditions.append("d.primary_vendors LIKE ?")
         params.append(f"%{vendor}%")
+    if category:
+        norm_cat = normalize_deal_category(category)
+        conditions.append("d.deal_category = ?")
+        params.append(norm_cat)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY d.updated_at DESC, d.deal_id DESC;"
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -757,6 +904,8 @@ def get_deals(vendor: Optional[str] = Query(None, description="Filter deals by p
             contact_email=row["contact_email"],
             contact_phone=row["contact_phone"],
             deal_name=row["deal_name"],
+            deal_category=row["deal_category"] or DealCategory.OPPORTUNITY_EFFORTS.value,
+            closing_date=row["closing_date"],
             primary_vendors=row["primary_vendors"] or "",
             stage=row["stage"],
             estimated_value=float(row["estimated_value"] or 0.0),
@@ -821,13 +970,15 @@ def create_deal(payload: DealCreate):
     # 2. Insert Deal
     vendors_str = normalize_vendors(payload.primary_vendors)
     now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    deal_cat = payload.deal_category.value if isinstance(payload.deal_category, DealCategory) else normalize_deal_category(payload.deal_category)
+    close_dt = normalize_closing_date(payload.closing_date)
 
     cursor.execute(
         """
         INSERT INTO deals (
-            customer_id, deal_name, primary_vendors, stage, estimated_value, assigned_presales, vendor_notes, created_at, updated_at
+            customer_id, deal_name, primary_vendors, stage, estimated_value, assigned_presales, vendor_notes, deal_category, closing_date, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             customer_id,
@@ -837,6 +988,8 @@ def create_deal(payload: DealCreate):
             payload.estimated_value,
             payload.assigned_presales.value if payload.assigned_presales else None,
             payload.vendor_notes.strip() if payload.vendor_notes else "",
+            deal_cat,
+            close_dt,
             now_iso,
             now_iso,
         ),
@@ -844,13 +997,29 @@ def create_deal(payload: DealCreate):
     deal_id = cursor.lastrowid
     conn.commit()
 
+    # Sync to tasks.db if matching tasks exist
+    try:
+        tasks_db_path = Path(__file__).resolve().parent / "tasks.db"
+        if tasks_db_path.exists():
+            t_conn = sqlite3.connect(tasks_db_path)
+            t_cur = t_conn.cursor()
+            t_cur.execute("""
+                UPDATE tasks
+                SET deal_category = ?, closing_date = COALESCE(?, closing_date), deal_name = COALESCE(deal_name, ?)
+                WHERE related_deal_id = ?;
+            """, (deal_cat, close_dt, payload.deal_name.strip(), deal_id))
+            t_conn.commit()
+            t_conn.close()
+    except Exception as e:
+        print(f"Notice: tasks sync on create skipped: {e}")
+
     # Fetch newly created deal with customer join
     cursor.execute(
         """
         SELECT 
             d.deal_id, d.customer_id, c.company_name, c.contact_name, c.contact_email, c.contact_phone,
             d.deal_name, d.primary_vendors, d.stage, d.estimated_value, d.assigned_presales,
-            d.vendor_notes, d.created_at, d.updated_at
+            d.vendor_notes, d.deal_category, d.closing_date, d.created_at, d.updated_at
         FROM deals d
         JOIN customers c ON d.customer_id = c.customer_id
         WHERE d.deal_id = ?;
@@ -868,6 +1037,8 @@ def create_deal(payload: DealCreate):
         contact_email=row["contact_email"],
         contact_phone=row["contact_phone"],
         deal_name=row["deal_name"],
+        deal_category=row["deal_category"] or DealCategory.OPPORTUNITY_EFFORTS.value,
+        closing_date=row["closing_date"],
         primary_vendors=row["primary_vendors"] or "",
         stage=row["stage"],
         estimated_value=float(row["estimated_value"]),
@@ -881,23 +1052,41 @@ def create_deal(payload: DealCreate):
 @app.put("/api/deals/{deal_id}", response_model=DealOut, tags=["Deals"])
 def update_deal(deal_id: int, payload: DealUpdate):
     """
-    Updates deal stage, value, vendor notes, assigned presales, vendors, or deal name.
-    Updates the updated_at timestamp.
+    Updates deal stage, value, vendor notes, assigned presales, vendors, deal_name, deal_category, or closing_date.
+    Updates the updated_at timestamp and syncs changes to tasks.db.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT deal_id FROM deals WHERE deal_id = ?;", (deal_id,))
-    if not cursor.fetchone():
+    cursor.execute("SELECT deal_id, deal_name, deal_category, closing_date FROM deals WHERE deal_id = ?;", (deal_id,))
+    curr_deal = cursor.fetchone()
+    if not curr_deal:
         conn.close()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Deal with ID {deal_id} not found.")
 
     update_clauses = []
     params = []
 
+    final_deal_name = curr_deal["deal_name"]
+    final_category = curr_deal["deal_category"] or DealCategory.OPPORTUNITY_EFFORTS.value
+    final_closing_date = curr_deal["closing_date"]
+
     if payload.deal_name is not None:
         update_clauses.append("deal_name = ?")
         params.append(payload.deal_name.strip())
+        final_deal_name = payload.deal_name.strip()
+
+    if payload.deal_category is not None:
+        cat_str = payload.deal_category.value if isinstance(payload.deal_category, DealCategory) else normalize_deal_category(payload.deal_category)
+        update_clauses.append("deal_category = ?")
+        params.append(cat_str)
+        final_category = cat_str
+
+    if payload.closing_date is not None:
+        c_date = normalize_closing_date(payload.closing_date)
+        update_clauses.append("closing_date = ?")
+        params.append(c_date)
+        final_closing_date = c_date
 
     if payload.primary_vendors is not None:
         update_clauses.append("primary_vendors = ?")
@@ -930,13 +1119,29 @@ def update_deal(deal_id: int, payload: DealUpdate):
     )
     conn.commit()
 
+    # Sync updated deal category and closing date to tasks.db
+    try:
+        tasks_db_path = Path(__file__).resolve().parent / "tasks.db"
+        if tasks_db_path.exists():
+            t_conn = sqlite3.connect(tasks_db_path)
+            t_cur = t_conn.cursor()
+            t_cur.execute("""
+                UPDATE tasks
+                SET deal_category = ?, closing_date = ?, deal_name = ?
+                WHERE related_deal_id = ?;
+            """, (final_category, final_closing_date, final_deal_name, deal_id))
+            t_conn.commit()
+            t_conn.close()
+    except Exception as e:
+        print(f"Notice: sync to tasks.db skipped: {e}")
+
     # Retrieve updated deal
     cursor.execute(
         """
         SELECT 
             d.deal_id, d.customer_id, c.company_name, c.contact_name, c.contact_email, c.contact_phone,
             d.deal_name, d.primary_vendors, d.stage, d.estimated_value, d.assigned_presales,
-            d.vendor_notes, d.created_at, d.updated_at
+            d.vendor_notes, d.deal_category, d.closing_date, d.created_at, d.updated_at
         FROM deals d
         JOIN customers c ON d.customer_id = c.customer_id
         WHERE d.deal_id = ?;
@@ -954,6 +1159,8 @@ def update_deal(deal_id: int, payload: DealUpdate):
         contact_email=row["contact_email"],
         contact_phone=row["contact_phone"],
         deal_name=row["deal_name"],
+        deal_category=row["deal_category"] or DealCategory.OPPORTUNITY_EFFORTS.value,
+        closing_date=row["closing_date"],
         primary_vendors=row["primary_vendors"] or "",
         stage=row["stage"],
         estimated_value=float(row["estimated_value"]),
@@ -962,6 +1169,16 @@ def update_deal(deal_id: int, payload: DealUpdate):
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
+
+
+@app.patch("/api/deals/{deal_id}/category", response_model=DealOut, tags=["Deals"])
+def change_deal_category(deal_id: int, payload: Dict[str, Any]):
+    """Changes deal category and syncs to tasks.db."""
+    raw_cat = payload.get("deal_category") or payload.get("category")
+    if not raw_cat:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category is required")
+    norm_cat = normalize_deal_category(raw_cat)
+    return update_deal(deal_id, DealUpdate(deal_category=norm_cat))
 
 
 @app.delete("/api/deals/{deal_id}", tags=["Deals"])
@@ -1662,7 +1879,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                     <!-- Search & Dropdown Select Controls Row -->
                     <div class="row g-2 align-items-center">
-                        <div class="col-12 col-lg-4">
+                        <div class="col-12 col-lg-3">
                             <div class="input-group input-group-sm">
                                 <span class="input-group-text bg-light text-muted"><i class="bi bi-search"></i></span>
                                 <input type="text" id="searchInput" class="form-control" placeholder="Search deals, company, notes, vendors..." oninput="applyFilters()">
@@ -1672,6 +1889,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             </div>
                         </div>
                         <div class="col-6 col-sm-4 col-lg-3">
+                            <div class="input-group input-group-sm">
+                                <span class="input-group-text bg-light small text-muted"><i class="bi bi-bookmark-star me-1"></i>Category</span>
+                                <select id="categoryFilter" class="form-select" onchange="onDropdownFilterChange()">
+                                    <option value="">All Categories</option>
+                                    <option value="1- RFP Ownership & Prime Proposals">1- RFP Ownership & Prime Proposals</option>
+                                    <option value="2- RFP Distributed Scope Items">2- RFP Distributed Scope Items</option>
+                                    <option value="3- Opportunity Efforts & PO">3- Opportunity Efforts & PO</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="col-6 col-sm-4 col-lg-2">
                             <div class="input-group input-group-sm">
                                 <span class="input-group-text bg-light small text-muted"><i class="bi bi-kanban me-1"></i>Stage</span>
                                 <select id="stageFilter" class="form-select" onchange="onDropdownFilterChange()">
@@ -1686,7 +1914,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 </select>
                             </div>
                         </div>
-                        <div class="col-6 col-sm-4 col-lg-3">
+                        <div class="col-6 col-sm-4 col-lg-2">
                             <div class="input-group input-group-sm">
                                 <span class="input-group-text bg-light small text-muted"><i class="bi bi-person-badge me-1"></i>Presales</span>
                                 <select id="presalesFilter" class="form-select" onchange="onDropdownFilterChange()">
@@ -1696,7 +1924,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 </select>
                             </div>
                         </div>
-                        <div class="col-12 col-sm-4 col-lg-2">
+                        <div class="col-6 col-sm-4 col-lg-2">
                             <div class="input-group input-group-sm">
                                 <span class="input-group-text bg-light small text-muted"><i class="bi bi-cpu me-1"></i>Vendor</span>
                                 <select id="vendorFilter" class="form-select" onchange="onDropdownFilterChange()">
@@ -1713,16 +1941,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <table class="table table-hover align-middle mb-0" id="dealsTable">
                             <thead class="table-light">
                                 <tr>
-                                    <th style="width: 70px;">Deal ID</th>
-                                    <th>Deal / Opportunity</th>
-                                    <th>Customer Account</th>
-                                    <th>Vendors</th>
-                                    <th>Stage</th>
-                                    <th>Est. Value</th>
-                                    <th>Presales Lead</th>
-                                    <th>Notes</th>
-                                    <th>Updated</th>
-                                    <th class="text-end">Actions</th>
+                                    <th style="width: 60px;">ID</th>
+                                    <th style="width: 22%;">Deal / Opportunity</th>
+                                    <th style="width: 14%;"><i class="bi bi-bookmark-star text-primary me-1"></i>Category</th>
+                                    <th style="width: 11%;"><i class="bi bi-calendar-event text-danger me-1"></i>Closing Date</th>
+                                    <th style="width: 14%;">Customer Account</th>
+                                    <th style="width: 8%;">Vendors</th>
+                                    <th style="width: 8%;">Stage</th>
+                                    <th style="width: 8%;">Est. Value</th>
+                                    <th style="width: 7%;">Presales</th>
+                                    <th class="text-end" style="width: 8%;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="dealsTableBody">
@@ -1853,6 +2081,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 </div>
                             </div>
                             <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-bookmark-star text-primary me-1"></i>Deal Category *</label>
+                                <select id="newDealCategory" class="form-select" required>
+                                    <option value="1- RFP Ownership & Prime Proposals">1- RFP Ownership & Prime Proposals</option>
+                                    <option value="2- RFP Distributed Scope Items">2- RFP Distributed Scope Items</option>
+                                    <option value="3- Opportunity Efforts & PO" selected>3- Opportunity Efforts & PO (Default)</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-calendar-event text-danger me-1"></i>Closing / Submission Date</label>
+                                <input type="date" id="newClosingDate" class="form-control">
+                                <div class="form-text small text-danger fw-semibold">Critical for RFP Ownership & Distributed Scope tracking</div>
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Stage *</label>
                                 <select id="newStage" class="form-select" required>
                                     <option value="Discovery">Discovery</option>
@@ -1933,6 +2174,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Deal Name *</label>
                                 <input type="text" id="editDealName" class="form-control" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-bookmark-star text-primary me-1"></i>Deal Category *</label>
+                                <select id="editDealCategory" class="form-select" required>
+                                    <option value="1- RFP Ownership & Prime Proposals">1- RFP Ownership & Prime Proposals</option>
+                                    <option value="2- RFP Distributed Scope Items">2- RFP Distributed Scope Items</option>
+                                    <option value="3- Opportunity Efforts & PO">3- Opportunity Efforts & PO</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-calendar-event text-danger me-1"></i>Closing / Submission Date</label>
+                                <input type="date" id="editClosingDate" class="form-control">
+                                <div class="form-text small text-danger fw-semibold">Critical for RFP deadlines</div>
                             </div>
                             <div class="col-md-4">
                                 <label class="form-label small fw-semibold">Stage *</label>
@@ -2687,12 +2941,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const stage = document.getElementById('stageFilter')?.value || '';
             const presales = document.getElementById('presalesFilter')?.value || '';
             const vendor = document.getElementById('vendorFilter')?.value || '';
+            const category = document.getElementById('categoryFilter')?.value || '';
 
             syncVendorPillButtons(vendor);
 
             document.querySelectorAll('#quickFilterGroup .filter-btn, .ms-md-2 .filter-btn').forEach(b => b.classList.remove('active'));
 
-            if (!stage && !presales) {
+            if (!stage && !presales && !category) {
                 currentQuickFilter = 'ALL';
                 const b = document.getElementById('qf-ALL');
                 if (b) b.classList.add('active');
@@ -2721,6 +2976,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             document.getElementById('searchInput').value = '';
             document.getElementById('stageFilter').value = '';
             document.getElementById('presalesFilter').value = '';
+            const catFilter = document.getElementById('categoryFilter');
+            if (catFilter) catFilter.value = '';
             const vendorFilter = document.getElementById('vendorFilter');
             if (vendorFilter) vendorFilter.value = '';
             syncVendorPillButtons('');
@@ -2742,8 +2999,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const stage = document.getElementById('stageFilter')?.value || '';
             const presales = document.getElementById('presalesFilter')?.value || '';
             const vendor = (document.getElementById('vendorFilter')?.value || '').toLowerCase().trim();
+            const category = document.getElementById('categoryFilter')?.value || '';
 
-            const isFiltered = search || stage || presales || vendor || (currentQuickFilter !== 'ALL');
+            const isFiltered = search || stage || presales || vendor || category || (currentQuickFilter !== 'ALL');
             const resetBtn = document.getElementById('resetDealsFilterBtn');
             if (resetBtn) {
                 resetBtn.style.display = isFiltered ? 'inline-block' : 'none';
@@ -2774,11 +3032,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     }
                 }
 
+                // Dropdown category filter
+                if (category) {
+                    if ((d.deal_category || '3- Opportunity Efforts & PO') !== category) {
+                        return false;
+                    }
+                }
+
                 // Keyword search
                 if (search) {
                     const match = 
                         (d.deal_name && d.deal_name.toLowerCase().includes(search)) || 
                         (d.company_name && d.company_name.toLowerCase().includes(search)) ||
+                        (d.deal_category && d.deal_category.toLowerCase().includes(search)) ||
+                        (d.closing_date && d.closing_date.toLowerCase().includes(search)) ||
                         (d.primary_vendors && d.primary_vendors.toLowerCase().includes(search)) ||
                         (d.vendor_notes && d.vendor_notes.toLowerCase().includes(search)) ||
                         (d.contact_name && d.contact_name.toLowerCase().includes(search));
@@ -2788,19 +3055,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 return true;
             });
 
-            // Update badge summary
-            const summaryBadge = document.getElementById('dealsFilterSummaryBadge');
-            if (summaryBadge) {
-                if (filtered.length === allDeals.length) {
-                    summaryBadge.textContent = `Showing all ${allDeals.length} deals`;
-                    summaryBadge.className = 'badge bg-secondary-subtle text-dark border ms-2';
-                } else {
-                    summaryBadge.textContent = `Showing ${filtered.length} of ${allDeals.length} deals`;
-                    summaryBadge.className = 'badge bg-primary text-white border ms-2';
-                }
-            }
-
             renderDealsTable(filtered);
+            updateDealsFilterSummaryBadge(filtered.length, allDeals.length);
+        }
+
+        function updateDealsFilterSummaryBadge(shown, total) {
+            const badge = document.getElementById('dealsFilterSummaryBadge');
+            if (!badge) return;
+            if (shown === total) {
+                badge.textContent = `Showing all ${total} deals`;
+                badge.className = 'badge bg-primary-subtle text-primary border ms-2';
+            } else {
+                badge.textContent = `Filtered: ${shown} of ${total} deals`;
+                badge.className = 'badge bg-warning-subtle text-dark border ms-2';
+            }
         }
 
         function switchToCustomersTab() {
@@ -2892,6 +3160,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip" onclick="setVendorFilter('${v.trim()}')" title="Filter deals by ${v.trim()}"><i class="bi bi-tag-fill me-1 small opacity-75"></i>${v.trim()}</span>`).join(' ')
                     : '<span class="text-muted small">-</span>';
 
+                // Category badge styling
+                let catBadge = '';
+                const cat = d.deal_category || '3- Opportunity Efforts & PO';
+                if (cat.includes('Ownership') || cat.includes('Prime')) {
+                    catBadge = `<span class="badge py-1 px-2 border" style="background-color: #eff6ff; color: #1d4ed8; border-color: #bfdbfe !important;"><i class="bi bi-award-fill me-1"></i>1- RFP Ownership</span>`;
+                } else if (cat.includes('Distributed') || cat.includes('Scope')) {
+                    catBadge = `<span class="badge py-1 px-2 border" style="background-color: #faf5ff; color: #7e22ce; border-color: #e9d5ff !important;"><i class="bi bi-puzzle-fill me-1"></i>2- Distributed Scope</span>`;
+                } else {
+                    catBadge = `<span class="badge py-1 px-2 border" style="background-color: #f0fdf4; color: #15803d; border-color: #bbf7d0 !important;"><i class="bi bi-bullseye me-1"></i>3- Opp Efforts & PO</span>`;
+                }
+
+                // Closing date badge
+                let closingDisplay = '<span class="text-muted small">-</span>';
+                if (d.closing_date) {
+                    const isRfp = cat.includes('RFP') || d.stage === 'RFP / Tender';
+                    if (isRfp) {
+                        closingDisplay = `<span class="badge bg-danger-subtle text-danger border border-danger-subtle py-1 px-2 fw-semibold" title="Submission Deadline"><i class="bi bi-alarm-fill me-1"></i>${d.closing_date}</span>`;
+                    } else {
+                        closingDisplay = `<span class="badge bg-light text-dark border py-1 px-2" title="Target Close Date"><i class="bi bi-calendar-event me-1"></i>${d.closing_date}</span>`;
+                    }
+                }
+
                 return `
                     <tr>
                         <td class="text-center">
@@ -2899,7 +3189,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </td>
                         <td>
                             <div class="fw-bold text-dark">${d.deal_name}</div>
+                            ${d.vendor_notes ? `<div class="small text-muted text-truncate" style="max-width: 260px;" title="${d.vendor_notes}">${d.vendor_notes}</div>` : ''}
                         </td>
+                        <td>${catBadge}</td>
+                        <td>${closingDisplay}</td>
                         <td>
                             <div class="d-flex align-items-center gap-1">
                                 <span class="badge bg-secondary-subtle text-dark border">#${d.customer_id}</span>
@@ -2915,10 +3208,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 ${d.assigned_presales || 'Unassigned'}
                             </span>
                         </td>
-                        <td style="max-width: 200px;" class="text-truncate small text-secondary" title="${d.vendor_notes || ''}">
-                            ${d.vendor_notes || '<span class="text-muted fst-italic">None</span>'}
-                        </td>
-                        <td class="small text-muted">${d.updated_at.split(' ')[0]}</td>
                         <td class="text-end">
                             <div class="btn-group btn-group-sm">
                                 <button class="btn btn-outline-secondary" onclick="openEditModal(${d.deal_id})" title="Edit Deal">
@@ -2926,17 +3215,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 </button>
                                 <button class="btn btn-outline-secondary dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown"></button>
                                 <ul class="dropdown-menu dropdown-menu-end shadow-sm">
+                                    <li><h6 class="dropdown-header">Change Category</h6></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetCategory(${d.deal_id}, '1- RFP Ownership & Prime Proposals')"><i class="bi bi-award-fill text-primary me-1"></i>1- RFP Ownership & Prime</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetCategory(${d.deal_id}, '2- RFP Distributed Scope Items')"><i class="bi bi-puzzle-fill me-1" style="color: #7e22ce;"></i>2- RFP Distributed Scope</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetCategory(${d.deal_id}, '3- Opportunity Efforts & PO')"><i class="bi bi-bullseye text-success me-1"></i>3- Opportunity Efforts & PO</a></li>
+                                    <li><hr class="dropdown-divider"></li>
                                     <li><h6 class="dropdown-header">Fast Advance Stage</h6></li>
-                                    <li><a class="dropdown-item" href="#" onclick="quickSetStage(${d.deal_id}, 'Discovery')">Discovery</a></li>
-                                    <li><a class="dropdown-item" href="#" onclick="quickSetStage(${d.deal_id}, 'Gathering Requirements')">Gathering Req.</a></li>
-                                    <li><a class="dropdown-item" href="#" onclick="quickSetStage(${d.deal_id}, 'RFP / Tender')">RFP / Tender</a></li>
-                                    <li><a class="dropdown-item" href="#" onclick="quickSetStage(${d.deal_id}, 'PoC')">PoC</a></li>
-                                    <li><a class="dropdown-item" href="#" onclick="quickSetStage(${d.deal_id}, 'Proposal')">Proposal</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'Discovery')">Discovery</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'Gathering Requirements')">Gathering Req.</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'RFP / Tender')">RFP / Tender</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'PoC')">PoC</a></li>
+                                    <li><a class="dropdown-item" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'Proposal')">Proposal</a></li>
                                     <li><hr class="dropdown-divider"></li>
-                                    <li><a class="dropdown-item text-success fw-semibold" href="#" onclick="quickSetStage(${d.deal_id}, 'Closed-Won')"><i class="bi bi-check2-circle me-1"></i>Closed-Won</a></li>
-                                    <li><a class="dropdown-item text-danger" href="#" onclick="quickSetStage(${d.deal_id}, 'Closed-Lost')"><i class="bi bi-x-circle me-1"></i>Closed-Lost</a></li>
+                                    <li><a class="dropdown-item text-success fw-semibold" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'Closed-Won')"><i class="bi bi-check2-circle me-1"></i>Closed-Won</a></li>
+                                    <li><a class="dropdown-item text-danger" href="javascript:void(0)" onclick="quickSetStage(${d.deal_id}, 'Closed-Lost')"><i class="bi bi-x-circle me-1"></i>Closed-Lost</a></li>
                                     <li><hr class="dropdown-divider"></li>
-                                    <li><a class="dropdown-item text-danger fw-semibold" href="#" onclick="deleteDealConfirm(${d.deal_id})"><i class="bi bi-trash3 me-1"></i>Delete Deal</a></li>
+                                    <li><a class="dropdown-item text-danger fw-semibold" href="javascript:void(0)" onclick="deleteDealConfirm(${d.deal_id})"><i class="bi bi-trash3 me-1"></i>Delete Deal</a></li>
                                 </ul>
                                 <button class="btn btn-outline-danger" onclick="deleteDealConfirm(${d.deal_id})" title="Delete Deal">
                                     <i class="bi bi-trash3"></i>
@@ -2946,6 +3240,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     </tr>
                 `;
             }).join('');
+        }
+
+        async function quickSetCategory(dealId, newCategory) {
+            try {
+                const res = await fetch(`/api/deals/${dealId}/category`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ deal_category: newCategory })
+                });
+                if (res.ok) {
+                    await loadAllData();
+                } else {
+                    const err = await res.json();
+                    alert('Failed to update deal category: ' + JSON.stringify(err));
+                }
+            } catch (err) {
+                console.error("Error setting category:", err);
+            }
         }
 
         function openNewDealModal() {
@@ -2963,6 +3275,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 contact_email: document.getElementById('newContactEmail').value || null,
                 contact_phone: document.getElementById('newContactPhone').value || null,
                 deal_name: document.getElementById('newDealName').value,
+                deal_category: document.getElementById('newDealCategory').value,
+                closing_date: document.getElementById('newClosingDate').value || null,
                 estimated_value: parseFloat(document.getElementById('newEstimatedValue').value) || 0.0,
                 stage: document.getElementById('newStage').value,
                 assigned_presales: document.getElementById('newAssignedPresales').value,
@@ -2996,6 +3310,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             document.getElementById('editDealId').value = deal.deal_id;
             document.getElementById('editCompanyName').value = deal.company_name;
             document.getElementById('editDealName').value = deal.deal_name;
+            document.getElementById('editDealCategory').value = deal.deal_category || 'Opportunity Efforts & PO';
+            document.getElementById('editClosingDate').value = deal.closing_date || '';
             document.getElementById('editEstimatedValue').value = deal.estimated_value;
             document.getElementById('editStage').value = deal.stage;
             document.getElementById('editAssignedPresales').value = deal.assigned_presales || 'Presales 1';
@@ -3016,6 +3332,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             const payload = {
                 deal_name: document.getElementById('editDealName').value,
+                deal_category: document.getElementById('editDealCategory').value,
+                closing_date: document.getElementById('editClosingDate').value || null,
                 stage: document.getElementById('editStage').value,
                 estimated_value: parseFloat(document.getElementById('editEstimatedValue').value) || 0.0,
                 assigned_presales: document.getElementById('editAssignedPresales').value,

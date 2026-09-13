@@ -88,7 +88,7 @@ def init_db():
     );
     """)
 
-    # Schema migration check: ensure started_at, completed_at, deal_name, customer_name, customer_id exist
+    # Schema migration check: ensure started_at, completed_at, deal_name, customer_name, customer_id, deal_category, closing_date exist
     cursor.execute("PRAGMA table_info(tasks);")
     existing_cols = [r["name"] for r in cursor.fetchall()]
     if "started_at" not in existing_cols:
@@ -101,6 +101,10 @@ def init_db():
         cursor.execute("ALTER TABLE tasks ADD COLUMN customer_name TEXT;")
     if "customer_id" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN customer_id INTEGER;")
+    if "deal_category" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN deal_category TEXT;")
+    if "closing_date" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN closing_date TEXT;")
 
     # Activity event log table for full lifecycle tracking
     cursor.execute("""
@@ -252,7 +256,7 @@ def init_db():
             crm_conn.row_factory = sqlite3.Row
             crm_cur = crm_conn.cursor()
             crm_cur.execute("""
-                SELECT d.deal_id, d.deal_name, d.customer_id, c.company_name as customer_name
+                SELECT d.deal_id, d.deal_name, d.customer_id, d.deal_category, d.closing_date, c.company_name as customer_name
                 FROM deals d
                 LEFT JOIN customers c ON d.customer_id = c.customer_id
             """)
@@ -261,14 +265,18 @@ def init_db():
                 d_name = r["deal_name"]
                 c_id = r["customer_id"]
                 c_name = r["customer_name"] or ""
+                d_cat = r["deal_category"] or ""
+                d_close = r["closing_date"] or ""
                 # Backfill linked tasks
                 cursor.execute("""
                     UPDATE tasks 
                     SET deal_name = COALESCE(deal_name, ?),
                         customer_name = COALESCE(customer_name, ?),
-                        customer_id = COALESCE(customer_id, ?)
+                        customer_id = COALESCE(customer_id, ?),
+                        deal_category = COALESCE(deal_category, ?),
+                        closing_date = COALESCE(closing_date, ?)
                     WHERE related_deal_id = ?;
-                """, (d_name, c_name, c_id, d_id))
+                """, (d_name, c_name, c_id, d_cat, d_close, d_id))
                 # Auto-link unlinked tasks by deal name or customer name keywords
                 if d_name and len(d_name) > 4:
                     cursor.execute("""
@@ -276,18 +284,22 @@ def init_db():
                         SET related_deal_id = COALESCE(related_deal_id, ?),
                             deal_name = COALESCE(deal_name, ?),
                             customer_name = COALESCE(customer_name, ?),
-                            customer_id = COALESCE(customer_id, ?)
+                            customer_id = COALESCE(customer_id, ?),
+                            deal_category = COALESCE(deal_category, ?),
+                            closing_date = COALESCE(closing_date, ?)
                         WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, c_id, f"%{d_name.lower()}%"))
+                    """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{d_name.lower()}%"))
                 if c_name and len(c_name) > 3:
                     cursor.execute("""
                         UPDATE tasks 
                         SET related_deal_id = COALESCE(related_deal_id, ?),
                             deal_name = COALESCE(deal_name, ?),
                             customer_name = COALESCE(customer_name, ?),
-                            customer_id = COALESCE(customer_id, ?)
+                            customer_id = COALESCE(customer_id, ?),
+                            deal_category = COALESCE(deal_category, ?),
+                            closing_date = COALESCE(closing_date, ?)
                         WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, c_id, f"%{c_name.lower()}%"))
+                    """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{c_name.lower()}%"))
             crm_conn.close()
         except Exception as e:
             print(f"Notice: CRM backfill skipped: {e}")
@@ -303,7 +315,7 @@ def init_db():
 
 
 def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
-    """Fetches deal_name, customer_id, customer_name, and primary_vendors for each deal_id from crm.db if available."""
+    """Fetches deal_name, customer_id, customer_name, primary_vendors, deal_category, and closing_date for each deal_id from crm.db if available."""
     deal_map = {}
     if not CRM_DB_FILE.exists():
         return deal_map
@@ -312,7 +324,7 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, c.company_name as customer_name
+            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, c.company_name as customer_name
             FROM deals d
             LEFT JOIN customers c ON d.customer_id = c.customer_id
             ORDER BY d.deal_id ASC
@@ -324,6 +336,8 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
                 "customer_id": r["customer_id"],
                 "customer_name": r["customer_name"] or "",
                 "primary_vendors": r["primary_vendors"] or "",
+                "deal_category": r["deal_category"] or "",
+                "closing_date": r["closing_date"] or "",
             }
         conn.close()
     except Exception:
@@ -385,6 +399,8 @@ class TaskBase(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_title: str = Field(default="Presales Action Item", description="Actionable title for the task")
     category: Union[TaskCategory, str] = Field(default=TaskCategory.GENERAL_ACTION, description="RFP_OWNERSHIP, RFP_DISTRIBUTED_SCOPE, or GENERAL_ACTION")
+    deal_category: Optional[str] = Field(None, description="Category of the associated CRM deal")
+    closing_date: Optional[str] = Field(None, description="Closing deadline of the RFP / tender")
     related_deal_id: Optional[Union[int, str]] = Field(None, description="Optional foreign deal ID reference")
     customer_id: Optional[Union[int, str]] = Field(None, description="Optional foreign customer ID reference")
     deal_name: Optional[str] = Field(None, description="Optional associated deal name")
@@ -409,9 +425,9 @@ class TaskBase(BaseModel):
         if not v:
             return TaskCategory.GENERAL_ACTION
         v_str = str(v).strip().lower()
-        if "owner" in v_str:
+        if "owner" in v_str or "prime" in v_str or "1-" in v_str:
             return TaskCategory.RFP_OWNERSHIP
-        if "distribut" in v_str or "scope" in v_str or "rfp" in v_str:
+        if "distribut" in v_str or "scope" in v_str or "2-" in v_str:
             return TaskCategory.RFP_DISTRIBUTED_SCOPE
         return TaskCategory.GENERAL_ACTION
 
@@ -512,6 +528,8 @@ class TaskUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_title: Optional[str] = None
     category: Optional[Union[TaskCategory, str]] = None
+    deal_category: Optional[str] = None
+    closing_date: Optional[str] = None
     related_deal_id: Optional[Union[int, str]] = None
     customer_id: Optional[Union[int, str]] = None
     deal_name: Optional[str] = None
@@ -545,9 +563,9 @@ class TaskUpdate(BaseModel):
         if v is None:
             return None
         v_str = str(v).strip().lower()
-        if "owner" in v_str:
+        if "owner" in v_str or "prime" in v_str or "1-" in v_str:
             return TaskCategory.RFP_OWNERSHIP
-        if "distribut" in v_str or "scope" in v_str or "rfp" in v_str:
+        if "distribut" in v_str or "scope" in v_str or "2-" in v_str:
             return TaskCategory.RFP_DISTRIBUTED_SCOPE
         return TaskCategory.GENERAL_ACTION
 
@@ -674,14 +692,11 @@ def compute_duration(start_str: Optional[str], end_str: Optional[str]) -> Option
         return None
 
 
-def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] = None) -> TaskOut:
+def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, Any]]] = None) -> TaskOut:
     created_at = str(row["created_at"])
     started_at = str(row["started_at"]) if row["started_at"] else None
     completed_at = str(row["completed_at"]) if row["completed_at"] else None
 
-    # Performance Metrics:
-    # Lead Time: Completed Date - Created Date (total time from creation to completion)
-    # Cycle Time: Completed Date - Started Date (actual active working time)
     lead_time = compute_duration(created_at, completed_at)
     cycle_time = compute_duration(started_at, completed_at)
 
@@ -689,15 +704,19 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] 
     d_name = row["deal_name"] if "deal_name" in cols and row["deal_name"] else None
     c_name = row["customer_name"] if "customer_name" in cols and row["customer_name"] else None
     c_id = row["customer_id"] if "customer_id" in cols and row["customer_id"] else None
+    d_cat = row["deal_category"] if "deal_category" in cols and row["deal_category"] else None
+    d_close = row["closing_date"] if "closing_date" in cols and row["closing_date"] else None
 
     rel_deal = row["related_deal_id"]
-    if (not d_name or not c_name or not c_id) and rel_deal:
+    if rel_deal:
         if deal_map is None:
             deal_map = get_deal_customer_map()
         if rel_deal in deal_map:
             d_name = d_name or deal_map[rel_deal].get("deal_name")
             c_name = c_name or deal_map[rel_deal].get("customer_name")
             c_id = c_id or deal_map[rel_deal].get("customer_id")
+            d_cat = d_cat or deal_map[rel_deal].get("deal_category")
+            d_close = d_close or deal_map[rel_deal].get("closing_date")
 
     if not c_name and c_id:
         for c in get_customer_list():
@@ -714,10 +733,23 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, str]]] 
         elif "islam" in title_lower:
             c_name = "Internal Presales Team"
 
+    # Harmonize task category with deal category if available
+    task_cat = row["category"]
+    if d_cat:
+        dc_low = str(d_cat).lower()
+        if "owner" in dc_low or "prime" in dc_low or "1-" in dc_low:
+            task_cat = "RFP_OWNERSHIP"
+        elif "distribut" in dc_low or "scope" in dc_low or "2-" in dc_low:
+            task_cat = "RFP_DISTRIBUTED_SCOPE"
+        elif "effort" in dc_low or "po" in dc_low or "3-" in dc_low:
+            task_cat = "GENERAL_ACTION"
+
     return TaskOut(
         task_id=row["task_id"],
         task_title=row["task_title"],
-        category=row["category"],
+        category=task_cat,
+        deal_category=d_cat,
+        closing_date=d_close,
         related_deal_id=rel_deal,
         customer_id=c_id,
         deal_name=d_name,
@@ -922,17 +954,21 @@ def create_task(payload: TaskCreate):
     started_at = now_iso if status_val != TaskStatus.NOT_STARTED.value else None
     completed_at = now_iso if status_val == TaskStatus.COMPLETED.value else None
 
-    # Resolve deal_name, customer_name, and customer_id
+    # Resolve deal_name, customer_name, customer_id, deal_category, closing_date
     deal_map = get_deal_customer_map()
     deal_name = payload.deal_name
     customer_name = payload.customer_name
     customer_id = payload.customer_id
-    if payload.related_deal_id and (not deal_name or not customer_name or not customer_id):
+    deal_cat = payload.deal_category
+    closing_dt = payload.closing_date
+    if payload.related_deal_id:
         d_info = deal_map.get(payload.related_deal_id)
         if d_info:
             deal_name = deal_name or d_info.get("deal_name")
             customer_name = customer_name or d_info.get("customer_name")
             customer_id = customer_id or d_info.get("customer_id")
+            deal_cat = deal_cat or d_info.get("deal_category")
+            closing_dt = closing_dt or d_info.get("closing_date")
 
     if customer_id and not customer_name:
         for c in get_customer_list():
@@ -940,11 +976,20 @@ def create_task(payload: TaskCreate):
                 customer_name = c["company_name"]
                 break
 
+    if deal_cat:
+        dc_low = str(deal_cat).lower()
+        if "owner" in dc_low or "prime" in dc_low or "1-" in dc_low:
+            cat_val = "RFP_OWNERSHIP"
+        elif "distribut" in dc_low or "scope" in dc_low or "2-" in dc_low:
+            cat_val = "RFP_DISTRIBUTED_SCOPE"
+        elif "effort" in dc_low or "po" in dc_low or "3-" in dc_low:
+            cat_val = "GENERAL_ACTION"
+
     cursor.execute(
         """
         INSERT INTO tasks (
-            task_title, category, related_deal_id, customer_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            task_title, category, related_deal_id, customer_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, deal_category, closing_date, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             payload.task_title.strip(),
@@ -961,6 +1006,8 @@ def create_task(payload: TaskCreate):
             payload.management_blockers.strip() if payload.management_blockers else None,
             started_at,
             completed_at,
+            deal_cat,
+            closing_dt,
             now_iso,
             now_iso,
         ),
@@ -1019,6 +1066,14 @@ def update_task(task_id: int, payload: TaskUpdate):
         update_clauses.append("category = ?")
         params.append(cat_val)
 
+    if payload.deal_category is not None:
+        update_clauses.append("deal_category = ?")
+        params.append(payload.deal_category.strip() if payload.deal_category else None)
+
+    if payload.closing_date is not None:
+        update_clauses.append("closing_date = ?")
+        params.append(payload.closing_date.strip() if payload.closing_date else None)
+
     if payload.customer_id is not None:
         update_clauses.append("customer_id = ?")
         params.append(payload.customer_id)
@@ -1045,6 +1100,12 @@ def update_task(task_id: int, payload: TaskUpdate):
                 if payload.customer_id is None and d_info.get("customer_id"):
                     update_clauses.append("customer_id = ?")
                     params.append(d_info.get("customer_id"))
+                if payload.deal_category is None and d_info.get("deal_category"):
+                    update_clauses.append("deal_category = ?")
+                    params.append(d_info.get("deal_category"))
+                if payload.closing_date is None and d_info.get("closing_date"):
+                    update_clauses.append("closing_date = ?")
+                    params.append(d_info.get("closing_date"))
 
     if payload.deal_name is not None:
         update_clauses.append("deal_name = ?")
@@ -1136,6 +1197,9 @@ def get_deals_lookup():
             "deal_name": d["deal_name"],
             "customer_id": d.get("customer_id"),
             "customer_name": d["customer_name"],
+            "primary_vendors": d.get("primary_vendors"),
+            "deal_category": d.get("deal_category"),
+            "closing_date": d.get("closing_date"),
         }
         for did, d in sorted(deal_map.items())
     ]
@@ -1237,6 +1301,46 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         .priority-Medium { background-color: var(--color-medium); }
         .priority-Low { background-color: var(--color-low); }
 
+        .category-tab-btn {
+            font-size: 0.92rem;
+            font-weight: 700;
+            padding: 8px 18px;
+            border-radius: 8px;
+            border: 1px solid #d0d7de;
+            background: #ffffff;
+            color: #475569;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+        }
+        .category-tab-btn:hover {
+            background-color: #f8fafc;
+            color: #0f172a;
+        }
+        .category-tab-btn.tab-owner.active {
+            background-color: #0073ea !important;
+            border-color: #0073ea !important;
+            color: #ffffff !important;
+        }
+        .category-tab-btn.tab-scope.active {
+            background-color: #a25ddc !important;
+            border-color: #a25ddc !important;
+            color: #ffffff !important;
+        }
+        .category-tab-btn.tab-efforts.active {
+            background-color: #00c875 !important;
+            border-color: #00c875 !important;
+            color: #ffffff !important;
+        }
+        .category-tab-btn.active .badge {
+            background-color: rgba(255, 255, 255, 0.3) !important;
+            color: #ffffff !important;
+            border-color: transparent !important;
+        }
+
         .group-section {
             background: #ffffff;
             border-radius: 8px;
@@ -1254,19 +1358,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             align-items: center;
             justify-content: space-between;
             border-bottom: 1px solid #f0f3f6;
-        }
-
-        .group-RFP_OWNERSHIP .group-header {
-            border-left: 6px solid #579bfc;
-            color: #0051b3;
-        }
-        .group-RFP_DISTRIBUTED_SCOPE .group-header {
-            border-left: 6px solid #a25ddc;
-            color: #6323a6;
-        }
-        .group-GENERAL_ACTION .group-header {
-            border-left: 6px solid #00c875;
-            color: #0b804d;
         }
 
         .task-table {
@@ -1537,10 +1628,70 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Groups Container -->
-        <div id="groupsContainer">
-            <div class="text-center py-5 text-muted">
-                <div class="spinner-border text-primary spinner-border-sm me-2"></div>Loading Task Board...
+        <!-- 3 Category Navigation Tabs -->
+        <div class="category-tabs-container mb-3">
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 p-2 bg-white rounded-3 shadow-sm border">
+                <div class="d-flex flex-wrap align-items-center gap-2" id="categoryNavTabs">
+                    <button type="button" class="category-tab-btn tab-owner active" id="tab-btn-RFP_OWNERSHIP" onclick="switchCategoryTab('RFP_OWNERSHIP')">
+                        <i class="bi bi-folder2-open fs-5"></i>
+                        <span>1- RFP Ownership & Prime Proposals</span>
+                        <span class="badge rounded-pill bg-primary ms-1" id="tabCountOwner">0</span>
+                    </button>
+                    <button type="button" class="category-tab-btn tab-scope" id="tab-btn-RFP_DISTRIBUTED_SCOPE" onclick="switchCategoryTab('RFP_DISTRIBUTED_SCOPE')">
+                        <i class="bi bi-diagram-3-fill fs-5" style="color: #a25ddc;"></i>
+                        <span>2- RFP Distributed Scope Items</span>
+                        <span class="badge rounded-pill ms-1 text-white" style="background-color: #a25ddc;" id="tabCountScope">0</span>
+                    </button>
+                    <button type="button" class="category-tab-btn tab-efforts" id="tab-btn-GENERAL_ACTION" onclick="switchCategoryTab('GENERAL_ACTION')">
+                        <i class="bi bi-bullseye fs-5" style="color: #00c875;"></i>
+                        <span>3- Opportunity Efforts & PO</span>
+                        <span class="badge rounded-pill bg-success ms-1" id="tabCountEfforts">0</span>
+                    </button>
+                </div>
+                <div>
+                    <button class="btn btn-primary px-3 py-2 fw-semibold shadow-sm d-flex align-items-center gap-2" onclick="openNewTaskModal()">
+                        <i class="bi bi-plus-circle-fill"></i>
+                        <span>Add Task</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Single Active Tab Table Container -->
+        <div id="activeTabContainer" class="card border-0 shadow-sm bg-white mb-4" style="border-radius: 10px; overflow: hidden; border: 1px solid var(--monday-border) !important;">
+            <div class="group-header py-3 px-3 border-bottom d-flex align-items-center justify-content-between bg-light" id="activeTabHeader">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="fw-bold fs-6" id="currentTabHeading">1- RFP Ownership & Prime Proposals</span>
+                    <span class="badge bg-secondary-subtle text-dark border" id="currentTabItemCount">0 items</span>
+                </div>
+                <div class="text-muted small" id="currentTabSubtext">
+                    Prime proposals & tenders owned end-to-end
+                </div>
+            </div>
+            <div class="table-responsive">
+                <table class="table task-table mb-0">
+                    <thead>
+                        <tr>
+                            <th class="text-start" style="width: 22%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name & Closing</th>
+                            <th class="text-start" style="width: 24%;"><i class="bi bi-card-text me-1 text-secondary"></i>Description (What it's about)</th>
+                            <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
+                            <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
+                            <th style="width: 8%;">Assignee</th>
+                            <th style="width: 9%;">Status</th>
+                            <th style="width: 6%;">Priority</th>
+                            <th style="width: 7%;">Timing</th>
+                            <th style="width: 6%;">Due Date</th>
+                            <th style="width: 3%;">Log</th>
+                        </tr>
+                    </thead>
+                    <tbody id="taskTableBody">
+                        <tr>
+                            <td colspan="10" class="text-center py-4 text-muted">
+                                <div class="spinner-border text-primary spinner-border-sm me-2"></div>Loading Task Board...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -1573,6 +1724,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-tag-fill text-primary me-1"></i>Deal Category (from CRM)</label>
+                                <div id="newCategoryDisplay" class="p-2 border rounded bg-light small fw-bold text-primary">
+                                    1- RFP Ownership & Prime Proposals
+                                </div>
+                                <input type="hidden" id="newCategoryHidden" value="RFP_OWNERSHIP">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-calendar2-week-fill text-danger me-1"></i>Closing Date (from CRM)</label>
+                                <div id="newClosingDateDisplay" class="p-2 border rounded bg-light small fw-bold text-danger">
+                                    No Closing Date
+                                </div>
+                                <input type="hidden" id="newClosingDateHidden" value="">
+                            </div>
                             <div class="col-md-4">
                                 <label class="form-label small fw-semibold"><i class="bi bi-cpu text-info me-1"></i>Vendor Domain *</label>
                                 <select id="newVendor" class="form-select" required>
@@ -1583,14 +1748,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="VMware">VMware</option>
                                     <option value="Nutanix">Nutanix</option>
                                     <option value="Cisco">Cisco</option>
-                                </select>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small fw-semibold">Workstream Category *</label>
-                                <select id="newCategory" class="form-select" required>
-                                    <option value="RFP_OWNERSHIP">RFP Ownership</option>
-                                    <option value="RFP_DISTRIBUTED_SCOPE">RFP Distributed Scope</option>
-                                    <option value="GENERAL_ACTION">General Action</option>
                                 </select>
                             </div>
                             <div class="col-md-4">
@@ -1610,7 +1767,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Completed">Completed</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Priority *</label>
                                 <select id="newPriority" class="form-select" required>
                                     <option value="High">High</option>
@@ -1618,7 +1775,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Due Date</label>
                                 <input type="date" id="newDueDate" class="form-control">
                             </div>
@@ -1665,6 +1822,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="">-- No Linked Deal --</option>
                                 </select>
                             </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-tag-fill text-primary me-1"></i>Deal Category (from CRM)</label>
+                                <div id="editCategoryDisplay" class="p-2 border rounded bg-light small fw-bold text-primary">
+                                    1- RFP Ownership & Prime Proposals
+                                </div>
+                                <input type="hidden" id="editCategoryHidden" value="RFP_OWNERSHIP">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold"><i class="bi bi-calendar2-week-fill text-danger me-1"></i>Closing Date (from CRM)</label>
+                                <div id="editClosingDateDisplay" class="p-2 border rounded bg-light small fw-bold text-danger">
+                                    No Closing Date
+                                </div>
+                                <input type="hidden" id="editClosingDateHidden" value="">
+                            </div>
                             <div class="col-md-4">
                                 <label class="form-label small fw-semibold"><i class="bi bi-cpu text-info me-1"></i>Vendor Domain *</label>
                                 <select id="editVendor" class="form-select" required>
@@ -1675,14 +1846,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="VMware">VMware</option>
                                     <option value="Nutanix">Nutanix</option>
                                     <option value="Cisco">Cisco</option>
-                                </select>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small fw-semibold">Category *</label>
-                                <select id="editCategory" class="form-select" required>
-                                    <option value="RFP_OWNERSHIP">RFP Ownership</option>
-                                    <option value="RFP_DISTRIBUTED_SCOPE">RFP Distributed Scope</option>
-                                    <option value="GENERAL_ACTION">General Action</option>
                                 </select>
                             </div>
                             <div class="col-md-4">
@@ -1702,7 +1865,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Completed">Completed</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Priority *</label>
                                 <select id="editPriority" class="form-select" required>
                                     <option value="High">High</option>
@@ -1710,7 +1873,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <option value="Low">Low</option>
                                 </select>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Due Date</label>
                                 <input type="date" id="editDueDate" class="form-control">
                             </div>
@@ -1770,6 +1933,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         let allCustomers = [];
         let currentFilter = 'ALL';
         let currentVendorFilter = '';
+        let currentCategoryTab = 'RFP_OWNERSHIP';
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
         const historyModal = new bootstrap.Modal(document.getElementById('historyModal'));
@@ -1780,6 +1944,35 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.addEventListener('DOMContentLoaded', () => {
             loadTasks();
         });
+
+        function switchCategoryTab(catKey) {
+            currentCategoryTab = catKey;
+            document.querySelectorAll('.category-tab-btn').forEach(btn => btn.classList.remove('active'));
+            const activeBtn = document.getElementById('tab-btn-' + catKey);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            const headings = {
+                'RFP_OWNERSHIP': {
+                    title: '1- RFP Ownership & Prime Proposals',
+                    subtext: 'Prime proposals & tenders owned end-to-end (strict closing deadlines)'
+                },
+                'RFP_DISTRIBUTED_SCOPE': {
+                    title: '2- RFP Distributed Scope Items',
+                    subtext: 'Distributed vendor partner scopes within larger customer RFPs'
+                },
+                'GENERAL_ACTION': {
+                    title: '3- Opportunity Efforts & PO',
+                    subtext: 'Early discovery visits, assessments, and pipeline efforts leading to PO'
+                }
+            };
+            const meta = headings[catKey] || headings['RFP_OWNERSHIP'];
+            const headingEl = document.getElementById('currentTabHeading');
+            const subtextEl = document.getElementById('currentTabSubtext');
+            if (headingEl) headingEl.textContent = meta.title;
+            if (subtextEl) subtextEl.textContent = meta.subtext;
+
+            renderBoard();
+        }
 
         function setVendorFilter(vendorName, btn) {
             currentVendorFilter = vendorName || '';
@@ -1847,7 +2040,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 filtered.forEach(d => {
                     const custLabel = d.customer_name ? ` (#${d.customer_id || ''} ${d.customer_name})` : '';
                     const vendorLabel = d.primary_vendors ? ` [${d.primary_vendors}]` : '';
-                    const label = `Deal #${d.deal_id}: ${d.deal_name}${custLabel}${vendorLabel}`;
+                    const catLabel = d.deal_category ? ` - [${d.deal_category}]` : '';
+                    const label = `Deal #${d.deal_id}: ${d.deal_name}${custLabel}${vendorLabel}${catLabel}`;
                     opts.push(`<option value="${d.deal_id}">${label}</option>`);
                 });
                 return opts.join('');
@@ -1873,6 +2067,43 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             }
         }
 
+        function updateDealCategoryBadges(dealId, target = 'new') {
+            const deal = allDeals.find(d => d.deal_id === parseInt(dealId));
+            const catDisp = document.getElementById(target + 'CategoryDisplay');
+            const catHidden = document.getElementById(target + 'CategoryHidden');
+            const closeDisp = document.getElementById(target + 'ClosingDateDisplay');
+            const closeHidden = document.getElementById(target + 'ClosingDateHidden');
+
+            if (deal) {
+                const dCat = deal.deal_category || '3- Opportunity Efforts & PO';
+                let mappedCatKey = 'GENERAL_ACTION';
+                const low = dCat.toLowerCase();
+                if (low.includes('owner') || low.includes('prime') || low.includes('1-')) mappedCatKey = 'RFP_OWNERSHIP';
+                else if (low.includes('distribut') || low.includes('scope') || low.includes('2-')) mappedCatKey = 'RFP_DISTRIBUTED_SCOPE';
+
+                if (catDisp) catDisp.textContent = dCat;
+                if (catHidden) catHidden.value = mappedCatKey;
+
+                if (deal.closing_date) {
+                    if (closeDisp) closeDisp.innerHTML = `<span class="badge bg-danger-subtle text-danger border border-danger-subtle px-2 py-1"><i class="bi bi-alarm-fill me-1"></i>Closing: ${deal.closing_date}</span>`;
+                    if (closeHidden) closeHidden.value = deal.closing_date;
+                } else {
+                    if (closeDisp) closeDisp.textContent = 'No Closing Date';
+                    if (closeHidden) closeHidden.value = '';
+                }
+            } else {
+                const defaultNames = {
+                    'RFP_OWNERSHIP': '1- RFP Ownership & Prime Proposals',
+                    'RFP_DISTRIBUTED_SCOPE': '2- RFP Distributed Scope Items',
+                    'GENERAL_ACTION': '3- Opportunity Efforts & PO'
+                };
+                if (catDisp) catDisp.textContent = defaultNames[currentCategoryTab] || '3- Opportunity Efforts & PO';
+                if (catHidden) catHidden.value = currentCategoryTab;
+                if (closeDisp) closeDisp.textContent = 'No Closing Date';
+                if (closeHidden) closeHidden.value = '';
+            }
+        }
+
         function onNewCustomerChange() {
             const custId = parseInt(document.getElementById('newCustomerId').value) || null;
             populateDealSelects(custId, 'new');
@@ -1883,30 +2114,33 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     newDealSel.value = "";
                 }
             }
+            updateDealCategoryBadges(newDealSel ? newDealSel.value : null, 'new');
         }
 
         function onNewDealChange() {
             const dealId = parseInt(document.getElementById('newDealId').value) || null;
-            if (!dealId) return;
-            const deal = allDeals.find(d => d.deal_id === dealId);
-            if (deal) {
-                if (deal.customer_id) {
-                    const newCustSel = document.getElementById('newCustomerId');
-                    if (newCustSel) {
-                        newCustSel.value = deal.customer_id;
-                        populateDealSelects(deal.customer_id, 'new');
-                        newCustSel.value = deal.customer_id;
-                        document.getElementById('newDealId').value = dealId;
+            if (dealId) {
+                const deal = allDeals.find(d => d.deal_id === dealId);
+                if (deal) {
+                    if (deal.customer_id) {
+                        const newCustSel = document.getElementById('newCustomerId');
+                        if (newCustSel) {
+                            newCustSel.value = deal.customer_id;
+                            populateDealSelects(deal.customer_id, 'new');
+                            newCustSel.value = deal.customer_id;
+                            document.getElementById('newDealId').value = dealId;
+                        }
                     }
-                }
-                if (deal.primary_vendors) {
-                    const firstV = deal.primary_vendors.split(',')[0].trim();
-                    const newVSel = document.getElementById('newVendor');
-                    if (newVSel && Array.from(newVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
-                        newVSel.value = firstV;
+                    if (deal.primary_vendors) {
+                        const firstV = deal.primary_vendors.split(',')[0].trim();
+                        const newVSel = document.getElementById('newVendor');
+                        if (newVSel && Array.from(newVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
+                            newVSel.value = firstV;
+                        }
                     }
                 }
             }
+            updateDealCategoryBadges(dealId, 'new');
         }
 
         function onEditCustomerChange() {
@@ -1919,34 +2153,34 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     editDealSel.value = "";
                 }
             }
+            updateDealCategoryBadges(editDealSel ? editDealSel.value : null, 'edit');
             updateEditBanner();
         }
 
         function onEditDealChange() {
             const dealId = parseInt(document.getElementById('editDealId').value) || null;
-            if (!dealId) {
-                updateEditBanner();
-                return;
-            }
-            const deal = allDeals.find(d => d.deal_id === dealId);
-            if (deal) {
-                if (deal.customer_id) {
-                    const editCustSel = document.getElementById('editCustomerId');
-                    if (editCustSel) {
-                        editCustSel.value = deal.customer_id;
-                        populateDealSelects(deal.customer_id, 'edit');
-                        editCustSel.value = deal.customer_id;
-                        document.getElementById('editDealId').value = dealId;
+            if (dealId) {
+                const deal = allDeals.find(d => d.deal_id === dealId);
+                if (deal) {
+                    if (deal.customer_id) {
+                        const editCustSel = document.getElementById('editCustomerId');
+                        if (editCustSel) {
+                            editCustSel.value = deal.customer_id;
+                            populateDealSelects(deal.customer_id, 'edit');
+                            editCustSel.value = deal.customer_id;
+                            document.getElementById('editDealId').value = dealId;
+                        }
                     }
-                }
-                if (deal.primary_vendors) {
-                    const firstV = deal.primary_vendors.split(',')[0].trim();
-                    const editVSel = document.getElementById('editVendor');
-                    if (editVSel && Array.from(editVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
-                        editVSel.value = firstV;
+                    if (deal.primary_vendors) {
+                        const firstV = deal.primary_vendors.split(',')[0].trim();
+                        const editVSel = document.getElementById('editVendor');
+                        if (editVSel && Array.from(editVSel.options).some(o => o.value.toLowerCase() === firstV.toLowerCase())) {
+                            editVSel.value = firstV;
+                        }
                     }
                 }
             }
+            updateDealCategoryBadges(dealId, 'edit');
             updateEditBanner();
         }
 
@@ -2067,66 +2301,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             updateVendorCounts(allTasks);
             updateMacroProgress(allTasks);
 
-            const groups = {
-                'RFP_OWNERSHIP': {
-                    title: 'RFP Ownership & Prime Proposals',
-                    color: '#0073ea',
-                    tasks: filtered.filter(t => t.category === 'RFP_OWNERSHIP')
-                },
-                'RFP_DISTRIBUTED_SCOPE': {
-                    title: 'RFP Distributed Scope Items',
-                    color: '#a25ddc',
-                    tasks: filtered.filter(t => t.category === 'RFP_DISTRIBUTED_SCOPE')
-                },
-                'GENERAL_ACTION': {
-                    title: 'General Technical Actions & PoC Tasks',
-                    color: '#00c875',
-                    tasks: filtered.filter(t => t.category === 'GENERAL_ACTION')
-                }
-            };
+            // Tab badge counts across all tasks (or filtered)
+            const countOwner = allTasks.filter(t => t.category === 'RFP_OWNERSHIP').length;
+            const countScope = allTasks.filter(t => t.category === 'RFP_DISTRIBUTED_SCOPE').length;
+            const countEfforts = allTasks.filter(t => t.category === 'GENERAL_ACTION').length;
 
-            const container = document.getElementById('groupsContainer');
-            container.innerHTML = Object.entries(groups).map(([catKey, group]) => `
-                <div class="group-section group-${catKey}">
-                    <div class="group-header">
-                        <div class="d-flex align-items-center gap-2">
-                            <span>${group.title}</span>
-                            <span class="badge bg-light text-dark border">${group.tasks.length} items</span>
-                        </div>
-                        <button class="btn btn-sm btn-link text-decoration-none p-0" onclick="openNewTaskModal('${catKey}')">
-                            <i class="bi bi-plus-circle me-1"></i>Add Item
-                        </button>
-                    </div>
+            const bOwner = document.getElementById('tabCountOwner');
+            const bScope = document.getElementById('tabCountScope');
+            const bEfforts = document.getElementById('tabCountEfforts');
+            if (bOwner) bOwner.textContent = countOwner;
+            if (bScope) bScope.textContent = countScope;
+            if (bEfforts) bEfforts.textContent = countEfforts;
 
-                    <div class="table-responsive">
-                        <table class="table task-table">
-                            <thead>
-                                <tr>
-                                    <th class="text-start" style="width: 20%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name</th>
-                                    <th class="text-start" style="width: 24%;"><i class="bi bi-card-text me-1 text-secondary"></i>Description (What it's about)</th>
-                                    <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
-                                    <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
-                                    <th style="width: 8%;">Assignee</th>
-                                    <th style="width: 9%;">Status</th>
-                                    <th style="width: 6%;">Priority</th>
-                                    <th style="width: 7%;">Timing</th>
-                                    <th style="width: 5%;">Due Date</th>
-                                    <th style="width: 3%;">Log</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${group.tasks.length === 0 ? `
-                                    <tr>
-                                        <td colspan="10" class="text-center py-4 text-muted fst-italic">
-                                            No tasks in this workstream matching filters.
-                                        </td>
-                                    </tr>
-                                ` : group.tasks.map(t => renderTaskRow(t)).join('')}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            `).join('');
+            // Filter for current active tab
+            const tabItems = filtered.filter(t => t.category === currentCategoryTab);
+            const countLabel = document.getElementById('currentTabItemCount');
+            if (countLabel) countLabel.textContent = `${tabItems.length} items`;
+
+            const tbody = document.getElementById('taskTableBody');
+            if (!tbody) return;
+
+            if (tabItems.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="10" class="text-center py-5 text-muted fst-italic">
+                            <i class="bi bi-inbox fs-2 d-block mb-2 text-secondary opacity-50"></i>
+                            No tasks in this category matching current filters.
+                        </td>
+                    </tr>
+                `;
+            } else {
+                tbody.innerHTML = tabItems.map(t => renderTaskRow(t)).join('');
+            }
         }
 
         function updateVendorCounts(tasks) {
@@ -2163,7 +2369,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             let velocityBadge = '';
             if (t.status === 'Completed') {
                 const cycle = t.cycle_time || '-';
-                const lead = t.lead_time || '-';
                 velocityBadge = `
                     <div class="d-flex flex-column gap-1 align-items-center">
                         <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.72rem;" title="Cycle Time (Working duration)">
@@ -2193,9 +2398,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const dealDisplay = t.deal_name || (t.related_deal_id ? `Deal #${t.related_deal_id}` : 'Internal Presales');
             const customerDisplay = t.customer_name || 'Internal / General';
 
+            // High-visibility closing deadline badge for RFP deals
+            const closingBadge = t.closing_date ? `
+                <div class="mt-1">
+                    <span class="badge bg-danger-subtle text-danger border border-danger-subtle d-inline-flex align-items-center gap-1 py-1 px-2" style="font-size: 0.72rem; font-weight: 600;" title="RFP Closing Deadline">
+                        <i class="bi bi-alarm-fill"></i>Closing: ${t.closing_date}
+                    </span>
+                </div>
+            ` : '';
+
             return `
                 <tr>
-                    <!-- 1. Deal Name (Only) -->
+                    <!-- 1. Deal Name & Closing -->
                     <td class="text-start">
                         <div class="d-flex align-items-center gap-1">
                             <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none d-inline-flex align-items-center gap-1" onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task">
@@ -2204,6 +2418,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             </a>
                             ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border py-0.5 px-1" style="font-size: 0.68rem; font-family: monospace;" title="Deal ID">#${t.related_deal_id}</span>` : ''}
                         </div>
+                        ${closingBadge}
                     </td>
 
                     <!-- 2. Description (What it's about) -->
@@ -2348,8 +2563,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             populateCustomerSelects();
             populateDealSelects(null, 'new');
             if (presetCategory) {
-                document.getElementById('newCategory').value = presetCategory;
+                currentCategoryTab = presetCategory;
+                switchCategoryTab(presetCategory);
             }
+            updateDealCategoryBadges(null, 'new');
             newModal.show();
         }
 
@@ -2359,10 +2576,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const dealId = parseInt(document.getElementById('newDealId').value) || null;
             const custObj = allCustomers.find(c => c.customer_id === custId);
             const dealObj = allDeals.find(d => d.deal_id === dealId);
+            const catVal = document.getElementById('newCategoryHidden').value || currentCategoryTab;
+            const closeVal = document.getElementById('newClosingDateHidden').value || (dealObj ? dealObj.closing_date : null);
 
             const payload = {
                 task_title: document.getElementById('newTitle').value,
-                category: document.getElementById('newCategory').value,
+                category: catVal,
+                deal_category: dealObj ? dealObj.deal_category : null,
+                closing_date: closeVal || null,
                 assigned_to: document.getElementById('newAssigned').value,
                 vendor_domain: document.getElementById('newVendor').value,
                 customer_id: custId,
@@ -2408,12 +2629,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             document.getElementById('editDealId').value = task.related_deal_id || '';
 
             document.getElementById('editVendor').value = task.vendor_domain || 'General';
-            document.getElementById('editCategory').value = task.category;
             document.getElementById('editAssigned').value = task.assigned_to;
             document.getElementById('editStatus').value = task.status;
             document.getElementById('editPriority').value = task.priority;
             document.getElementById('editDueDate').value = task.due_date || '';
             document.getElementById('editBlockers').value = task.management_blockers || '';
+
+            updateDealCategoryBadges(task.related_deal_id, 'edit');
+            if (task.closing_date) {
+                document.getElementById('editClosingDateHidden').value = task.closing_date;
+                document.getElementById('editClosingDateDisplay').innerHTML = `<span class="badge bg-danger-subtle text-danger border border-danger-subtle px-2 py-1"><i class="bi bi-alarm-fill me-1"></i>Closing: ${task.closing_date}</span>`;
+            }
 
             updateEditBanner();
             editModal.show();
@@ -2426,10 +2652,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const dealId = parseInt(document.getElementById('editDealId').value) || null;
             const custObj = allCustomers.find(c => c.customer_id === custId);
             const dealObj = allDeals.find(d => d.deal_id === dealId);
+            const catVal = document.getElementById('editCategoryHidden').value;
+            const closeVal = document.getElementById('editClosingDateHidden').value || (dealObj ? dealObj.closing_date : null);
 
             const payload = {
                 task_title: document.getElementById('editTitle').value,
-                category: document.getElementById('editCategory').value,
+                category: catVal,
+                deal_category: dealObj ? dealObj.deal_category : null,
+                closing_date: closeVal || null,
                 assigned_to: document.getElementById('editAssigned').value,
                 vendor_domain: document.getElementById('editVendor').value,
                 customer_id: custId,

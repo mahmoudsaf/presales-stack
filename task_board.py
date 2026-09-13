@@ -1471,35 +1471,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Vendor Quick-Filter Pill Buttons -->
-        <div class="d-flex flex-wrap align-items-center gap-2 mt-2 pt-2 border-top">
-            <span class="small fw-semibold text-muted d-flex align-items-center gap-1">
-                <i class="bi bi-cpu-fill text-primary"></i>Vendor Filter:
-            </span>
-            <div class="d-flex flex-wrap align-items-center gap-1" id="vendorPillsBar">
-                <button type="button" class="vendor-pill-btn active" data-vendor="" onclick="setVendorFilter('', this)">
-                    All Vendors <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorAll">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="HPE" onclick="setVendorFilter('HPE', this)">
-                    HPE <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorHPE">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="Dell" onclick="setVendorFilter('Dell', this)">
-                    Dell <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorDell">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="Veeam" onclick="setVendorFilter('Veeam', this)">
-                    Veeam <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorVeeam">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="VMware" onclick="setVendorFilter('VMware', this)">
-                    VMware <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorVMware">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="Nutanix" onclick="setVendorFilter('Nutanix', this)">
-                    Nutanix <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorNutanix">0</span>
-                </button>
-                <button type="button" class="vendor-pill-btn" data-vendor="General" onclick="setVendorFilter('General', this)">
-                    General <span class="badge bg-secondary-subtle text-dark border ms-1" id="badgeVendorGeneral">0</span>
-                </button>
-            </div>
-        </div>
+
     </header>
 
     <!-- Main Board Area -->
@@ -1586,8 +1558,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <div class="modal-body p-4">
                         <div class="row g-3">
                             <div class="col-12">
-                                <label class="form-label small fw-semibold">Task / Item Title *</label>
-                                <input type="text" id="newTitle" class="form-control" placeholder="e.g. Complete Technical RFP Section 3.2" required>
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Description (What it's about / Details) *</label>
+                                <input type="text" id="newTitle" class="form-control" placeholder="Describe what this task is about / action details..." required>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label small fw-semibold"><i class="bi bi-building text-primary me-1"></i>Customer Account (ID & Name)</label>
@@ -1678,7 +1650,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <input type="hidden" id="editTaskId">
                         <div class="row g-3">
                             <div class="col-12">
-                                <label class="form-label small fw-semibold">Task Title *</label>
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Description (What it's about / Details) *</label>
                                 <input type="text" id="editTitle" class="form-control" required>
                             </div>
                             <div class="col-md-6">
@@ -2130,21 +2102,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <table class="table task-table">
                             <thead>
                                 <tr>
-                                    <th class="text-start" style="width: 32%;">Item & Deal Name</th>
-                                    <th class="text-start" style="width: 16%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
+                                    <th class="text-start" style="width: 20%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name</th>
+                                    <th class="text-start" style="width: 24%;"><i class="bi bi-card-text me-1 text-secondary"></i>Description (What it's about)</th>
+                                    <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
                                     <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
                                     <th style="width: 8%;">Assignee</th>
-                                    <th style="width: 10%;">Status</th>
-                                    <th style="width: 7%;">Priority</th>
-                                    <th style="width: 8%;">Timing & Velocity</th>
+                                    <th style="width: 9%;">Status</th>
+                                    <th style="width: 6%;">Priority</th>
+                                    <th style="width: 7%;">Timing</th>
                                     <th style="width: 5%;">Due Date</th>
-                                    <th style="width: 4%;">Log</th>
+                                    <th style="width: 3%;">Log</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 ${group.tasks.length === 0 ? `
                                     <tr>
-                                        <td colspan="9" class="text-center py-4 text-muted fst-italic">
+                                        <td colspan="10" class="text-center py-4 text-muted fst-italic">
                                             No tasks in this workstream matching filters.
                                         </td>
                                     </tr>
@@ -2222,24 +2195,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             return `
                 <tr>
-                    <!-- 1. Item Title & Deal Name (Merged) -->
+                    <!-- 1. Deal Name (Only) -->
                     <td class="text-start">
-                        <div class="d-flex flex-wrap align-items-center gap-1">
-                            <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
+                        <div class="d-flex align-items-center gap-1">
+                            <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none d-inline-flex align-items-center gap-1" onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task">
+                                <i class="bi bi-briefcase text-success me-1"></i>
+                                <span class="text-truncate" style="max-width: 220px;">${dealDisplay}</span>
+                            </a>
+                            ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border py-0.5 px-1" style="font-size: 0.68rem; font-family: monospace;" title="Deal ID">#${t.related_deal_id}</span>` : ''}
+                        </div>
+                    </td>
+
+                    <!-- 2. Description (What it's about) -->
+                    <td class="text-start">
+                        <div class="text-dark small fw-medium" title="${t.task_title}">
+                            <a href="javascript:void(0)" class="text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
                                 ${t.task_title}
                             </a>
-                        </div>
-                        <div class="d-flex flex-wrap align-items-center gap-1 mt-1">
-                            <span class="badge border px-2 py-0.5 d-inline-flex align-items-center gap-1" style="font-size: 0.74rem; font-weight: 500; background-color: #f8fafc; color: #0f172a; border-color: #cbd5e1 !important;" title="Associated Deal: ${dealDisplay}">
-                                <i class="bi bi-briefcase text-success"></i>
-                                ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.68rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}
-                                <span class="text-truncate" style="max-width: 280px;">${dealDisplay}</span>
-                            </span>
                         </div>
                         ${blockerDisplay}
                     </td>
 
-                    <!-- 2. Customer Name -->
+                    <!-- 3. Customer Name -->
                     <td class="text-start">
                         <div class="d-flex align-items-center gap-1">
                             ${t.customer_id ? `<span class="badge bg-secondary-subtle text-secondary border py-1 px-2" style="font-size: 0.72rem; font-family: monospace;" title="Customer ID">#${t.customer_id}</span>` : ''}
@@ -2250,7 +2227,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </div>
                     </td>
 
-                    <!-- 3. Vendor -->
+                    <!-- 4. Vendor -->
                     <td>
                         <span class="badge vendor-badge ${vendorClass}" onclick="setVendorFilter('${vendorDomain}')" style="cursor: pointer;" title="Click to filter by ${vendorDomain}">
                             <i class="bi bi-cpu me-1"></i>${vendorDomain}

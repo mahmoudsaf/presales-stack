@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -716,11 +716,11 @@ def update_customer(customer_id: int, payload: CustomerUpdate):
 
 
 @app.get("/api/deals", response_model=List[DealOut], tags=["Deals"])
-def get_deals():
-    """Returns all deals with joined customer information."""
+def get_deals(vendor: Optional[str] = Query(None, description="Filter deals by primary vendor")):
+    """Returns all deals with joined customer information. Optionally filters by vendor."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
+    query = """
         SELECT 
             d.deal_id,
             d.customer_id,
@@ -738,8 +738,13 @@ def get_deals():
             d.updated_at
         FROM deals d
         JOIN customers c ON d.customer_id = c.customer_id
-        ORDER BY d.updated_at DESC, d.deal_id DESC;
-    """)
+    """
+    params = []
+    if vendor:
+        query += " WHERE d.primary_vendors LIKE ? "
+        params.append(f"%{vendor}%")
+    query += " ORDER BY d.updated_at DESC, d.deal_id DESC;"
+    cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
@@ -1173,9 +1178,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             color: #334155;
             font-size: 0.72rem;
             font-weight: 600;
-            padding: 2px 7px;
+            padding: 2px 8px;
             border-radius: 4px;
             margin: 1px;
+            cursor: pointer;
+            transition: all 0.15s ease-in-out;
+            text-decoration: none;
+            user-select: none;
+        }
+        .vendor-chip:hover {
+            background: #2563eb;
+            color: #ffffff;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 4px rgba(37, 99, 235, 0.35);
+        }
+        .vendor-pill-btn {
+            font-size: 0.8rem;
+            font-weight: 500;
+            border-radius: 20px !important;
+            padding: 0.22rem 0.75rem !important;
+            transition: all 0.15s ease-in-out;
+        }
+        .vendor-pill-btn.active {
+            background-color: #2563eb !important;
+            color: #ffffff !important;
+            border-color: #2563eb !important;
+            box-shadow: 0 2px 5px rgba(37, 99, 235, 0.35);
         }
         .modal-content {
             border-radius: 14px;
@@ -1597,6 +1625,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <div class="btn-group btn-group-sm ms-md-2" role="group">
                             <button type="button" class="btn btn-outline-secondary filter-btn" id="qf-P1" onclick="setQuickFilter('PRESALES_1', this)"><i class="bi bi-person me-1 text-primary"></i>Presales 1</button>
                             <button type="button" class="btn btn-outline-secondary filter-btn" id="qf-P2" onclick="setQuickFilter('PRESALES_2', this)"><i class="bi bi-person me-1 text-info"></i>Presales 2</button>
+                        </div>
+                    </div>
+
+                    <!-- Vendor Quick-Filter Pills Row -->
+                    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+                        <span class="small text-muted fw-bold me-1"><i class="bi bi-cpu me-1"></i>Filter by Vendor:</span>
+                        <div class="btn-group btn-group-sm flex-wrap" role="group" id="vendorPillsGroup">
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn active" data-vendor="" onclick="setVendorFilter('', this)">
+                                All Vendors <span class="badge bg-light text-dark ms-1 rounded-pill" id="vendor-count-all">0</span>
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="HPE" onclick="setVendorFilter('HPE', this)">
+                                HPE <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-HPE">0</span>
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Dell" onclick="setVendorFilter('Dell', this)">
+                                Dell <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Dell">0</span>
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Veeam" onclick="setVendorFilter('Veeam', this)">
+                                Veeam <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Veeam">0</span>
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="VMware" onclick="setVendorFilter('VMware', this)">
+                                VMware <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-VMware">0</span>
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary vendor-pill-btn" data-vendor="Nutanix" onclick="setVendorFilter('Nutanix', this)">
+                                Nutanix <span class="badge bg-secondary ms-1 rounded-pill" id="vendor-count-Nutanix">0</span>
+                            </button>
                         </div>
                     </div>
 
@@ -2423,7 +2476,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             tbody.innerHTML = deals.map(d => {
                 const stageClass = 'badge-' + (d.stage || '').replace(/[\\s\\/]+/g, '-');
                 const vendorChips = d.primary_vendors 
-                    ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip">${v.trim()}</span>`).join(' ')
+                    ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip" onclick="filterByVendorFromAnywhere('${v.trim()}')" title="Filter deals by ${v.trim()}"><i class="bi bi-tag-fill me-1 small opacity-75"></i>${v.trim()}</span>`).join(' ')
                     : '<span class="text-muted small">-</span>';
 
                 return `
@@ -2489,30 +2542,89 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         function populateVendorFilter() {
             const select = document.getElementById('vendorFilter');
-            if (!select) return;
-            const currentVal = select.value;
-            const vendorSet = new Set();
+            const pillsGroup = document.getElementById('vendorPillsGroup');
+            const currentVal = select ? select.value : '';
+
+            // Compute vendor counts across allDeals
+            const vendorMap = new Map();
+            // Preset the primary known vendors
+            ["HPE", "Dell", "Veeam", "VMware", "Nutanix"].forEach(v => vendorMap.set(v, 0));
+
             allDeals.forEach(d => {
                 if (d.primary_vendors) {
                     d.primary_vendors.split(',').forEach(v => {
                         const trimmed = v.trim();
-                        if (trimmed) vendorSet.add(trimmed);
+                        if (trimmed) {
+                            vendorMap.set(trimmed, (vendorMap.get(trimmed) || 0) + 1);
+                        }
                     });
                 }
             });
-            const sortedVendors = Array.from(vendorSet).sort();
-            select.innerHTML = '<option value="">All Vendors</option>' + 
-                sortedVendors.map(v => `<option value="${v}">${v}</option>`).join('');
-            if (currentVal && sortedVendors.includes(currentVal)) {
-                select.value = currentVal;
+
+            const sortedVendors = Array.from(vendorMap.keys()).sort();
+
+            if (select) {
+                select.innerHTML = `<option value="">All Vendors (${allDeals.length})</option>` + 
+                    sortedVendors.map(v => `<option value="${v}">${v} (${vendorMap.get(v) || 0})</option>`).join('');
+                if (currentVal && sortedVendors.includes(currentVal)) {
+                    select.value = currentVal;
+                }
             }
+
+            if (pillsGroup) {
+                const isAllActive = !currentVal;
+                let pillsHtml = `
+                    <button type="button" class="btn btn-outline-secondary vendor-pill-btn ${isAllActive ? 'active' : ''}" data-vendor="" onclick="setVendorFilter('', this)">
+                        All Vendors <span class="badge ${isAllActive ? 'bg-light text-dark' : 'bg-secondary'} ms-1 rounded-pill">${allDeals.length}</span>
+                    </button>
+                `;
+                sortedVendors.forEach(v => {
+                    const count = vendorMap.get(v) || 0;
+                    const isActive = currentVal && currentVal.toLowerCase() === v.toLowerCase();
+                    pillsHtml += `
+                        <button type="button" class="btn btn-outline-secondary vendor-pill-btn ${isActive ? 'active' : ''}" data-vendor="${v}" onclick="setVendorFilter('${v}', this)">
+                            ${v} <span class="badge ${isActive ? 'bg-light text-dark' : 'bg-secondary'} ms-1 rounded-pill">${count}</span>
+                        </button>
+                    `;
+                });
+                pillsGroup.innerHTML = pillsHtml;
+            }
+        }
+
+        function setVendorFilter(vendorName, btn) {
+            const select = document.getElementById('vendorFilter');
+            if (select) {
+                select.value = vendorName || '';
+            }
+            syncVendorPillButtons(vendorName || '');
+            applyFilters();
+        }
+
+        function syncVendorPillButtons(vendorName) {
+            const vLower = (vendorName || '').toLowerCase().trim();
+            document.querySelectorAll('#vendorPillsGroup .vendor-pill-btn').forEach(b => {
+                const bVendor = (b.getAttribute('data-vendor') || '').toLowerCase().trim();
+                const badge = b.querySelector('.badge');
+                if (bVendor === vLower) {
+                    b.classList.add('active');
+                    if (badge) badge.className = 'badge bg-light text-dark ms-1 rounded-pill';
+                } else {
+                    b.classList.remove('active');
+                    if (badge) badge.className = 'badge bg-secondary ms-1 rounded-pill';
+                }
+            });
+        }
+
+        function filterByVendorFromAnywhere(vendorName) {
+            switchToDealsTab();
+            setVendorFilter(vendorName);
         }
 
         function setQuickFilter(filterType, btn) {
             currentQuickFilter = filterType;
 
-            // Reset and update button styles
-            document.querySelectorAll('#quickFilterGroup .filter-btn, .filter-btn').forEach(b => {
+            // Reset and update button styles for quickFilterGroup only
+            document.querySelectorAll('#quickFilterGroup .filter-btn, .ms-md-2 .filter-btn').forEach(b => {
                 b.classList.remove('active');
             });
 
@@ -2562,8 +2674,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         function onDropdownFilterChange() {
             const stage = document.getElementById('stageFilter')?.value || '';
             const presales = document.getElementById('presalesFilter')?.value || '';
+            const vendor = document.getElementById('vendorFilter')?.value || '';
 
-            document.querySelectorAll('#quickFilterGroup .filter-btn').forEach(b => b.classList.remove('active'));
+            syncVendorPillButtons(vendor);
+
+            document.querySelectorAll('#quickFilterGroup .filter-btn, .ms-md-2 .filter-btn').forEach(b => b.classList.remove('active'));
 
             if (!stage && !presales) {
                 currentQuickFilter = 'ALL';
@@ -2596,8 +2711,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             document.getElementById('presalesFilter').value = '';
             const vendorFilter = document.getElementById('vendorFilter');
             if (vendorFilter) vendorFilter.value = '';
+            syncVendorPillButtons('');
 
-            document.querySelectorAll('#quickFilterGroup .filter-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('#quickFilterGroup .filter-btn, .ms-md-2 .filter-btn').forEach(b => b.classList.remove('active'));
             const allBtn = document.getElementById('qf-ALL');
             if (allBtn) allBtn.classList.add('active');
 
@@ -2761,7 +2877,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             tbody.innerHTML = deals.map(d => {
                 const stageClass = 'badge-' + d.stage.replace(/[\\s\\/]+/g, '-');
                 const vendorChips = d.primary_vendors 
-                    ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip">${v.trim()}</span>`).join(' ')
+                    ? d.primary_vendors.split(',').map(v => `<span class="vendor-chip" onclick="setVendorFilter('${v.trim()}')" title="Filter deals by ${v.trim()}"><i class="bi bi-tag-fill me-1 small opacity-75"></i>${v.trim()}</span>`).join(' ')
                     : '<span class="text-muted small">-</span>';
 
                 return `
@@ -3024,7 +3140,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def serve_dashboard():
     """Serves the self-contained single-page HTML/Bootstrap CRM dashboard."""
-    return HTML_DASHBOARD
+    return HTMLResponse(
+        content=HTML_DASHBOARD,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # -----------------------------------------------------------------------------

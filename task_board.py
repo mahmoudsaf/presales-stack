@@ -2130,22 +2130,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <table class="table task-table">
                             <thead>
                                 <tr>
-                                    <th class="text-start" style="width: 22%;">Item Title</th>
-                                    <th class="text-start" style="width: 14%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
-                                    <th class="text-start" style="width: 16%;"><i class="bi bi-briefcase me-1 text-success"></i>Deal Name</th>
+                                    <th class="text-start" style="width: 32%;">Item & Deal Name</th>
+                                    <th class="text-start" style="width: 16%;"><i class="bi bi-building me-1 text-primary"></i>Customer Name</th>
                                     <th style="width: 8%;"><i class="bi bi-cpu me-1 text-info"></i>Vendor</th>
                                     <th style="width: 8%;">Assignee</th>
                                     <th style="width: 10%;">Status</th>
                                     <th style="width: 7%;">Priority</th>
                                     <th style="width: 8%;">Timing & Velocity</th>
-                                    <th style="width: 4%;">Due Date</th>
-                                    <th style="width: 3%;">Log</th>
+                                    <th style="width: 5%;">Due Date</th>
+                                    <th style="width: 4%;">Log</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 ${group.tasks.length === 0 ? `
                                     <tr>
-                                        <td colspan="10" class="text-center py-4 text-muted fst-italic">
+                                        <td colspan="9" class="text-center py-4 text-muted fst-italic">
                                             No tasks in this workstream matching filters.
                                         </td>
                                     </tr>
@@ -2223,12 +2222,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             return `
                 <tr>
-                    <!-- 1. Item Title -->
+                    <!-- 1. Item Title & Deal Name (Merged) -->
                     <td class="text-start">
                         <div class="d-flex flex-wrap align-items-center gap-1">
                             <a href="javascript:void(0)" class="fw-semibold text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
                                 ${t.task_title}
                             </a>
+                        </div>
+                        <div class="d-flex flex-wrap align-items-center gap-1 mt-1">
+                            <span class="badge border px-2 py-0.5 d-inline-flex align-items-center gap-1" style="font-size: 0.74rem; font-weight: 500; background-color: #f8fafc; color: #0f172a; border-color: #cbd5e1 !important;" title="Associated Deal: ${dealDisplay}">
+                                <i class="bi bi-briefcase text-success"></i>
+                                ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.68rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}
+                                <span class="text-truncate" style="max-width: 280px;">${dealDisplay}</span>
+                            </span>
                         </div>
                         ${blockerDisplay}
                     </td>
@@ -2244,16 +2250,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </div>
                     </td>
 
-                    <!-- 3. Deal Name -->
-                    <td class="text-start">
-                        <span class="badge border px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.82rem; font-weight: 600; background-color: #f8fafc; color: #0f172a; border-color: #cbd5e1 !important;" title="Deal: ${dealDisplay}">
-                            <i class="bi bi-briefcase text-success"></i>
-                            ${t.related_deal_id ? `<span class="badge bg-primary-subtle text-primary border me-1" style="font-size: 0.7rem; font-family: monospace;">#${t.related_deal_id}</span>` : ''}
-                            <span class="text-truncate" style="max-width: 150px;">${dealDisplay}</span>
-                        </span>
-                    </td>
-
-                    <!-- 4. Vendor -->
+                    <!-- 3. Vendor -->
                     <td>
                         <span class="badge vendor-badge ${vendorClass}" onclick="setVendorFilter('${vendorDomain}')" style="cursor: pointer;" title="Click to filter by ${vendorDomain}">
                             <i class="bi bi-cpu me-1"></i>${vendorDomain}

@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from customer_matcher import compute_customer_similarity, find_similar_customer, normalize_arabic
+
 # -----------------------------------------------------------------------------
 # Configuration & Constants
 # -----------------------------------------------------------------------------
@@ -719,22 +721,56 @@ def get_customer(customer_id: int):
 def create_customer(payload: CustomerCreate):
     """
     Creates a new customer account directly.
-    Checks for duplicate company name (case-insensitive).
+    Checks for duplicate or similar company name (bilingual & normalized).
+    If a similar customer exists, enriches missing contact details and returns
+    the existing record instead of creating a duplicate.
     """
     clean_company = payload.company_name.strip()
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT customer_id FROM customers WHERE LOWER(company_name) = LOWER(?);",
-        (clean_company,),
-    )
-    existing = cursor.fetchone()
+    existing = find_similar_customer(clean_company, cursor, threshold=0.80)
     if existing:
+        customer_id = existing["customer_id"]
+        # Enrich missing contact details if provided
+        update_fields = []
+        params = []
+        if payload.contact_name and not existing["contact_name"]:
+            update_fields.append("contact_name = ?")
+            params.append(payload.contact_name.strip())
+        if payload.contact_email and not existing["contact_email"]:
+            update_fields.append("contact_email = ?")
+            params.append(payload.contact_email.strip())
+        if payload.contact_phone and not existing["contact_phone"]:
+            update_fields.append("contact_phone = ?")
+            params.append(payload.contact_phone.strip())
+        if update_fields:
+            params.append(customer_id)
+            cursor.execute(f"UPDATE customers SET {', '.join(update_fields)} WHERE customer_id = ?;", params)
+            conn.commit()
+
+        # Fetch aggregated record for existing customer
+        cursor.execute("""
+            SELECT 
+                c.customer_id, c.company_name, c.contact_name, c.contact_email, c.contact_phone,
+                COUNT(d.deal_id) AS total_deals,
+                COALESCE(SUM(d.estimated_value), 0.0) AS total_pipeline
+            FROM customers c
+            LEFT JOIN deals d ON c.customer_id = d.customer_id
+            WHERE c.customer_id = ?
+            GROUP BY c.customer_id;
+        """, (customer_id,))
+        row = cursor.fetchone()
         conn.close()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Customer account with company name '{clean_company}' already exists (ID #{existing['customer_id']})."
+
+        return CustomerOut(
+            customer_id=row["customer_id"],
+            company_name=row["company_name"],
+            contact_name=row["contact_name"],
+            contact_email=row["contact_email"],
+            contact_phone=row["contact_phone"],
+            total_deals=row["total_deals"],
+            total_pipeline=row["total_pipeline"],
         )
 
     cursor.execute(
@@ -782,10 +818,14 @@ def update_customer(customer_id: int, payload: CustomerUpdate):
     if payload.company_name is not None:
         clean_name = payload.company_name.strip()
         if clean_name.lower() != old_company_name.lower():
-            cursor.execute("SELECT customer_id FROM customers WHERE LOWER(company_name) = LOWER(?) AND customer_id != ?;", (clean_name, customer_id))
-            if cursor.fetchone():
-                conn.close()
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Another customer with company name '{clean_name}' already exists.")
+            cursor.execute("SELECT customer_id, company_name FROM customers WHERE customer_id != ?;", (customer_id,))
+            for oc in cursor.fetchall():
+                if compute_customer_similarity(clean_name, oc["company_name"]) >= 0.85:
+                    conn.close()
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Cannot rename customer: name '{clean_name}' is too similar to existing customer '{oc['company_name']}' (ID #{oc['customer_id']})."
+                    )
         updates.append("company_name = ?")
         params.append(clean_name)
         new_company_name = clean_name
@@ -927,13 +967,9 @@ def create_deal(payload: DealCreate):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Customer deduplication/lookup
+    # 1. Customer deduplication/lookup with bilingual similarity matching
     clean_company = payload.company_name.strip()
-    cursor.execute(
-        "SELECT customer_id, contact_name, contact_email, contact_phone FROM customers WHERE LOWER(company_name) = LOWER(?);",
-        (clean_company,),
-    )
-    existing_customer = cursor.fetchone()
+    existing_customer = find_similar_customer(clean_company, cursor, threshold=0.80)
 
     if existing_customer:
         customer_id = existing_customer["customer_id"]
@@ -1196,11 +1232,14 @@ def delete_deal(deal_id: int):
     conn.commit()
     conn.close()
 
-    # If tasks.db exists, unlink tasks associated with this deal
+    # If tasks.db exists, delete tasks associated with this deal
     if TASKS_DB_FILE.exists():
         try:
             t_conn = sqlite3.connect(TASKS_DB_FILE)
-            t_conn.execute("UPDATE tasks SET related_deal_id = NULL WHERE related_deal_id = ?;", (deal_id,))
+            t_conn.execute(
+                "DELETE FROM tasks WHERE related_deal_id = ? OR (related_deal_id IS NULL AND deal_name = ?);",
+                (deal_id, deal["deal_name"]),
+            )
             t_conn.commit()
             t_conn.close()
         except Exception:

@@ -105,6 +105,8 @@ def init_db():
         cursor.execute("ALTER TABLE tasks ADD COLUMN deal_category TEXT;")
     if "closing_date" not in existing_cols:
         cursor.execute("ALTER TABLE tasks ADD COLUMN closing_date TEXT;")
+    if "previous_task_id" not in existing_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN previous_task_id INTEGER REFERENCES tasks(task_id);")
 
     # Activity event log table for full lifecycle tracking
     cursor.execute("""
@@ -414,6 +416,17 @@ class TaskBase(BaseModel):
     priority: Union[TaskPriority, str] = Field(default=TaskPriority.MEDIUM, description="Task urgency")
     due_date: Optional[str] = Field(None, description="Target completion date (YYYY-MM-DD)")
     management_blockers: Optional[str] = Field(None, description="Escalations, vendor delays, or blockers")
+    previous_task_id: Optional[Union[int, str]] = Field(None, description="Previous/parent task ID in deal execution chain")
+
+    @field_validator("previous_task_id", mode="before")
+    @classmethod
+    def normalize_previous_task_id(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, int):
+            return v
+        nums = re.findall(r"\d+", str(v))
+        return int(nums[0]) if nums else None
 
     @field_validator("task_title", mode="before")
     @classmethod
@@ -543,6 +556,7 @@ class TaskUpdate(BaseModel):
     priority: Optional[Union[TaskPriority, str]] = None
     due_date: Optional[str] = None
     management_blockers: Optional[str] = None
+    previous_task_id: Optional[Union[int, str]] = None
     changed_by: Optional[str] = Field(default="Voice Agent", description="User or agent moving the task")
 
     @model_validator(mode="before")
@@ -552,6 +566,16 @@ class TaskUpdate(BaseModel):
             if "title" in data and "task_title" not in data:
                 data["task_title"] = data["title"]
         return data
+
+    @field_validator("previous_task_id", mode="before")
+    @classmethod
+    def normalize_previous_task_id(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, int):
+            return v
+        nums = re.findall(r"\d+", str(v))
+        return int(nums[0]) if nums else None
 
     @field_validator("task_title", mode="before")
     @classmethod
@@ -675,6 +699,17 @@ class TaskStatusPatch(BaseModel):
         return TaskStatus.NOT_STARTED
 
 
+class TaskCompleteAndNext(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    next_task_title: str
+    assigned_to: Optional[Union[PresalesRep, str]] = None
+    vendor_domain: Optional[Union[VendorDomain, str]] = None
+    priority: Optional[Union[TaskPriority, str]] = None
+    due_date: Optional[str] = None
+    management_blockers: Optional[str] = None
+    changed_by: Optional[str] = Field(default="Voice Agent", description="User or agent recording the transition")
+
+
 class TaskOut(TaskBase):
     task_id: int
     started_at: Optional[str] = None
@@ -731,6 +766,7 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, Any]]] 
     c_id = row["customer_id"] if "customer_id" in cols and row["customer_id"] else None
     d_cat = row["deal_category"] if "deal_category" in cols and row["deal_category"] else None
     d_close = row["closing_date"] if "closing_date" in cols and row["closing_date"] else None
+    prev_task = row["previous_task_id"] if "previous_task_id" in cols and row["previous_task_id"] else None
 
     rel_deal = row["related_deal_id"]
     if rel_deal:
@@ -785,6 +821,7 @@ def row_to_task(row: sqlite3.Row, deal_map: Optional[Dict[int, Dict[str, Any]]] 
         priority=row["priority"],
         due_date=row["due_date"],
         management_blockers=row["management_blockers"],
+        previous_task_id=prev_task,
         started_at=started_at,
         completed_at=completed_at,
         lead_time=lead_time,
@@ -1013,8 +1050,8 @@ def create_task(payload: TaskCreate):
     cursor.execute(
         """
         INSERT INTO tasks (
-            task_title, category, related_deal_id, customer_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, deal_category, closing_date, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            task_title, category, related_deal_id, customer_id, deal_name, customer_name, assigned_to, vendor_domain, status, priority, due_date, management_blockers, started_at, completed_at, deal_category, closing_date, previous_task_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             payload.task_title.strip(),
@@ -1033,6 +1070,7 @@ def create_task(payload: TaskCreate):
             completed_at,
             deal_cat,
             closing_dt,
+            payload.previous_task_id,
             now_iso,
             now_iso,
         ),
@@ -1163,6 +1201,10 @@ def update_task(task_id: int, payload: TaskUpdate):
         update_clauses.append("management_blockers = ?")
         params.append(payload.management_blockers.strip() if payload.management_blockers else None)
 
+    if payload.previous_task_id is not None:
+        update_clauses.append("previous_task_id = ?")
+        params.append(payload.previous_task_id)
+
     # Status transition & lifecycle timestamp handling
     new_status = payload.status.value if hasattr(payload.status, "value") else (str(payload.status) if payload.status is not None else None)
     if new_status is not None:
@@ -1221,6 +1263,70 @@ def patch_task_status(task_id: int, payload: TaskStatusPatch):
     return update_task(task_id, TaskUpdate(status=payload.status, changed_by=payload.changed_by))
 
 
+@app.get("/api/deals/{deal_id}/tasks", response_model=List[TaskOut], tags=["Tasks", "Deals"])
+def get_deal_tasks_history(deal_id: int):
+    """
+    Returns all historical and active tasks associated with a specific deal in chronological order.
+    Enables viewing the full progression lineage (completed, in parallel, and latest).
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM tasks WHERE related_deal_id = ? ORDER BY task_id ASC;",
+        (deal_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    deal_map = get_deal_customer_map()
+    return [row_to_task(r, deal_map) for r in rows]
+
+
+@app.post("/api/tasks/{task_id}/complete-and-next", response_model=TaskOut, status_code=status.HTTP_201_CREATED, tags=["Tasks"])
+def complete_and_next_task(task_id: int, payload: TaskCompleteAndNext):
+    """
+    Atomically marks the current task as 'Completed' and creates the next chained task
+    linked to the same deal under the previous task (previous_task_id = task_id).
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tasks WHERE task_id = ?;", (task_id,))
+    parent_row = cursor.fetchone()
+    if not parent_row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Parent task #{task_id} not found.")
+    conn.close()
+
+    # 1. Mark parent task as Completed
+    update_task(task_id, TaskUpdate(status=TaskStatus.COMPLETED, changed_by=payload.changed_by))
+
+    # 2. Create chained next task under the same deal with previous_task_id = task_id
+    parent_dict = dict(parent_row)
+    assigned_val = payload.assigned_to or parent_dict.get("assigned_to") or "Presales 1"
+    vendor_val = payload.vendor_domain or parent_dict.get("vendor_domain") or "General"
+    priority_val = payload.priority or parent_dict.get("priority") or "Medium"
+
+    new_task = TaskCreate(
+        task_title=payload.next_task_title.strip(),
+        category=parent_dict.get("category") or TaskCategory.GENERAL_ACTION,
+        deal_category=parent_dict.get("deal_category"),
+        closing_date=parent_dict.get("closing_date"),
+        related_deal_id=parent_dict.get("related_deal_id"),
+        customer_id=parent_dict.get("customer_id"),
+        deal_name=parent_dict.get("deal_name"),
+        customer_name=parent_dict.get("customer_name"),
+        assigned_to=assigned_val,
+        vendor_domain=vendor_val,
+        status=TaskStatus.IN_PROGRESS,
+        priority=priority_val,
+        due_date=payload.due_date,
+        management_blockers=payload.management_blockers,
+        previous_task_id=task_id,
+        changed_by=payload.changed_by,
+    )
+    return create_task(new_task)
+
+
 @app.get("/api/deals-lookup", tags=["Deals"])
 def get_deals_lookup():
     """Returns simplified deal and customer list for task linking dropdowns and deal-centric board grouping."""
@@ -1257,6 +1363,55 @@ def delete_task(task_id: int):
     conn.commit()
     conn.close()
     return None
+
+
+@app.delete("/api/deals/{deal_id}", tags=["Deals"])
+def delete_deal_and_tasks(deal_id: int):
+    """
+    Deletes a deal from CRM (if crm.db is present)
+    and permanently deletes all tasks associated with that deal from tasks.db.
+    """
+    deal_name = ""
+    # 1. Fetch deal name and delete deal from crm.db
+    if CRM_DB_FILE.exists():
+        try:
+            crm_conn = sqlite3.connect(CRM_DB_FILE)
+            crm_cur = crm_conn.cursor()
+            crm_cur.execute("SELECT deal_name FROM deals WHERE deal_id = ?;", (deal_id,))
+            d_row = crm_cur.fetchone()
+            if d_row:
+                deal_name = d_row[0]
+                crm_cur.execute("DELETE FROM deals WHERE deal_id = ?;", (deal_id,))
+                crm_conn.commit()
+            crm_conn.close()
+        except Exception as e:
+            print(f"Warning: could not delete deal #{deal_id} from crm.db: {e}")
+
+    # 2. Delete all tasks associated with this deal from tasks.db
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if deal_name:
+        cursor.execute(
+            "SELECT task_id FROM tasks WHERE related_deal_id = ? OR (related_deal_id IS NULL AND deal_name = ?);",
+            (deal_id, deal_name),
+        )
+    else:
+        cursor.execute("SELECT task_id FROM tasks WHERE related_deal_id = ?;", (deal_id,))
+    task_ids = [r[0] for r in cursor.fetchall()]
+
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        cursor.execute(f"DELETE FROM tasks WHERE task_id IN ({placeholders});", task_ids)
+        conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "message": f"Deal #{deal_id} '{deal_name}' and all {len(task_ids)} associated task(s) deleted successfully.",
+        "deal_id": deal_id,
+        "tasks_deleted": len(task_ids),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -1907,6 +2062,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <input type="date" id="editDueDate" class="form-control">
                             </div>
                             <div class="col-12" id="editDealBannerContainer"></div>
+
+                            <!-- Historical Tasks & Progression Lineage for this Deal -->
+                            <div class="col-12" id="dealTaskHistoryContainer" style="display: none;">
+                                <div class="card border rounded-3 overflow-hidden bg-light shadow-none">
+                                    <div class="card-header bg-white py-2 px-3 d-flex align-items-center justify-content-between border-bottom">
+                                        <div class="d-flex align-items-center gap-2">
+                                            <i class="bi bi-diagram-3-fill text-primary"></i>
+                                            <span class="fw-bold small text-dark">Deal Task History & Timeline</span>
+                                            <span class="badge bg-secondary-subtle text-dark border ms-1" id="dealHistoryTaskCount">0 Tasks</span>
+                                        </div>
+                                        <button type="button" class="btn btn-sm btn-outline-success py-1 px-2 fw-semibold d-inline-flex align-items-center gap-1" style="font-size: 0.76rem;" onclick="openCompleteAndNextFromEdit()" title="Mark current task completed and launch next chained step">
+                                            <i class="bi bi-check2-circle"></i>Mark Done & Add Next Step
+                                        </button>
+                                    </div>
+                                    <div class="card-body p-2" id="dealTaskHistoryList" style="max-height: 220px; overflow-y: auto;">
+                                        <!-- Dynamically rendered timeline items -->
+                                    </div>
+                                </div>
+                            </div>
+
                             <div class="col-12">
                                 <label class="form-label small fw-semibold">Management Blockers</label>
                                 <textarea id="editBlockers" class="form-control" rows="3"></textarea>
@@ -1953,6 +2128,76 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Complete & Next Task Chaining Modal -->
+    <div class="modal fade" id="completeAndNextModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-md">
+            <div class="modal-content" style="border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
+                <form id="completeAndNextForm" onsubmit="submitCompleteAndNext(event)">
+                    <div class="modal-header border-0 pb-0">
+                        <div>
+                            <h5 class="modal-title fw-bold text-success d-flex align-items-center gap-2">
+                                <i class="bi bi-arrow-right-circle-fill"></i>Mark Completed & Add Next Step
+                            </h5>
+                            <div class="small text-muted" id="completeAndNextParentLabel">Chaining under current task</div>
+                        </div>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body p-4">
+                        <input type="hidden" id="chainParentTaskId">
+                        <div class="alert alert-success py-2 px-3 small mb-3 border-0 bg-success-subtle text-success-emphasis">
+                            <i class="bi bi-check2-all me-1"></i>Current task will be marked <strong>Completed</strong>, and this new task will be linked to the <strong>same deal</strong> under it.
+                        </div>
+                        <div class="row g-3">
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Next Step Description (What it's about / Spoken Action) *</label>
+                                <input type="text" id="chainNextTitle" class="form-control" placeholder="e.g. توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Presales Assignee *</label>
+                                <select id="chainNextAssigned" class="form-select" required>
+                                    <option value="Presales 1">Presales 1</option>
+                                    <option value="Presales 2">Presales 2</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Vendor Domain *</label>
+                                <select id="chainNextVendor" class="form-select" required>
+                                    <option value="General">General</option>
+                                    <option value="HPE">HPE</option>
+                                    <option value="Dell">Dell</option>
+                                    <option value="Veeam">Veeam</option>
+                                    <option value="VMware">VMware</option>
+                                    <option value="Nutanix">Nutanix</option>
+                                    <option value="Cisco">Cisco</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Priority *</label>
+                                <select id="chainNextPriority" class="form-select" required>
+                                    <option value="High">High</option>
+                                    <option value="Medium" selected>Medium</option>
+                                    <option value="Low">Low</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small fw-semibold">Due Date</label>
+                                <input type="date" id="chainNextDueDate" class="form-control">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small fw-semibold">Management Blockers / Notes</label>
+                                <input type="text" id="chainNextBlockers" class="form-control" placeholder="Optional blockers or partner dependencies">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer border-0 pt-0">
+                        <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-success fw-semibold"><i class="bi bi-check2-circle me-1"></i>Complete & Launch Next Step</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <!-- Bootstrap Bundle JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
@@ -1966,6 +2211,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
         const historyModal = new bootstrap.Modal(document.getElementById('historyModal'));
+        const chainModal = new bootstrap.Modal(document.getElementById('completeAndNextModal'));
 
         const STATUS_FLOW = ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"];
         const PRIORITY_FLOW = ["Low", "Medium", "High"];
@@ -2415,16 +2661,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             // Render each Deal as a section containing its tasks (Deals > Tasks > Presales 1 or 2)
             tabDeals.forEach(deal => {
                 const dealTasks = filtered.filter(t => t.related_deal_id === deal.deal_id || (!t.related_deal_id && t.deal_name && t.deal_name === deal.deal_name));
+                dealTasks.sort((a, b) => a.task_id - b.task_id);
                 const totalTasks = dealTasks.length;
                 const completedTasks = dealTasks.filter(t => t.status === 'Completed').length;
                 const inProgressTasks = dealTasks.filter(t => t.status === 'In Progress' || t.status === 'Waiting on Vendor' || t.status === 'Pending Review').length;
                 const progressPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+                const latestDealTask = totalTasks > 0 ? dealTasks[totalTasks - 1] : null;
+                const latestTaskId = latestDealTask ? latestDealTask.task_id : null;
 
                 const progressColor = progressPct === 100 ? 'bg-success' : (progressPct >= 50 ? 'bg-primary' : (progressPct > 0 ? 'bg-warning' : 'bg-secondary'));
 
                 const closingBadge = deal.closing_date ? `
                     <span class="badge bg-danger-subtle text-danger border border-danger-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem; font-weight: 700;" title="RFP Submission Deadline">
                         <i class="bi bi-alarm-fill"></i>Closing: ${deal.closing_date}
+                    </span>
+                ` : '';
+
+                const latestHeaderBadge = latestDealTask ? `
+                    <span class="badge bg-primary text-white border py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.75rem;" title="Latest identified front-line task in record">
+                        <i class="bi bi-star-fill text-warning"></i>Latest Record: #${latestDealTask.task_id}
                     </span>
                 ` : '';
 
@@ -2444,6 +2699,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     </span>
                                     ${getCategoryBadge(deal.deal_category)}
                                     ${closingBadge}
+                                    ${latestHeaderBadge}
                                     <span class="badge bg-light text-secondary border px-2 py-1" style="font-size: 0.75rem;">
                                         <i class="bi bi-person-fill text-primary me-1"></i>Lead: <strong class="text-dark">${deal.assigned_presales || 'Presales 1'}</strong>
                                     </span>
@@ -2454,6 +2710,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <div class="d-flex align-items-center gap-2">
                                     <button class="btn btn-sm btn-outline-primary fw-semibold d-inline-flex align-items-center gap-1" onclick="openNewTaskModalWithDeal(${deal.deal_id})" title="Add a task under this deal">
                                         <i class="bi bi-plus-circle"></i>Add Task
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-danger fw-semibold d-inline-flex align-items-center gap-1" onclick="deleteDealWithTasks(${deal.deal_id}, ${JSON.stringify(deal.deal_name).replace(/"/g, '&quot;')}, ${totalTasks})" title="Delete this deal and all its tasks">
+                                        <i class="bi bi-trash3"></i>Delete Deal
                                     </button>
                                 </div>
                             </div>
@@ -2469,7 +2728,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                         </strong>
                                     </div>
                                     <div class="small text-muted">
-                                        ${totalTasks === 0 ? '<span class="fst-italic text-secondary">No tasks recorded yet</span>' : `<span class="fw-semibold text-dark">${inProgressTasks}</span> in-flight / pending`}
+                                        ${totalTasks === 0 ? '<span class="fst-italic text-secondary">No tasks recorded yet</span>' : `<span class="fw-semibold text-dark">${inProgressTasks}</span> in-flight / parallel (${completedTasks} completed)`}
                                     </div>
                                 </div>
                                 <div class="progress" style="height: 10px; border-radius: 6px; background-color: #e2e8f0;">
@@ -2497,17 +2756,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <table class="table task-table mb-0 align-middle">
                                         <thead class="bg-light text-muted small text-uppercase" style="font-size: 0.72rem; letter-spacing: 0.5px;">
                                             <tr>
-                                                <th class="text-start ps-3" style="width: 32%;"><i class="bi bi-card-text me-1 text-primary"></i>Task Description (Spoken Action / What it's about)</th>
-                                                <th style="width: 14%;"><i class="bi bi-person-badge me-1 text-info"></i>Presales Assignee</th>
+                                                <th class="text-start ps-3" style="width: 34%;"><i class="bi bi-card-text me-1 text-primary"></i>Task Description (Spoken Action / What it's about)</th>
+                                                <th style="width: 13%;"><i class="bi bi-person-badge me-1 text-info"></i>Presales Assignee</th>
                                                 <th style="width: 10%;"><i class="bi bi-cpu me-1 text-secondary"></i>Vendor</th>
-                                                <th style="width: 18%;"><i class="bi bi-arrow-repeat me-1 text-primary"></i>Status / Progress</th>
+                                                <th style="width: 17%;"><i class="bi bi-arrow-repeat me-1 text-primary"></i>Status / Progress</th>
                                                 <th style="width: 8%;"><i class="bi bi-flag me-1"></i>Priority</th>
                                                 <th style="width: 10%;"><i class="bi bi-calendar-event me-1"></i>Due Date</th>
                                                 <th class="text-end pe-3" style="width: 8%;">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            ${dealTasks.map(t => renderDealTaskRow(t)).join('')}
+                                            ${dealTasks.map(t => renderDealTaskRow(t, t.task_id === latestTaskId, inProgressTasks > 1)).join('')}
                                         </tbody>
                                     </table>
                                 </div>
@@ -2553,17 +2812,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <table class="table task-table mb-0 align-middle">
                                     <thead class="bg-light text-muted small text-uppercase" style="font-size: 0.72rem;">
                                         <tr>
-                                            <th class="text-start ps-3" style="width: 32%;">Task Description</th>
-                                            <th style="width: 14%;">Presales Assignee</th>
+                                            <th class="text-start ps-3" style="width: 34%;">Task Description</th>
+                                            <th style="width: 13%;">Presales Assignee</th>
                                             <th style="width: 10%;">Vendor</th>
-                                            <th style="width: 18%;">Status / Progress</th>
+                                            <th style="width: 17%;">Status / Progress</th>
                                             <th style="width: 8%;">Priority</th>
                                             <th style="width: 10%;">Due Date</th>
                                             <th class="text-end pe-3" style="width: 8%;">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        ${unlinkedTasks.map(t => renderDealTaskRow(t)).join('')}
+                                        ${unlinkedTasks.map(t => renderDealTaskRow(t, false, false)).join('')}
                                     </tbody>
                                 </table>
                             </div>
@@ -2575,7 +2834,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             container.innerHTML = html;
         }
 
-        function renderDealTaskRow(t) {
+        function renderDealTaskRow(t, isLatest = false, isParallel = false) {
             const statusClass = 'status-' + (t.status || 'Not-Started').replace(/\\s+/g, '-');
             const priorityClass = 'priority-' + (t.priority || 'Medium');
 
@@ -2587,6 +2846,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const vendorClass = 'vendor-' + vendorDomain;
 
             const isDone = t.status === 'Completed';
+
+            const latestBadge = isLatest 
+                ? `<span class="badge bg-primary text-white py-1 px-2 ms-2" style="font-size: 0.70rem;" title="Latest Identified Task in Record for this deal"><i class="bi bi-star-fill text-warning me-1"></i>Latest Task</span>` 
+                : '';
+
+            const parallelBadge = (!isLatest && !isDone && isParallel)
+                ? `<span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2 ms-2" style="font-size: 0.70rem;" title="Working concurrently in parallel"><i class="bi bi-lightning-charge-fill me-1"></i>In Parallel</span>`
+                : '';
+
+            const chainedIndicator = t.previous_task_id 
+                ? `<div class="small text-muted mt-1" style="font-size: 0.74rem;"><i class="bi bi-arrow-return-right text-primary me-1"></i>Follow-up to Task #${t.previous_task_id}</div>` 
+                : '';
 
             return `
                 <tr class="${isDone ? 'table-light bg-opacity-50' : ''}">
@@ -2600,10 +2871,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                 <i class="bi ${isDone ? 'bi-check-lg text-white' : 'bi-check'}"></i>
                             </button>
                             <div>
-                                <a href="javascript:void(0)" class="text-dark text-decoration-none fw-medium ${isDone ? 'text-decoration-line-through text-muted' : ''}" 
-                                   onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task details">
-                                    ${t.task_title}
-                                </a>
+                                <div class="d-inline-flex align-items-center flex-wrap">
+                                    <a href="javascript:void(0)" class="text-dark text-decoration-none fw-medium ${isDone ? 'text-decoration-line-through text-muted' : ''}" 
+                                       onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task details">
+                                        ${t.task_title}
+                                    </a>
+                                    ${latestBadge}
+                                    ${parallelBadge}
+                                </div>
+                                ${chainedIndicator}
                                 ${blockerDisplay}
                             </div>
                         </div>
@@ -2655,6 +2931,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <!-- 7. Actions -->
                     <td class="text-end pe-3">
                         <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-success py-1 px-2" title="Mark Done & Add Next Step" onclick="openCompleteAndNextModal(${t.task_id}, '${t.task_title.replace(/'/g, "\\'")}', '${t.assigned_to}', '${t.vendor_domain}')">
+                                <i class="bi bi-check2-circle"></i>
+                            </button>
                             <button class="btn btn-outline-secondary py-1 px-2" title="Edit Task" onclick="openEditTaskModal(${t.task_id})">
                                 <i class="bi bi-pencil"></i>
                             </button>
@@ -2690,6 +2969,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 }
             } catch (err) {
                 console.error("Error deleting task:", err);
+            }
+        }
+
+        async function deleteDealWithTasks(dealId, dealName, taskCount) {
+            const confirmMsg = taskCount > 0
+                ? `Are you sure you want to permanently delete Deal #${dealId} "${dealName}" and ALL of its ${taskCount} associated task(s)?\n\nThis will delete the deal and its tasks permanently.`
+                : `Are you sure you want to permanently delete Deal #${dealId} "${dealName}"?`;
+
+            if (!confirm(confirmMsg)) return;
+
+            try {
+                const res = await fetch(`/api/deals/${dealId}`, { method: 'DELETE' });
+                if (res.ok) {
+                    await loadTasks();
+                } else {
+                    const err = await res.json().catch(() => ({ detail: 'Failed to delete deal.' }));
+                    alert(err.detail || 'Failed to delete deal.');
+                }
+            } catch (err) {
+                console.error("Error deleting deal and tasks:", err);
+                alert("Network error deleting deal: " + err.message);
             }
         }
 
@@ -2999,8 +3299,115 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 document.getElementById('editClosingDateDisplay').innerHTML = `<span class="badge bg-danger-subtle text-danger border border-danger-subtle px-2 py-1"><i class="bi bi-alarm-fill me-1"></i>Closing: ${task.closing_date}</span>`;
             }
 
+            // Render Deal Task History & Timeline
+            const dealId = task.related_deal_id;
+            const historyContainer = document.getElementById('dealTaskHistoryContainer');
+            const historyList = document.getElementById('dealTaskHistoryList');
+            const historyCount = document.getElementById('dealHistoryTaskCount');
+
+            if (dealId) {
+                historyContainer.style.display = 'block';
+                const dealTasks = allTasks.filter(t => t.related_deal_id === dealId).sort((a, b) => a.task_id - b.task_id);
+                const latestId = dealTasks.length > 0 ? dealTasks[dealTasks.length - 1].task_id : null;
+                const completedCount = dealTasks.filter(t => t.status === 'Completed').length;
+                const inProgressCount = dealTasks.filter(t => t.status !== 'Completed').length;
+                historyCount.textContent = `${dealTasks.length} Tasks (${completedCount} Done, ${inProgressCount} Active)`;
+
+                if (dealTasks.length === 0) {
+                    historyList.innerHTML = `<div class="text-center text-muted small py-2">No other tasks identified for this deal.</div>`;
+                } else {
+                    historyList.innerHTML = dealTasks.map(t => {
+                        const isCurrent = t.task_id === taskId;
+                        const isLatest = t.task_id === latestId;
+                        const isCompleted = t.status === 'Completed';
+
+                        let badgeHtml = '';
+                        if (isCompleted) {
+                            badgeHtml = `<span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2" style="font-size: 0.72rem;"><i class="bi bi-check2-all me-1"></i>Completed</span>`;
+                        } else if (isLatest) {
+                            badgeHtml = `<span class="badge bg-primary text-white py-1 px-2" style="font-size: 0.72rem;"><i class="bi bi-star-fill text-warning me-1"></i>Latest Task in Record</span>`;
+                        } else {
+                            badgeHtml = `<span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2" style="font-size: 0.72rem;"><i class="bi bi-lightning-charge-fill me-1"></i>In Parallel (${t.status})</span>`;
+                        }
+
+                        const chainedNote = t.previous_task_id ? `<small class="text-muted d-block" style="font-size: 0.72rem;"><i class="bi bi-arrow-return-right text-primary me-1"></i>Follow-up to Task #${t.previous_task_id}</small>` : '';
+
+                        return `
+                            <div class="p-2 mb-2 rounded border ${isCurrent ? 'bg-primary-subtle border-primary' : 'bg-white'} d-flex align-items-center justify-content-between gap-2" style="font-size: 0.8rem;">
+                                <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 0;">
+                                    <span class="badge ${isCurrent ? 'bg-primary text-white' : 'bg-light text-dark border'}" style="font-family: monospace;">#${t.task_id}</span>
+                                    <div class="text-truncate">
+                                        <span class="fw-semibold ${isCompleted ? 'text-decoration-line-through text-muted' : 'text-dark'}">${t.task_title}</span>
+                                        ${chainedNote}
+                                    </div>
+                                </div>
+                                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                                    <span class="badge bg-light text-secondary border py-1 px-2" style="font-size: 0.72rem;"><i class="bi bi-person me-1"></i>${t.assigned_to}</span>
+                                    ${badgeHtml}
+                                    ${!isCurrent ? `<button type="button" class="btn btn-xs btn-outline-primary py-0 px-2" style="font-size: 0.72rem;" onclick="openEditTaskModal(${t.task_id})">Inspect</button>` : `<span class="badge bg-primary text-white" style="font-size: 0.7rem;">Active</span>`}
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+            } else {
+                historyContainer.style.display = 'none';
+            }
+
             updateEditBanner();
             editModal.show();
+        }
+
+        function openCompleteAndNextFromEdit() {
+            const taskId = parseInt(document.getElementById('editTaskId').value);
+            const title = document.getElementById('editTitle').value;
+            const assigned = document.getElementById('editAssigned').value;
+            const vendor = document.getElementById('editVendor').value;
+            editModal.hide();
+            openCompleteAndNextModal(taskId, title, assigned, vendor);
+        }
+
+        function openCompleteAndNextModal(taskId, taskTitle, assigned, vendor) {
+            document.getElementById('chainParentTaskId').value = taskId;
+            document.getElementById('completeAndNextParentLabel').textContent = `Parent Step #${taskId}: ${taskTitle}`;
+            document.getElementById('chainNextTitle').value = '';
+            document.getElementById('chainNextAssigned').value = assigned || 'Presales 1';
+            document.getElementById('chainNextVendor').value = vendor || 'General';
+            document.getElementById('chainNextPriority').value = 'Medium';
+            document.getElementById('chainNextDueDate').value = '';
+            document.getElementById('chainNextBlockers').value = '';
+            chainModal.show();
+        }
+
+        async function submitCompleteAndNext(e) {
+            e.preventDefault();
+            const parentId = document.getElementById('chainParentTaskId').value;
+            const payload = {
+                next_task_title: document.getElementById('chainNextTitle').value,
+                assigned_to: document.getElementById('chainNextAssigned').value,
+                vendor_domain: document.getElementById('chainNextVendor').value,
+                priority: document.getElementById('chainNextPriority').value,
+                due_date: document.getElementById('chainNextDueDate').value || null,
+                management_blockers: document.getElementById('chainNextBlockers').value || null,
+                changed_by: "Task Board UI"
+            };
+
+            try {
+                const res = await fetch(`/api/tasks/${parentId}/complete-and-next`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (res.ok) {
+                    chainModal.hide();
+                    await loadTasks();
+                } else {
+                    const err = await res.json();
+                    alert('Error chaining task: ' + JSON.stringify(err));
+                }
+            } catch (err) {
+                console.error("Failed to complete and chain task:", err);
+            }
         }
 
         async function submitEditTask(e) {

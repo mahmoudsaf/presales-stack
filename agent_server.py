@@ -16,6 +16,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from customer_matcher import compute_customer_similarity, normalize_arabic
+
 # -----------------------------------------------------------------------------
 # Configuration & Persistence
 # -----------------------------------------------------------------------------
@@ -586,14 +588,22 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # 10. Changed By
     p["changed_by"] = p.get("changed_by") or "Voice Agent"
+
+    # 11. Previous Task ID
+    prev_tid = p.get("previous_task_id")
+    if prev_tid is not None and str(prev_tid).strip():
+        digits = re.findall(r"\d+", str(prev_tid))
+        p["previous_task_id"] = int(digits[0]) if digits else None
+    else:
+        p["previous_task_id"] = None
     return p
 
 
-def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: List[Dict[str, Any]], baseline_tasks: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """
     Ensures that EVERY actionable deliverable, tender, or next step mentioned in the conversation
     is captured as a task in task_updates, eliminating gaps between executive report and task board.
-    Attaches deal_id, deal_name, customer_name, deal_category, and closing_date to tasks for full cross-system linkage.
+    Attaches deal_id, deal_name, customer_name, deal_category, closing_date, and previous_task_id to tasks for full cross-system linkage.
     """
     task_updates = list(ai_data.get("task_updates", []))
     existing_titles = [str(item.get("payload", {}).get("task_title", "")).lower() for item in task_updates]
@@ -602,6 +612,26 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     exec_report = ai_data.get("executive_report", {})
     actions = exec_report.get("tomorrow_actions", [])
     progress = exec_report.get("today_progress", [])
+
+    # Map deals to their latest known task ID for chaining
+    deal_latest_task_ids: Dict[int, int] = {}
+    if baseline_tasks:
+        for bt in baseline_tasks:
+            bd_id = bt.get("related_deal_id")
+            bt_id = bt.get("task_id")
+            if bd_id and bt_id:
+                if bd_id not in deal_latest_task_ids or bt_id > deal_latest_task_ids[bd_id]:
+                    deal_latest_task_ids[bd_id] = bt_id
+
+    # If any task in task_updates is being marked 'Completed', record for chaining
+    for tu in task_updates:
+        if tu.get("method") == "PUT" and tu.get("task_id"):
+            p = tu.get("payload", {})
+            if p.get("status") == "Completed":
+                t_id = tu.get("task_id")
+                for bt in (baseline_tasks or []):
+                    if bt.get("task_id") == t_id and bt.get("related_deal_id"):
+                        deal_latest_task_ids[bt["related_deal_id"]] = t_id
 
     # Map deals by customer or name keywords for smart linking
     known_deals = []
@@ -637,6 +667,11 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
 
     def find_related_deal_and_context(text: str):
         t_low = text.lower()
+        t_norm = normalize_arabic(text)
+
+        best_deal = None
+        best_score = 0.0
+
         for d in known_deals:
             d_id = d.get("deal_id")
             d_name = d.get("deal_name", "")
@@ -645,16 +680,29 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             d_cat = d.get("deal_category")
             c_date = d.get("closing_date")
 
-            # Check customer name
-            if c_name and len(c_name) > 2 and c_name.lower() in t_low:
+            # Check customer similarity
+            if c_name:
+                sim = compute_customer_similarity(c_name, text)
+                if sim > best_score:
+                    best_score = sim
+                    best_deal = (d_id, d_name, c_name, c_id, d_cat, c_date)
+                for seg in text.split(" - "):
+                    seg_sim = compute_customer_similarity(c_name, seg.strip())
+                    if seg_sim > best_score:
+                        best_score = seg_sim
+                        best_deal = (d_id, d_name, c_name, c_id, d_cat, c_date)
+
+            # Direct token / substring fallback
+            if c_name and len(c_name) > 2 and (c_name.lower() in t_low or normalize_arabic(c_name) in t_norm):
                 return d_id, d_name, c_name, c_id, d_cat, c_date
-            # Check deal name
-            if d_name and len(d_name) > 3 and (d_name.lower() in t_low or t_low in d_name.lower()):
+            if d_name and len(d_name) > 3 and (d_name.lower() in t_low or t_low in d_name.lower() or normalize_arabic(d_name) in t_norm):
                 return d_id, d_name, c_name, c_id, d_cat, c_date
-            # Check individual tokens of customer name (e.g. "كاست" or "المراعي")
             for token in c_name.split():
-                if len(token) > 2 and token.lower() in t_low:
+                if len(token) > 2 and (token.lower() in t_low or normalize_arabic(token) in t_norm):
                     return d_id, d_name, c_name, c_id, d_cat, c_date
+
+        if best_deal and best_score >= 0.80:
+            return best_deal
 
         return None, None, None, None, None, None
 
@@ -746,6 +794,14 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         })
         existing_titles.append(act_low)
 
+    # Attach previous_task_id to new POST tasks on the same deal
+    for tu in task_updates:
+        if tu.get("method") == "POST":
+            p = tu.get("payload", {})
+            d_id = p.get("related_deal_id")
+            if d_id and not p.get("previous_task_id") and d_id in deal_latest_task_ids:
+                p["previous_task_id"] = deal_latest_task_ids[d_id]
+
     return task_updates
 
 
@@ -813,7 +869,9 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     c_cust_id = cd.get("customer_id")
                     c_name = str(cd.get("deal_name", "")).lower()
                     c_cust = str(cd.get("company_name", "")).lower()
-                    if (c_cust and c_cust in search_text) or (c_name and (c_name in search_text or search_text in c_name)):
+                    c_cust_raw = cd.get("company_name", "")
+                    sim = compute_customer_similarity(c_cust_raw, payload.get("customer_name", "") or "")
+                    if (c_cust and c_cust in search_text) or (c_name and (c_name in search_text or search_text in c_name)) or (sim >= 0.80):
                         if not payload.get("related_deal_id"):
                             payload["related_deal_id"] = c_id
                         if not payload.get("deal_name"):
@@ -1389,7 +1447,7 @@ Your responsibilities:
      * For existing baseline deals: Use "PUT" with "deal_id" and "payload".
      * For newly discussed projects/opportunities (e.g. "مشروع كاست", "مشروع المراعي"): Use "POST" with "payload".
      IMPORTANT REQUIREMENTS FOR CRM DEALS (CRITICAL):
-     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة", "MOI").
+     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة", "MOI"). If an existing customer in BASELINE CRM DEALS matches this entity (e.g. "المراعي" when mentioned as "شركة المراعي"), reuse the existing customer's registered company name.
      * deal_name: REQUIRED for "POST". Descriptive deal/project title in original Arabic/English as spoken (e.g. "تجديد الدعم الفني للأجهزة", "مشروع كاست - تحديث مركز البيانات", "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell").
      * deal_category: MUST be one of the three standardized business categories:
        1. "1- RFP Ownership & Prime Proposals": When presales mentions owning a prime RFP/tender end-to-end (e.g. "I got an RFP for customer MOI and the name is renewal for hardware" / "استلمت مناقصة" / "اعمل على مناقصة").
@@ -1412,6 +1470,10 @@ Your responsibilities:
       * DO NOT extract tasks from casual discussion, past accomplishments, or generic stage progression without an assigned next step.
       * EVERY task MUST be linked to its referenced Deal (`related_deal_id`, `deal_name`, `customer_name`, `deal_category`, `closing_date`).
       * Set `assigned_to` strictly to the engineer responsible ("Presales 1" or "Presales 2").
+      * TASK PROGRESSION & CHAINING RULES (CRITICAL):
+        - When the standup speaker mentions that a previous task on a deal has finished and a new task is under way (e.g. "خلصنا زيارة الموقع وحالياً شغال على توزيع النطاق للشركاء Dell و Cisco" / "we finished site survey and now distributing scope to partners"):
+          a) If the finished task exists in BASELINE TASK BOARD: formulate a "PUT" on that task's "task_id" with payload {{ "status": "Completed" }}.
+          b) For the new under-way task: formulate a "POST" linked to the SAME deal ("related_deal_id"), set "previous_task_id" to the completed task's ID, and set status to "In Progress".
       IMPORTANT CONSTRAINTS FOR TASKS:
       * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية", "طلب زيارة ميدانية Site Survey للموقع").
       * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
@@ -1424,6 +1486,7 @@ Your responsibilities:
       * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
       * priority: MUST be one of: ["High", "Medium", "Low"].
       * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
+      * previous_task_id: Integer ID of previous completed task on same deal, else null.
       * changed_by: "Voice Agent" (or the speaking engineer).
 4. Produce an Executive Briefing Report in the original spoken language without translation:
    - `today_progress`: Array of key accomplishments in the spoken language.
@@ -1478,6 +1541,7 @@ Return STRICT JSON matching this schema:
         "status": "In Progress",
         "priority": "High",
         "related_deal_id": null,
+        "previous_task_id": null,
         "changed_by": "Voice Agent"
       }}
     }}
@@ -1502,7 +1566,7 @@ Return STRICT JSON matching this schema:
 
     # 3. Automatically synchronize detected updates to local APIs with comprehensive reconciliation
     crm_updates = ai_data.get("crm_updates", [])
-    task_updates = reconcile_tasks_from_conversation(ai_data, deals)
+    task_updates = reconcile_tasks_from_conversation(ai_data, deals, tasks)
     sync_log = await execute_api_sync(crm_updates, task_updates)
 
     return {

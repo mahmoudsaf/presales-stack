@@ -168,11 +168,13 @@ def compute_customer_similarity(name1: str, name2: str) -> float:
 
     if c1:
         for a in CUSTOMER_ALIASES[c1]:
-            if normalize_arabic(a) == norm2 or (len(a) > 3 and a.lower() in norm2):
+            a_norm = normalize_arabic(a)
+            if a_norm == norm2 or (len(a_norm) > 3 and a_norm in norm2):
                 return 0.95
     if c2:
         for a in CUSTOMER_ALIASES[c2]:
-            if normalize_arabic(a) == norm1 or (len(a) > 3 and a.lower() in norm1):
+            a_norm = normalize_arabic(a)
+            if a_norm == norm1 or (len(a_norm) > 3 and a_norm in norm1):
                 return 0.95
 
     # 5. Core stripped tokens comparison (excluding corporate noise words)

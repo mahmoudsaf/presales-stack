@@ -17,6 +17,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from customer_matcher import compute_customer_similarity, normalize_arabic
+from task_catalog import PRE_RFP_TASKS, RFP_TASKS, ALL_ALLOWED_TASKS, normalize_to_catalog, is_pre_rfp_category
 
 # -----------------------------------------------------------------------------
 # Configuration & Persistence
@@ -486,13 +487,7 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(payload)
     p.pop("task_id", None)
 
-    # 1. Title handling (alias resolution & default)
-    title = p.pop("task_title", None) or p.pop("title", None) or p.pop("name", None)
-    if not title or not str(title).strip():
-        title = "Presales Action Item"
-    p["task_title"] = str(title).strip()
-
-    # 2. Category handling
+    # 1. Category handling
     cat = str(p.get("category", "") or p.get("deal_category", "")).strip().lower()
     if "owner" in cat or "prime" in cat or "1-" in cat:
         p["category"] = "RFP_OWNERSHIP"
@@ -503,6 +498,13 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         p["category"] = "GENERAL_ACTION"
         p["deal_category"] = "3- Opportunity Efforts & PO"
+
+    # 2. Title handling (strictly enforce predefined task catalog)
+    raw_title = p.pop("task_title", None) or p.pop("title", None) or p.pop("name", None)
+    canonical_title = normalize_to_catalog(raw_title, p["deal_category"])
+    p["task_title"] = canonical_title
+    if raw_title and raw_title != canonical_title and not p.get("management_blockers"):
+        p["management_blockers"] = f"Context: {raw_title}"
 
     # 3. Assigned To handling
     assigned = str(p.get("assigned_to", "")).strip().lower()
@@ -761,23 +763,32 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if not p.get("closing_date"):
             p["closing_date"] = c_date or detect_closing_date(t_text)
 
+        # Enforce strict predefined catalog task title
+        raw_t = p.get("task_title", "")
+        p["task_title"] = normalize_to_catalog(raw_t, p.get("deal_category"))
+        if raw_t and raw_t != p["task_title"] and not p.get("management_blockers"):
+            p["management_blockers"] = f"Context: {raw_t}"
+
     # 1. Reconcile tomorrow's actions
     for action in actions:
         action_text = str(action).strip()
         if not action_text:
             continue
         act_low = action_text.lower()
-        if any(len(act_low) > 8 and (act_low[:20] in et or et in act_low) for et in existing_titles):
-            continue
 
         d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(action_text)
         cat_key, cat_name = detect_category(action_text)
         closing_dt = c_date or detect_closing_date(action_text)
 
+        canonical_action_title = normalize_to_catalog(action_text, d_cat or cat_name)
+        if any(t.get("payload", {}).get("task_title") == canonical_action_title and t.get("payload", {}).get("related_deal_id") == d_id for t in task_updates):
+            continue
+
         task_updates.append({
             "method": "POST",
             "payload": {
-                "task_title": action_text,
+                "task_title": canonical_action_title,
+                "management_blockers": f"Action details: {action_text}" if action_text != canonical_action_title else None,
                 "category": cat_key,
                 "deal_category": d_cat or cat_name,
                 "closing_date": closing_dt,
@@ -792,7 +803,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "changed_by": "Voice Agent",
             }
         })
-        existing_titles.append(act_low)
+        existing_titles.append(canonical_action_title.lower())
 
     # Attach previous_task_id to new POST tasks on the same deal
     for tu in task_updates:
@@ -1460,34 +1471,57 @@ Your responsibilities:
      * assigned_presales: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
      * estimated_value: Numeric float in SAR/USD (e.g. 1.25M to 1.5M -> 1350000.0, 10M -> 10000000.0). Remember 1 million = 1000000.0.
      * vendor_notes: Technical requirements, scope, target close dates, in original spoken language.
-   - `task_updates`: Array of task updates.
-      STRICT TASK EXTRACTION RULES (FOLLOW-UP ONLY - NO SPECULATIVE PLAYBOOK SUGGESTIONS):
-      * DO NOT suggest or invent playbook tasks that were not explicitly spoken in the meeting.
-      * Extract a task ONLY if:
-        1. A manager/lead explicitly instructs someone ("do this", "prepare the scope", "Ahmed do site survey").
-        2. A presales engineer explicitly commits to an action ("I am handling the deal by distributing the scope", "ask for site survey", "I will deliver the BOM").
-        3. A concrete next action was agreed upon during the standup meeting as a follow-up item for a deal.
-      * DO NOT extract tasks from casual discussion, past accomplishments, or generic stage progression without an assigned next step.
-      * EVERY task MUST be linked to its referenced Deal (`related_deal_id`, `deal_name`, `customer_name`, `deal_category`, `closing_date`).
-      * Set `assigned_to` strictly to the engineer responsible ("Presales 1" or "Presales 2").
-      * TASK PROGRESSION & CHAINING RULES (CRITICAL):
-        - When the standup speaker mentions that a previous task on a deal has finished and a new task is under way (e.g. "خلصنا زيارة الموقع وحالياً شغال على توزيع النطاق للشركاء Dell و Cisco" / "we finished site survey and now distributing scope to partners"):
-          a) If the finished task exists in BASELINE TASK BOARD: formulate a "PUT" on that task's "task_id" with payload {{ "status": "Completed" }}.
-          b) For the new under-way task: formulate a "POST" linked to the SAME deal ("related_deal_id"), set "previous_task_id" to the completed task's ID, and set status to "In Progress".
-      IMPORTANT CONSTRAINTS FOR TASKS:
-      * task_title: Actionable title in the original spoken language (Arabic or English as spoken, e.g. "توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية", "طلب زيارة ميدانية Site Survey للموقع").
-      * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
-      * deal_name: Descriptive deal/project title.
-      * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
-      * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
-      * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-      * assigned_to: MUST be: "Presales 1" or "Presales 2".
-      * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
-      * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
-      * priority: MUST be one of: ["High", "Medium", "Low"].
-      * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
-      * previous_task_id: Integer ID of previous completed task on same deal, else null.
-      * changed_by: "Voice Agent" (or the speaking engineer).
+    - `task_updates`: Array of task updates.
+       STRICT TASK CATALOG REQUIREMENT (CRITICAL - CEASE FREE-FORM TASKS):
+       * The presales operations pipeline uses a FIXED, PREDEFINED TASK CATALOG.
+       * You MUST NOT generate open-ended or arbitrary free-form task titles.
+       * Every task's `task_title` MUST BE EXACTLY ONE OF THE FOLLOWING PREDEFINED CATALOG ITEMS:
+         --- PRE-RFP TASKS (for Category 3: Opportunity Efforts & PO) ---
+         1. "Discovery & Technical Requirements Gathering"
+         2. "High-Level Architecture (HLA) Design"
+         3. "Preliminary BoQ & Budgetary Sizing"
+         4. "RFP Specifications Shaping & Advisory"
+         5. "Technical Proposal Draft & Client Review"
+         --- RFP TASKS (for Category 1: RFP Ownership & Category 2: RFP Distributed Scope) ---
+         1. "Bid / No-Bid Qualification & Owner Assignment"
+         2. "RFP Decomposition & Scope Breakdown"
+         3. "Clarification Questions Submission"
+         4. "Low-Level Architecture & Technical Write-up"
+         5. "Final BoQ & Vendor Quotations"
+         6. "Technical Compliance Matrix"
+         7. "Proposal Integration & Master Compliance Audit"
+         8. "Final Technical Review & Commercial Handover"
+       * ANY spoken details, engineer comments, partner coordination, site visits, or specific hardware context MUST be placed in `management_blockers` or notes, NEVER replacing the standardized catalog `task_title`.
+
+       MANDATORY 4-STEP AGENT DATA PIPELINE:
+       1. Determine whether a deal is NEW or EXISTING:
+          - Compare against BASELINE CRM DEALS above. If matching an existing deal (by customer name, deal name, or ID):
+            use "method": "PUT" with "deal_id" to update that deal.
+          - If a completely new project/tender: use "method": "POST" with payload.
+       2. Update Deal Context:
+          - Capture deal stage progression, estimated value, closing date, vendor notes, and primary vendors.
+       3. Update Existing Task Statuses:
+          - Check BASELINE TASK BOARD. If speech indicates an active task on the deal finished (e.g. "خلصنا زيارة الموقع" / "we finished site survey" / "we submitted questions"):
+            formulate a "PUT" on that task's "task_id" with payload {{ "status": "Completed" }}.
+       4. Enqueue the Next Action strictly from the Catalog:
+          - Choose the logical next deliverable strictly from PRE_RFP_TASKS (for Opportunity Efforts) or RFP_TASKS (for RFPs).
+          - Formulate a "POST" in task_updates linked to the deal, chained to the finished task via "previous_task_id", and set status to "In Progress" or "Not Started".
+
+       IMPORTANT CONSTRAINTS FOR TASKS:
+       * task_title: MUST be verbatim from PRE_RFP_TASKS or RFP_TASKS above.
+       * management_blockers: Specific spoken context, blockers, or next step details.
+       * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
+       * deal_name: Descriptive deal/project title.
+       * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
+       * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
+       * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
+       * assigned_to: MUST be: "Presales 1" or "Presales 2".
+       * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
+       * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
+       * priority: MUST be one of: ["High", "Medium", "Low"].
+       * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
+       * previous_task_id: Integer ID of previous completed task on same deal, else null.
+       * changed_by: "Voice Agent" (or the speaking engineer).
 4. Produce an Executive Briefing Report in the original spoken language without translation:
    - `today_progress`: Array of key accomplishments in the spoken language.
    - `tomorrow_actions`: Array of prioritized next steps in the spoken language.
@@ -1530,7 +1564,8 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "إعداد كراسة الشروط والمواصفات لمناقصة تجديد الدعم الفني",
+        "task_title": "RFP Decomposition & Scope Breakdown",
+        "management_blockers": "توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية",
         "customer_name": "MOI",
         "deal_name": "تجديد الدعم الفني للأجهزة",
         "deal_category": "1- RFP Ownership & Prime Proposals",

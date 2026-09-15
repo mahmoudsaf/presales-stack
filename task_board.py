@@ -13,6 +13,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
+from task_catalog import (
+    PRE_RFP_TASKS,
+    RFP_TASKS,
+    ALL_ALLOWED_TASKS,
+    normalize_to_catalog,
+)
+
 # -----------------------------------------------------------------------------
 # Configuration & Constants
 # -----------------------------------------------------------------------------
@@ -432,8 +439,14 @@ class TaskBase(BaseModel):
     @classmethod
     def normalize_title(cls, v):
         if not v or not str(v).strip():
-            return "Presales Action Item"
-        return str(v).strip()
+            return normalize_to_catalog(None)
+        return normalize_to_catalog(v)
+
+    @model_validator(mode="after")
+    def ensure_catalog_title(self):
+        if self.task_title:
+            self.task_title = normalize_to_catalog(self.task_title, self.deal_category)
+        return self
 
     @field_validator("category", mode="before")
     @classmethod
@@ -581,8 +594,16 @@ class TaskUpdate(BaseModel):
     @classmethod
     def normalize_title(cls, v):
         if v is not None:
-            return str(v).strip()
+            if not str(v).strip():
+                return None
+            return normalize_to_catalog(v)
         return None
+
+    @model_validator(mode="after")
+    def ensure_catalog_title(self):
+        if self.task_title is not None:
+            self.task_title = normalize_to_catalog(self.task_title, self.deal_category)
+        return self
 
     @field_validator("category", mode="before")
     @classmethod
@@ -708,6 +729,13 @@ class TaskCompleteAndNext(BaseModel):
     due_date: Optional[str] = None
     management_blockers: Optional[str] = None
     changed_by: Optional[str] = Field(default="Voice Agent", description="User or agent recording the transition")
+
+    @field_validator("next_task_title", mode="before")
+    @classmethod
+    def normalize_next_title(cls, v):
+        if not v or not str(v).strip():
+            return normalize_to_catalog(None)
+        return normalize_to_catalog(v)
 
 
 class TaskOut(TaskBase):
@@ -1306,10 +1334,11 @@ def complete_and_next_task(task_id: int, payload: TaskCompleteAndNext):
     vendor_val = payload.vendor_domain or parent_dict.get("vendor_domain") or "General"
     priority_val = payload.priority or parent_dict.get("priority") or "Medium"
 
+    deal_cat = parent_dict.get("deal_category")
     new_task = TaskCreate(
-        task_title=payload.next_task_title.strip(),
+        task_title=normalize_to_catalog(payload.next_task_title.strip(), deal_cat),
         category=parent_dict.get("category") or TaskCategory.GENERAL_ACTION,
-        deal_category=parent_dict.get("deal_category"),
+        deal_category=deal_cat,
         closing_date=parent_dict.get("closing_date"),
         related_deal_id=parent_dict.get("related_deal_id"),
         customer_id=parent_dict.get("customer_id"),
@@ -1893,8 +1922,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     <div class="modal-body p-4">
                         <div class="row g-3">
                             <div class="col-12">
-                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Description (What it's about / Details) *</label>
-                                <input type="text" id="newTitle" class="form-control" placeholder="Describe what this task is about / action details..." required>
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Standard Task Action (Predefined Catalog) *</label>
+                                <select id="newTitle" class="form-select" required>
+                                    <option value="" disabled selected>-- Select Standard Action from Catalog --</option>
+                                    <optgroup label="Pre-RFP Tasks (Opportunity Efforts & PO)">
+                                        <option value="Discovery & Technical Requirements Gathering">Discovery & Technical Requirements Gathering</option>
+                                        <option value="High-Level Architecture (HLA) Design">High-Level Architecture (HLA) Design</option>
+                                        <option value="Preliminary BoQ & Budgetary Sizing">Preliminary BoQ & Budgetary Sizing</option>
+                                        <option value="RFP Specifications Shaping & Advisory">RFP Specifications Shaping & Advisory</option>
+                                        <option value="Technical Proposal Draft & Client Review">Technical Proposal Draft & Client Review</option>
+                                    </optgroup>
+                                    <optgroup label="RFP Tasks (Tenders & Distributed Scope Items)">
+                                        <option value="Bid / No-Bid Qualification & Owner Assignment">Bid / No-Bid Qualification & Owner Assignment</option>
+                                        <option value="RFP Decomposition & Scope Breakdown">RFP Decomposition & Scope Breakdown</option>
+                                        <option value="Clarification Questions Submission">Clarification Questions Submission</option>
+                                        <option value="Low-Level Architecture & Technical Write-up">Low-Level Architecture & Technical Write-up</option>
+                                        <option value="Final BoQ & Vendor Quotations">Final BoQ & Vendor Quotations</option>
+                                        <option value="Technical Compliance Matrix">Technical Compliance Matrix</option>
+                                        <option value="Proposal Integration & Master Compliance Audit">Proposal Integration & Master Compliance Audit</option>
+                                        <option value="Final Technical Review & Commercial Handover">Final Technical Review & Commercial Handover</option>
+                                    </optgroup>
+                                </select>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label small fw-semibold"><i class="bi bi-building text-primary me-1"></i>Customer Account (ID & Name)</label>
@@ -1991,8 +2039,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <input type="hidden" id="editTaskId">
                         <div class="row g-3">
                             <div class="col-12">
-                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Description (What it's about / Details) *</label>
-                                <input type="text" id="editTitle" class="form-control" required>
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Standard Task Action (Predefined Catalog) *</label>
+                                <select id="editTitle" class="form-select" required>
+                                    <option value="" disabled>-- Select Standard Action from Catalog --</option>
+                                    <optgroup label="Pre-RFP Tasks (Opportunity Efforts & PO)">
+                                        <option value="Discovery & Technical Requirements Gathering">Discovery & Technical Requirements Gathering</option>
+                                        <option value="High-Level Architecture (HLA) Design">High-Level Architecture (HLA) Design</option>
+                                        <option value="Preliminary BoQ & Budgetary Sizing">Preliminary BoQ & Budgetary Sizing</option>
+                                        <option value="RFP Specifications Shaping & Advisory">RFP Specifications Shaping & Advisory</option>
+                                        <option value="Technical Proposal Draft & Client Review">Technical Proposal Draft & Client Review</option>
+                                    </optgroup>
+                                    <optgroup label="RFP Tasks (Tenders & Distributed Scope Items)">
+                                        <option value="Bid / No-Bid Qualification & Owner Assignment">Bid / No-Bid Qualification & Owner Assignment</option>
+                                        <option value="RFP Decomposition & Scope Breakdown">RFP Decomposition & Scope Breakdown</option>
+                                        <option value="Clarification Questions Submission">Clarification Questions Submission</option>
+                                        <option value="Low-Level Architecture & Technical Write-up">Low-Level Architecture & Technical Write-up</option>
+                                        <option value="Final BoQ & Vendor Quotations">Final BoQ & Vendor Quotations</option>
+                                        <option value="Technical Compliance Matrix">Technical Compliance Matrix</option>
+                                        <option value="Proposal Integration & Master Compliance Audit">Proposal Integration & Master Compliance Audit</option>
+                                        <option value="Final Technical Review & Commercial Handover">Final Technical Review & Commercial Handover</option>
+                                    </optgroup>
+                                </select>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label small fw-semibold"><i class="bi bi-building text-primary me-1"></i>Customer Account (ID & Name)</label>
@@ -2149,8 +2216,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         </div>
                         <div class="row g-3">
                             <div class="col-12">
-                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Next Step Description (What it's about / Spoken Action) *</label>
-                                <input type="text" id="chainNextTitle" class="form-control" placeholder="e.g. توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية" required>
+                                <label class="form-label small fw-semibold"><i class="bi bi-card-text text-primary me-1"></i>Next Standard Task Action (Predefined Catalog) *</label>
+                                <select id="chainNextTitle" class="form-select" required>
+                                    <option value="" disabled selected>-- Select Next Action from Catalog --</option>
+                                    <optgroup label="Pre-RFP Tasks (Opportunity Efforts & PO)">
+                                        <option value="Discovery & Technical Requirements Gathering">Discovery & Technical Requirements Gathering</option>
+                                        <option value="High-Level Architecture (HLA) Design">High-Level Architecture (HLA) Design</option>
+                                        <option value="Preliminary BoQ & Budgetary Sizing">Preliminary BoQ & Budgetary Sizing</option>
+                                        <option value="RFP Specifications Shaping & Advisory">RFP Specifications Shaping & Advisory</option>
+                                        <option value="Technical Proposal Draft & Client Review">Technical Proposal Draft & Client Review</option>
+                                    </optgroup>
+                                    <optgroup label="RFP Tasks (Tenders & Distributed Scope Items)">
+                                        <option value="Bid / No-Bid Qualification & Owner Assignment">Bid / No-Bid Qualification & Owner Assignment</option>
+                                        <option value="RFP Decomposition & Scope Breakdown">RFP Decomposition & Scope Breakdown</option>
+                                        <option value="Clarification Questions Submission">Clarification Questions Submission</option>
+                                        <option value="Low-Level Architecture & Technical Write-up">Low-Level Architecture & Technical Write-up</option>
+                                        <option value="Final BoQ & Vendor Quotations">Final BoQ & Vendor Quotations</option>
+                                        <option value="Technical Compliance Matrix">Technical Compliance Matrix</option>
+                                        <option value="Proposal Integration & Master Compliance Audit">Proposal Integration & Master Compliance Audit</option>
+                                        <option value="Final Technical Review & Commercial Handover">Final Technical Review & Commercial Handover</option>
+                                    </optgroup>
+                                </select>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label small fw-semibold">Presales Assignee *</label>
@@ -3277,7 +3363,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             if (!task) return;
 
             document.getElementById('editTaskId').value = task.task_id;
-            document.getElementById('editTitle').value = task.task_title;
+            const editTitleEl = document.getElementById('editTitle');
+            if (editTitleEl) {
+                const optExists = Array.from(editTitleEl.options).some(o => o.value === task.task_title);
+                if (!optExists && task.task_title) {
+                    const customOpt = document.createElement('option');
+                    customOpt.value = task.task_title;
+                    customOpt.textContent = `${task.task_title} (Custom/Legacy)`;
+                    editTitleEl.appendChild(customOpt);
+                }
+                editTitleEl.value = task.task_title;
+            }
             populateCustomerSelects();
 
             const custId = task.customer_id || (allDeals.find(d => d.deal_id === task.related_deal_id)?.customer_id || '');

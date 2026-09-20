@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from customer_matcher import compute_customer_similarity, find_similar_customer, normalize_arabic
+from customer_matcher import CUSTOMER_ALIASES, compute_customer_similarity, find_similar_customer, normalize_arabic
 
 # -----------------------------------------------------------------------------
 # Configuration & Constants
@@ -363,32 +363,47 @@ class DealCreate(BaseModel):
     def normalize_aliases(cls, data: Any) -> Any:
         if isinstance(data, dict):
             # 1. Alias company_name (customer_name, customer, client, etc.)
-            if not data.get("company_name"):
+            if not data.get("company_name") or str(data.get("company_name", "")).strip().lower() in ("general client", "client", "general", "عميل"):
                 for key in ["customer_name", "customer", "client_name", "client", "account_name", "account", "org_name", "organization"]:
-                    if data.get(key) and str(data.get(key)).strip():
+                    if data.get(key) and str(data.get(key)).strip() and str(data.get(key)).strip().lower() not in ("general client", "client", "general", "عميل"):
                         data["company_name"] = str(data.get(key)).strip()
                         break
-            
+
+            # Search deal_name and vendor_notes against CUSTOMER_ALIASES if company_name is still missing or generic
+            search_corpus = f"{data.get('deal_name') or ''} {data.get('opportunity_name') or ''} {data.get('title') or ''} {data.get('name') or ''} {data.get('vendor_notes') or ''}"
+            if not data.get("company_name") or str(data.get("company_name")).strip().lower() in ("general client", "client", "general", "عميل"):
+                for cluster_id, aliases in CUSTOMER_ALIASES.items():
+                    for a in aliases:
+                        if len(a) > 2 and (normalize_arabic(a) in normalize_arabic(search_corpus) or a.lower() in search_corpus.lower()):
+                            data["company_name"] = aliases[0]
+                            break
+                    if data.get("company_name") and data["company_name"] != "General Client":
+                        break
+
             # Infer from deal_name if company_name is still missing
             deal_raw = data.get("deal_name") or data.get("opportunity_name") or data.get("project_name") or data.get("title") or data.get("name")
-            if not data.get("company_name") and deal_raw:
+            if (not data.get("company_name") or data.get("company_name") == "General Client") and deal_raw:
                 d_str = str(deal_raw).strip()
                 m = re.search(r"(?:مشروع|عميل|شركة|مؤسسة|مناقصة)\s+([^\s\-:،,]+)", d_str)
-                if m:
+                if m and m.group(1).strip().lower() not in ("general", "client"):
                     data["company_name"] = m.group(1).strip()
-                else:
+                elif "general client" not in d_str.lower():
                     data["company_name"] = d_str[:30]
-            elif not data.get("company_name"):
+
+            if not data.get("company_name"):
                 data["company_name"] = "General Client"
 
             # 2. Alias deal_name
             if not data.get("deal_name"):
                 for key in ["project_name", "opportunity_name", "title", "name", "tender_name", "deal"]:
-                    if data.get(key) and str(data.get(key)).strip():
+                    if data.get(key) and str(data.get(key)).strip() and "general client" not in str(data.get(key)).lower():
                         data["deal_name"] = str(data.get(key)).strip()
                         break
-            if not data.get("deal_name"):
-                data["deal_name"] = f"مشروع {data.get('company_name', 'العميل')}"
+            if not data.get("deal_name") or str(data.get("deal_name")).strip().lower() in ("مشروع general client", "general client"):
+                if data.get("company_name") and data["company_name"] != "General Client":
+                    data["deal_name"] = f"مشروع {data['company_name']}"
+                else:
+                    data["deal_name"] = "مشروع متابعة الفرص"
 
             # 3. Alias deal_category
             if not data.get("deal_category"):
@@ -1003,35 +1018,127 @@ def create_deal(payload: DealCreate):
         )
         customer_id = cursor.lastrowid
 
-    # 2. Insert Deal
-    vendors_str = normalize_vendors(payload.primary_vendors)
-    now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    deal_cat = payload.deal_category.value if isinstance(payload.deal_category, DealCategory) else normalize_deal_category(payload.deal_category)
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    deal_cat = normalize_deal_category(payload.deal_category)
     close_dt = normalize_closing_date(payload.closing_date)
+    vendors_str = ", ".join(payload.primary_vendors) if payload.primary_vendors else "General"
 
-    cursor.execute(
-        """
-        INSERT INTO deals (
-            customer_id, deal_name, primary_vendors, stage, estimated_value, assigned_presales, vendor_notes, deal_category, closing_date, created_at, updated_at
+    # 2. Check for existing deal deduplication under this customer
+    matched_existing_deal = None
+    if existing_customer:
+        cursor.execute("SELECT * FROM deals WHERE customer_id = ? ORDER BY updated_at DESC, deal_id DESC;", (customer_id,))
+        cust_deals = cursor.fetchall()
+
+        req_deal_name = payload.deal_name.strip()
+        req_cat = deal_cat
+
+        for d in cust_deals:
+            d_name = d["deal_name"] or ""
+            d_cat = d["deal_category"] or ""
+
+            # Exact or normalized match
+            if d_name.lower() == req_deal_name.lower() or normalize_arabic(d_name) == normalize_arabic(req_deal_name):
+                matched_existing_deal = d
+                break
+
+            # Generic incoming deal name matching existing deal for customer
+            is_generic_name = (
+                "general client" in req_deal_name.lower()
+                or req_deal_name in (f"مشروع {clean_company}", f"مشروع {existing_customer['company_name']}", clean_company)
+                or req_deal_name.lower() in ("rfp", "tender", "مناقصة", "كراسة", "مشروع", "مشروع متابعة الفرص")
+            )
+            if is_generic_name:
+                if d_cat == req_cat or len(cust_deals) == 1:
+                    matched_existing_deal = d
+                    break
+
+            # Substring / keyword overlap
+            if len(req_deal_name) > 4 and (req_deal_name.lower() in d_name.lower() or d_name.lower() in req_deal_name.lower()):
+                matched_existing_deal = d
+                break
+            if len(normalize_arabic(req_deal_name)) > 4 and (normalize_arabic(req_deal_name) in normalize_arabic(d_name) or normalize_arabic(d_name) in normalize_arabic(req_deal_name)):
+                matched_existing_deal = d
+                break
+
+            # If both are RFP category and customer only has 1 RFP deal
+            rfp_deals = [x for x in cust_deals if "1-" in (x["deal_category"] or "") or "owner" in (x["deal_category"] or "").lower() or "prime" in (x["deal_category"] or "").lower()]
+            if ("1-" in req_cat or "owner" in req_cat.lower() or "prime" in req_cat.lower()) and len(rfp_deals) == 1 and d["deal_id"] == rfp_deals[0]["deal_id"]:
+                matched_existing_deal = d
+                break
+
+    if matched_existing_deal:
+        deal_id = matched_existing_deal["deal_id"]
+        update_clauses = []
+        update_params = []
+
+        if payload.stage and payload.stage.value != matched_existing_deal["stage"]:
+            update_clauses.append("stage = ?")
+            update_params.append(payload.stage.value)
+
+        if payload.estimated_value and float(payload.estimated_value) > 0:
+            update_clauses.append("estimated_value = ?")
+            update_params.append(float(payload.estimated_value))
+
+        if close_dt and close_dt != matched_existing_deal["closing_date"]:
+            update_clauses.append("closing_date = ?")
+            update_params.append(close_dt)
+
+        if payload.primary_vendors:
+            curr_v = set([v.strip().lower() for v in (matched_existing_deal["primary_vendors"] or "").split(",") if v.strip()])
+            new_v_items = payload.primary_vendors if isinstance(payload.primary_vendors, list) else [payload.primary_vendors]
+            merged_v = [v.strip() for v in (matched_existing_deal["primary_vendors"] or "").split(",") if v.strip()]
+            for v in new_v_items:
+                if v and v.strip().lower() not in curr_v:
+                    merged_v.append(v.strip())
+            if merged_v:
+                update_clauses.append("primary_vendors = ?")
+                update_params.append(", ".join(merged_v))
+
+        if payload.vendor_notes and payload.vendor_notes.strip():
+            old_n = matched_existing_deal["vendor_notes"] or ""
+            note_snip = payload.vendor_notes.strip()
+            if note_snip not in old_n:
+                combined_n = f"{old_n} | {note_snip}".strip(" |")
+                update_clauses.append("vendor_notes = ?")
+                update_params.append(combined_n)
+
+        # Fix deal_name if the existing deal was erroneously named 'مشروع General Client'
+        if "general client" in (matched_existing_deal["deal_name"] or "").lower():
+            better_name = payload.deal_name if "general client" not in payload.deal_name.lower() else f"مشروع {clean_company}"
+            update_clauses.append("deal_name = ?")
+            update_params.append(better_name)
+
+        update_clauses.append("updated_at = ?")
+        update_params.append(now_iso)
+
+        if update_clauses:
+            update_params.append(deal_id)
+            cursor.execute(f"UPDATE deals SET {', '.join(update_clauses)} WHERE deal_id = ?;", update_params)
+            conn.commit()
+    else:
+        cursor.execute(
+            """
+            INSERT INTO deals (
+                customer_id, deal_name, primary_vendors, stage, estimated_value, assigned_presales, vendor_notes, deal_category, closing_date, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                customer_id,
+                payload.deal_name.strip(),
+                vendors_str,
+                payload.stage.value,
+                payload.estimated_value,
+                payload.assigned_presales.value if payload.assigned_presales else None,
+                payload.vendor_notes.strip() if payload.vendor_notes else "",
+                deal_cat,
+                close_dt,
+                now_iso,
+                now_iso,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        (
-            customer_id,
-            payload.deal_name.strip(),
-            vendors_str,
-            payload.stage.value,
-            payload.estimated_value,
-            payload.assigned_presales.value if payload.assigned_presales else None,
-            payload.vendor_notes.strip() if payload.vendor_notes else "",
-            deal_cat,
-            close_dt,
-            now_iso,
-            now_iso,
-        ),
-    )
-    deal_id = cursor.lastrowid
-    conn.commit()
+        deal_id = cursor.lastrowid
+        conn.commit()
 
     # Sync to tasks.db if matching tasks exist
     try:

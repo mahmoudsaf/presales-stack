@@ -39,6 +39,13 @@ NOISE_WORDS = {
     "bank", "center", "the", "of", "for", "and", "saudi"
 }
 
+GENERIC_DEAL_WORDS = {
+    "مشروع", "مناقصة", "مناقصه", "منافسة", "منافسه", "كراسة", "كراسه", "فرصة", "فرصه",
+    "طلب", "توريد", "تقديم", "عقد", "عملية", "عمليه", "rfp", "tender", "deal",
+    "project", "opportunity", "client", "general", "department", "لصالح", "جديدة", "جديده",
+    "باسم", "اسم", "خاصة", "خاصه", "خدمات", "اعمال", "أعمال"
+}
+
 CUSTOMER_ALIASES: Dict[str, List[str]] = {
     "kacst": [
         "مدينة الملك عبد العزيز للعلوم والتقنية",
@@ -135,6 +142,33 @@ def get_customer_tokens(text: str) -> Tuple[str, List[str], List[str]]:
         else:
             stripped_tokens.append(w)
     return norm, core_tokens, stripped_tokens
+
+
+def extract_deal_scope_tokens(deal_name: str, company_name: str = "") -> set:
+    """
+    Extracts core project scope tokens from a deal name by removing customer name tokens,
+    noise words, and generic deal words (like مناقصة, كراسة, مشروع, rfp, tender).
+    """
+    if not deal_name:
+        return set()
+    norm = normalize_arabic(deal_name)
+    tokens = set(re.split(r"[\s\-:،,]+", norm))
+    comp_tokens = set(re.split(r"[\s\-:،,]+", normalize_arabic(company_name))) if company_name else set()
+    stripped_comp = set()
+    for ct in comp_tokens:
+        if ct.startswith("ال") and len(ct) > 3:
+            stripped_comp.add(ct[2:])
+        stripped_comp.add(ct)
+    exclude = stripped_comp | comp_tokens | NOISE_WORDS | GENERIC_DEAL_WORDS
+    
+    result = set()
+    for t in tokens:
+        clean = t
+        if clean.startswith("ال") and len(clean) > 3:
+            clean = clean[2:]
+        if len(clean) >= 3 and clean not in exclude and t not in exclude:
+            result.add(clean)
+    return result
 
 
 def compute_customer_similarity(name1: str, name2: str) -> float:

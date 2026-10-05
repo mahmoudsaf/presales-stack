@@ -13,7 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from customer_matcher import CUSTOMER_ALIASES, compute_customer_similarity, find_similar_customer, normalize_arabic
+from customer_matcher import (
+    CUSTOMER_ALIASES,
+    GENERIC_DEAL_WORDS,
+    NOISE_WORDS,
+    compute_customer_similarity,
+    extract_deal_scope_tokens,
+    find_similar_customer,
+    normalize_arabic,
+)
 
 # -----------------------------------------------------------------------------
 # Configuration & Constants
@@ -908,9 +916,11 @@ def update_customer(customer_id: int, payload: CustomerUpdate):
 @app.get("/api/deals", response_model=List[DealOut], tags=["Deals"])
 def get_deals(
     vendor: Optional[str] = Query(None, description="Filter deals by primary vendor"),
-    category: Optional[str] = Query(None, description="Filter deals by deal category")
+    category: Optional[str] = Query(None, description="Filter deals by deal category"),
+    active_only: bool = Query(False, description="Filter deals by active status (excludes Closed-Won and Closed-Lost)"),
+    stage: Optional[str] = Query(None, description="Filter deals by specific stage")
 ):
-    """Returns all deals with joined customer information. Optionally filters by vendor or category."""
+    """Returns all deals with joined customer information. Optionally filters by vendor, category, stage, or active status."""
     conn = get_db_connection()
     cursor = conn.cursor()
     query = """
@@ -936,6 +946,11 @@ def get_deals(
     """
     conditions = []
     params = []
+    if active_only:
+        conditions.append("d.stage NOT IN ('Closed-Won', 'Closed-Lost')")
+    if stage:
+        conditions.append("d.stage = ?")
+        params.append(stage)
     if vendor:
         conditions.append("d.primary_vendors LIKE ?")
         params.append(f"%{vendor}%")
@@ -1045,26 +1060,41 @@ def create_deal(payload: DealCreate):
             is_generic_name = (
                 "general client" in req_deal_name.lower()
                 or req_deal_name in (f"مشروع {clean_company}", f"مشروع {existing_customer['company_name']}", clean_company)
-                or req_deal_name.lower() in ("rfp", "tender", "مناقصة", "كراسة", "مشروع", "مشروع متابعة الفرص")
+                or req_deal_name.lower() in ("rfp", "tender", "مناقصة", "مناقصه", "كراسة", "كراسه", "مشروع", "مشروع متابعة الفرص")
             )
             if is_generic_name:
-                if d_cat == req_cat or len(cust_deals) == 1:
+                req_notes = (payload.vendor_notes or "").lower()
+                is_explicit_new = any(kw in req_notes for kw in [
+                    "مناقصة جديدة", "مناقصه جديده", "كراسة جديدة", "كراسه جديده",
+                    "فرصة جديدة", "فرصه جديده", "مناقصة اخرى", "مناقصه اخري", "كراسة اخرى", "كراسه اخري"
+                ])
+                if not is_explicit_new:
+                    if len(cust_deals) == 1:
+                        matched_existing_deal = d
+                        break
+                    else:
+                        d_scope = extract_deal_scope_tokens(d_name, existing_customer["company_name"])
+                        if d_scope and any(t in req_notes for t in d_scope):
+                            matched_existing_deal = d
+                            break
+
+            # Extract distinct project scope tokens (excluding customer name and generic words)
+            req_scope = extract_deal_scope_tokens(req_deal_name, existing_customer["company_name"])
+            d_scope = extract_deal_scope_tokens(d_name, existing_customer["company_name"])
+
+            if req_scope and d_scope:
+                overlap = req_scope & d_scope
+                # If they share significant project scope tokens, consider them the same project
+                if overlap and len(overlap) / min(len(req_scope), len(d_scope)) >= 0.5:
                     matched_existing_deal = d
                     break
-
-            # Substring / keyword overlap
-            if len(req_deal_name) > 4 and (req_deal_name.lower() in d_name.lower() or d_name.lower() in req_deal_name.lower()):
-                matched_existing_deal = d
-                break
-            if len(normalize_arabic(req_deal_name)) > 4 and (normalize_arabic(req_deal_name) in normalize_arabic(d_name) or normalize_arabic(d_name) in normalize_arabic(req_deal_name)):
-                matched_existing_deal = d
-                break
-
-            # If both are RFP category and customer only has 1 RFP deal
-            rfp_deals = [x for x in cust_deals if "1-" in (x["deal_category"] or "") or "owner" in (x["deal_category"] or "").lower() or "prime" in (x["deal_category"] or "").lower()]
-            if ("1-" in req_cat or "owner" in req_cat.lower() or "prime" in req_cat.lower()) and len(rfp_deals) == 1 and d["deal_id"] == rfp_deals[0]["deal_id"]:
-                matched_existing_deal = d
-                break
+            elif not req_scope and not d_scope:
+                # If neither has specific scope tokens (e.g. general deal titles), only match if same category or single deal
+                if (d_cat == req_cat or len(cust_deals) == 1) and not is_generic_name:
+                    sim = compute_customer_similarity(d_name, req_deal_name)
+                    if sim >= 0.85:
+                        matched_existing_deal = d
+                        break
 
     if matched_existing_deal:
         deal_id = matched_existing_deal["deal_id"]
@@ -1749,6 +1779,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <button class="nav-link fw-semibold" id="deals-tab" data-bs-toggle="pill" data-bs-target="#deals-pane" type="button">
                             <i class="bi bi-kanban me-1"></i>Deals Pipeline
                             <span class="badge bg-primary ms-1 rounded-pill" id="dealsTabBadge">0</span>
+                        </button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link fw-semibold" id="active-deals-tab" type="button" onclick="setQuickFilter('ACTIVE')" title="View and work on active opportunities">
+                            <i class="bi bi-lightning-charge-fill me-1 text-warning"></i>Active Deals
+                            <span class="badge bg-warning text-dark ms-1 rounded-pill" id="activeDealsTabBadge">0</span>
                         </button>
                     </li>
                     <li class="nav-item">
@@ -2518,7 +2554,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const editCustomerModal = new bootstrap.Modal(document.getElementById('editCustomerModal'));
 
         document.addEventListener('DOMContentLoaded', () => {
-            loadAllData();
+            loadAllData().then(() => {
+                const urlParams = new URLSearchParams(window.location.search);
+                if (urlParams.get('view') === 'active' || urlParams.get('active_only') === 'true' || window.location.hash === '#active') {
+                    setQuickFilter('ACTIVE');
+                }
+            });
             loadDashboardMetrics();
         });
 
@@ -2572,6 +2613,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             const dealsBadge = document.getElementById('dealsTabBadge');
             if (dealsBadge) dealsBadge.textContent = allDeals.length;
+            const activeBadge = document.getElementById('activeDealsTabBadge');
+            if (activeBadge) activeBadge.textContent = activeDeals;
             const custBadge = document.getElementById('customersTabBadge');
             if (custBadge) custBadge.textContent = allCustomers.length;
         }

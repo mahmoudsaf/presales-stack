@@ -1357,11 +1357,14 @@ def complete_and_next_task(task_id: int, payload: TaskCompleteAndNext):
 
 
 @app.get("/api/deals-lookup", tags=["Deals"])
-def get_deals_lookup():
+def get_deals_lookup(active_only: bool = Query(False, description="Filter to active deals only (excludes Closed-Won and Closed-Lost)")):
     """Returns simplified deal and customer list for task linking dropdowns and deal-centric board grouping."""
     deal_map = get_deal_customer_map()
-    return [
-        {
+    items = []
+    for did, d in sorted(deal_map.items()):
+        if active_only and d.get("stage") in ("Closed-Won", "Closed-Lost"):
+            continue
+        items.append({
             "deal_id": did,
             "deal_name": d["deal_name"],
             "customer_id": d.get("customer_id"),
@@ -1372,9 +1375,8 @@ def get_deals_lookup():
             "assigned_presales": d.get("assigned_presales"),
             "stage": d.get("stage"),
             "estimated_value": d.get("estimated_value"),
-        }
-        for did, d in sorted(deal_map.items())
-    ]
+        })
+    return items
 
 
 @app.get("/api/customers-lookup", tags=["Customers"])
@@ -2861,61 +2863,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     </div>
                 `;
             });
-
-            // If there are unlinked tasks, render them in an Unassigned Tasks card
-            if (unlinkedTasks.length > 0 && (currentCategoryTab === 'ALL' || currentCategoryTab === 'GENERAL_ACTION')) {
-                const totalUnlinked = unlinkedTasks.length;
-                const completedUnlinked = unlinkedTasks.filter(t => t.status === 'Completed').length;
-                const unlinkedPct = Math.round((completedUnlinked / totalUnlinked) * 100);
-
-                html += `
-                    <div class="card border shadow-sm bg-white mb-3" style="border-radius: 12px; overflow: hidden; border: 1px dashed #94a3b8 !important;">
-                        <div class="card-header bg-light border-bottom p-3">
-                            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
-                                <div class="d-flex align-items-center gap-2">
-                                    <i class="bi bi-puzzle fs-4 text-warning"></i>
-                                    <div>
-                                        <h5 class="mb-0 fw-bold text-dark">General Presales Operations (Standalone Tasks)</h5>
-                                        <small class="text-muted">Tasks not yet associated with a specific CRM deal</small>
-                                    </div>
-                                    <span class="badge bg-secondary text-white ms-2">${totalUnlinked} Tasks</span>
-                                </div>
-                                <div>
-                                    <button class="btn btn-sm btn-outline-secondary" onclick="openNewTaskModal()">
-                                        <i class="bi bi-plus-circle me-1"></i>New Standalone Task
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="mt-2">
-                                <div class="small fw-semibold text-secondary mb-1">Progress: ${completedUnlinked} / ${totalUnlinked} Completed (${unlinkedPct}%)</div>
-                                <div class="progress" style="height: 8px;">
-                                    <div class="progress-bar bg-success" style="width: ${unlinkedPct}%"></div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="card-body p-0">
-                            <div class="table-responsive">
-                                <table class="table task-table mb-0 align-middle">
-                                    <thead class="bg-light text-muted small text-uppercase" style="font-size: 0.72rem;">
-                                        <tr>
-                                            <th class="text-start ps-3" style="width: 34%;">Task Description</th>
-                                            <th style="width: 13%;">Presales Assignee</th>
-                                            <th style="width: 10%;">Vendor</th>
-                                            <th style="width: 17%;">Status / Progress</th>
-                                            <th style="width: 8%;">Priority</th>
-                                            <th style="width: 10%;">Due Date</th>
-                                            <th class="text-end pe-3" style="width: 8%;">Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        ${unlinkedTasks.map(t => renderDealTaskRow(t, false, false)).join('')}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }
 
             container.innerHTML = html;
         }

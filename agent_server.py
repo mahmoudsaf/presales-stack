@@ -16,7 +16,15 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from customer_matcher import CUSTOMER_ALIASES, compute_customer_similarity, normalize_arabic
+from customer_matcher import (
+    CUSTOMER_ALIASES,
+    GENERIC_DEAL_WORDS,
+    NOISE_WORDS,
+    compute_customer_similarity,
+    extract_deal_scope_tokens,
+    get_customer_tokens,
+    normalize_arabic,
+)
 from task_catalog import PRE_RFP_TASKS, RFP_TASKS, ALL_ALLOWED_TASKS, normalize_to_catalog, is_pre_rfp_category
 
 # -----------------------------------------------------------------------------
@@ -61,6 +69,16 @@ def normalize_closing_date(v: Optional[Any]) -> Optional[str]:
         d, m, y = m_dmy.groups()
         return f"{y}-{int(m):02d}-{int(d):02d}"
     return s[:20]
+
+
+def get_vendors_str(v: Optional[Any]) -> str:
+    """Safely converts primary_vendors (str, list, None) into a normalized string."""
+    if not v:
+        return ""
+    if isinstance(v, list):
+        return " ".join(str(item).strip() for item in v if item)
+    return str(v).strip()
+
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
@@ -140,8 +158,8 @@ load_env_file()
 
 CRM_API_URL = os.getenv("CRM_API_URL", "http://127.0.0.1:8000/api")
 TASKS_API_URL = os.getenv("TASKS_API_URL", "http://127.0.0.1:8001/api")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest"]
 
 
 def generate_with_model_fallback(client: genai.Client, contents: Any, **kwargs):
@@ -219,7 +237,7 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 # Helper Functions: State Fetching & API Execution
 # -----------------------------------------------------------------------------
-async def fetch_baseline_state() -> Dict[str, Any]:
+async def fetch_baseline_state(active_only: bool = True) -> Dict[str, Any]:
     deals = []
     tasks = []
     crm_healthy = False
@@ -227,7 +245,8 @@ async def fetch_baseline_state() -> Dict[str, Any]:
 
     async with httpx.AsyncClient(timeout=8.0) as client:
         try:
-            r = await client.get(f"{CRM_API_URL}/deals")
+            url = f"{CRM_API_URL}/deals?active_only=true" if active_only else f"{CRM_API_URL}/deals"
+            r = await client.get(url)
             if r.status_code == 200:
                 deals = r.json()
                 crm_healthy = True
@@ -241,6 +260,10 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                 tasks_healthy = True
         except Exception as e:
             print(f"Warning: Could not fetch tasks from Tasks API: {e}")
+
+    # Enforce active_only filter to guarantee closed deals are completely excluded for scalability & precision
+    if active_only:
+        deals = [d for d in deals if d.get("stage") not in ("Closed-Won", "Closed-Lost")]
 
     # Ensure every task record has customer_name, deal_name, and customer_id populated
     deals_by_id = {}
@@ -325,8 +348,8 @@ async def fetch_baseline_state() -> Dict[str, Any]:
                     t["deal_name"] = t.get("deal_name") or "Cross-Functional Team Deliverables"
                     t["customer_name"] = t.get("customer_name") or "Internal Presales Team"
                 else:
-                    t["deal_name"] = t.get("deal_name") or "General Presales Deliverable"
-                    t["customer_name"] = t.get("customer_name") or "Presales Operations"
+                    t["deal_name"] = t.get("deal_name") or None
+                    t["customer_name"] = t.get("customer_name") or None
 
     return {
         "deals": deals,
@@ -636,58 +659,104 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
         cand_comp_norm = normalize_arabic(candidate_company or "")
         cand_deal_norm = normalize_arabic(candidate_deal or "")
 
+        # Check if incoming text introduces an explicitly new tender/project
+        is_explicit_new = any(kw in t_norm for kw in [
+            "مناقصه جديده", "كراسه جديده", "فرصه جديده", "مناقصه اخري", "كراسه اخري", "مشروع جديد"
+        ])
+
         best_deal = None
         best_score = 0.0
 
         for bd in baseline_deals:
             bd_id = bd.get("deal_id")
-            bd_comp = str(bd.get("company_name") or "")
+            bd_comp = str(bd.get("company_name") or bd.get("customer_name") or "")
             bd_deal = str(bd.get("deal_name") or "")
             bd_comp_norm = normalize_arabic(bd_comp)
-            bd_comp_low = bd_comp.lower()
             bd_deal_norm = normalize_arabic(bd_deal)
-            bd_deal_low = bd_deal.lower()
 
-            # 1. Direct Customer Alias Cluster Check (Highest confidence)
-            alias_matched = False
+            # Check if this baseline deal matches the candidate customer
+            cust_matched = False
+            # 1. Direct Customer Alias Cluster Check
             for cluster_id, aliases in CUSTOMER_ALIASES.items():
-                if any(normalize_arabic(a) in bd_comp_norm or a.lower() in bd_comp_low for a in aliases):
-                    if any(normalize_arabic(a) in t_norm or a.lower() in t_low or 
-                           (cand_comp_norm and normalize_arabic(a) in cand_comp_norm) or 
-                           (cand_deal_norm and normalize_arabic(a) in cand_deal_norm) or
-                           normalize_arabic(a) in full_context_norm or a.lower() in full_context_low
-                           for a in aliases):
-                        alias_matched = True
+                if any(normalize_arabic(a) in bd_comp_norm for a in aliases):
+                    if any(normalize_arabic(a) in t_norm or (cand_comp_norm and normalize_arabic(a) in cand_comp_norm) for a in aliases):
+                        cust_matched = True
                         break
-            if alias_matched:
-                return bd
 
             # 2. Customer Name Similarity
+            if not cust_matched and bd_comp:
+                if cand_comp_norm and cand_comp_norm not in ("general client", "client", "general", "عميل"):
+                    if compute_customer_similarity(bd_comp, candidate_company) >= 0.75:
+                        cust_matched = True
+                if not cust_matched and compute_customer_similarity(bd_comp, text) >= 0.75:
+                    cust_matched = True
+                if not cust_matched:
+                    _, core_tokens, stripped_tokens = get_customer_tokens(bd_comp)
+                    for token in core_tokens + stripped_tokens:
+                        if len(token) >= 3 and token not in NOISE_WORDS:
+                            t_boundary = rf"\b{re.escape(token)}\b"
+                            if re.search(t_boundary, t_norm) or token in t_norm.split():
+                                cust_matched = True
+                                break
+
+            # If customer does not match bd, continue
+            if not cust_matched:
+                continue
+
+            # If candidate introduces an explicit new tender, do NOT match existing deal!
+            if is_explicit_new:
+                continue
+
             score = 0.0
-            if bd_comp and candidate_company and candidate_company.lower() not in ("general client", "client", "general", "عميل"):
-                score = max(score, compute_customer_similarity(bd_comp, candidate_company))
-            if bd_comp:
-                score = max(score, compute_customer_similarity(bd_comp, text))
-                for token in re.split(r"[\s\-:،,]+", text):
-                    if len(token) > 2:
-                        score = max(score, compute_customer_similarity(bd_comp, token))
 
-            # 3. Deal Title Similarity
-            if bd_deal and candidate_deal and "general client" not in candidate_deal.lower():
-                d_sim = compute_customer_similarity(bd_deal, candidate_deal)
-                if d_sim >= 0.70:
-                    score = max(score, d_sim)
+            # Exact normalized deal name match
+            if cand_deal_norm and bd_deal_norm and cand_deal_norm == bd_deal_norm:
+                score = 10.0
+            else:
+                cand_scope = extract_deal_scope_tokens(candidate_deal or "", bd_comp)
+                bd_scope = extract_deal_scope_tokens(bd_deal, bd_comp)
 
-            # Direct substring / token fallback
-            if bd_comp and len(bd_comp) > 2 and (bd_comp_low in t_low or bd_comp_norm in t_norm):
-                score = max(score, 0.90)
+                if cand_scope and bd_scope:
+                    overlap = cand_scope & bd_scope
+                    if overlap:
+                        jaccard = len(overlap) / len(cand_scope | bd_scope)
+                        score = len(overlap) * 3.0 + jaccard * 4.0
+                    else:
+                        # Distinct project scopes for the same customer (e.g. ملقمات vs رخص vs إنكورت)!
+                        continue
+                elif not cand_scope:
+                    cand_is_generic = (
+                        not candidate_deal or 
+                        "general client" in (candidate_deal or "").lower() or
+                        candidate_deal in (f"مشروع {bd_comp}", bd_comp) or
+                        cand_deal_norm in (bd_comp_norm, f"مشروع {bd_comp_norm}", "مشروع", "مناقصه", "كراسه", "فرصه")
+                    )
+                    if cand_is_generic:
+                        cust_deals = [d for d in baseline_deals if (d.get("company_name") or d.get("customer_name")) == bd_comp or (bd.get("customer_id") and d.get("customer_id") == bd.get("customer_id"))]
+                        if len(cust_deals) == 1:
+                            score = 4.0
+                        else:
+                            if bd_scope and any(st in t_norm for st in bd_scope):
+                                score = 5.0
+
+                # Check vendor keyword match
+                p_vendors = get_vendors_str(bd.get("primary_vendors")).lower()
+                for v in ["huawei", "هواوي", "cisco", "سيسكو", "micro focus", "ميكروفوكس", "incorta", "انكورت", "hpe", "dell", "veeam"]:
+                    if v in p_vendors and (v in t_low or v in t_norm):
+                        score += 3.0
+
+                # Deal name string similarity
+                if candidate_deal and "general client" not in candidate_deal.lower():
+                    d_sim = compute_customer_similarity(bd_deal, candidate_deal)
+                    score += d_sim * 2.0
 
             if score > best_score:
                 best_score = score
                 best_deal = bd
 
-        if best_deal and best_score >= 0.75:
+        if best_deal and best_score >= 4.0:
             return best_deal
+
         return None
 
     reconciled_updates: List[Dict[str, Any]] = []
@@ -705,7 +774,27 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
 
         matched_bd = None
         if deal_id:
-            matched_bd = next((d for d in baseline_deals if d.get("deal_id") == deal_id), None)
+            matched_candidate = next((d for d in baseline_deals if d.get("deal_id") == deal_id), None)
+            if matched_candidate:
+                # Strictly verify that candidate deal name matches the existing deal name/scope
+                cand_scope = extract_deal_scope_tokens(deal or "", matched_candidate.get("company_name", ""))
+                bd_scope = extract_deal_scope_tokens(matched_candidate.get("deal_name", ""), matched_candidate.get("company_name", ""))
+                sim = compute_customer_similarity(matched_candidate.get("deal_name", ""), deal or "")
+
+                is_explicit_new = any(kw in normalize_arabic(notes) or kw in normalize_arabic(search_corpus) for kw in [
+                    "مناقصه جديده", "كراسه جديده", "فرصه جديده", "مناقصه اخري", "كراسه اخري", "مشروع جديد"
+                ])
+
+                if (cand_scope and bd_scope and not (cand_scope & bd_scope)) or (is_explicit_new and sim < 0.80):
+                    # Gemini erroneously sent PUT on an existing deal for a new/different tender!
+                    # Convert to POST to create a brand new deal!
+                    matched_bd = None
+                    deal_id = None
+                    cu["method"] = "POST"
+                    cu.pop("deal_id", None)
+                else:
+                    matched_bd = matched_candidate
+
         if not matched_bd:
             matched_bd = find_matching_deal(search_corpus, candidate_company=comp, candidate_deal=deal)
 
@@ -724,15 +813,17 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
                 else:
                     new_stage = matched_bd.get("stage") or "RFP / Tender"
 
-            # Determine Authentic Deal Name (never accept 'مشروع General Client')
+            # Determine Authentic Deal Name (never overwrite authentic deal name with different deal name)
             final_deal_name = matched_bd.get("deal_name")
-            if deal and str(deal).strip().lower() not in (
-                "مشروع general client", "general client", "مشروع متابعة الفرص",
-                f"مشروع {str(matched_bd.get('company_name', '')).lower()}"
-            ):
-                final_deal_name = deal
+            bd_scope = extract_deal_scope_tokens(final_deal_name or "", matched_bd.get("company_name", ""))
+            if not bd_scope or "general client" in (final_deal_name or "").lower():
+                if deal and str(deal).strip().lower() not in (
+                    "مشروع general client", "general client", "مشروع متابعة الفرص",
+                    f"مشروع {str(matched_bd.get('company_name', '')).lower()}"
+                ):
+                    final_deal_name = deal
 
-            # Merge Notes
+            # Merge Notes only if it is actually the same deal
             existing_notes = str(matched_bd.get("vendor_notes") or "").strip()
             if notes and notes not in existing_notes:
                 merged_notes = f"{existing_notes} | {notes}".strip(" |") if existing_notes else notes
@@ -776,60 +867,9 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
                ("general client" in deal_clean or not deal_clean):
                 # Discard phantom deal with no real customer entity
                 continue
+            cu["method"] = "POST"
+            cu.pop("deal_id", None)
             reconciled_updates.append(cu)
-
-    # If an existing deal was explicitly mentioned in the conversation progress/actions,
-    # but Gemini omitted a crm_update for it, synthesize a PUT update so CRM stays synchronized.
-    for bd in baseline_deals:
-        bd_id = bd.get("deal_id")
-        if bd_id in handled_deal_ids:
-            continue
-        bd_comp = str(bd.get("company_name") or "")
-        bd_deal = str(bd.get("deal_name") or "")
-        bd_comp_norm = normalize_arabic(bd_comp)
-        bd_comp_low = bd_comp.lower()
-
-        is_mentioned = False
-        for cluster_id, aliases in CUSTOMER_ALIASES.items():
-            if any(normalize_arabic(a) in bd_comp_norm or a.lower() in bd_comp_low for a in aliases):
-                if any(normalize_arabic(a) in full_context_norm or a.lower() in full_context_low for a in aliases):
-                    is_mentioned = True
-                    break
-        if not is_mentioned and bd_comp and len(bd_comp) > 2:
-            if bd_comp_low in full_context_low or bd_comp_norm in full_context_norm or compute_customer_similarity(bd_comp, full_context) >= 0.85:
-                is_mentioned = True
-
-        if is_mentioned:
-            relevant_progress = [p for p in progress_items + action_items if bd_comp_low in p.lower() or normalize_arabic(bd_comp) in normalize_arabic(p)]
-            if not relevant_progress:
-                relevant_progress = [summary]
-
-            search_all = f"{' '.join(relevant_progress)}".lower()
-            stage = bd.get("stage", "RFP / Tender")
-            if any(w in search_all for w in ["tender department", "إدارة المناقصات", "ارسال العرض", "send to tender", "submitted", "تسليم العرض"]):
-                stage = "Proposal"
-            elif any(w in search_all for w in ["prices", "quotations", "pricing", "تسعير", "الأسعار"]):
-                stage = "Proposal" if ("tender" in search_all or "مناقصات" in search_all) else "RFP / Tender"
-
-            notes = bd.get("vendor_notes") or ""
-            if relevant_progress and relevant_progress[0] not in notes:
-                notes = f"{notes} | {relevant_progress[0]}".strip(" |")
-
-            reconciled_updates.append({
-                "method": "PUT",
-                "deal_id": bd_id,
-                "payload": {
-                    "company_name": bd.get("company_name"),
-                    "deal_name": bd.get("deal_name"),
-                    "deal_category": bd.get("deal_category"),
-                    "stage": stage,
-                    "vendor_notes": notes,
-                    "primary_vendors": bd.get("primary_vendors") or ["General"],
-                    "estimated_value": bd.get("estimated_value") or 0.0,
-                    "closing_date": bd.get("closing_date"),
-                }
-            })
-            handled_deal_ids.add(bd_id)
 
     return reconciled_updates
 
@@ -874,10 +914,12 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         known_deals.append({
             "deal_id": d.get("deal_id"),
             "deal_name": d.get("deal_name", ""),
-            "customer_name": d.get("company_name", ""),
+            "customer_name": d.get("company_name") or d.get("customer_name") or "",
             "customer_id": d.get("customer_id"),
             "deal_category": d.get("deal_category"),
             "closing_date": d.get("closing_date"),
+            "primary_vendors": d.get("primary_vendors", ""),
+            "vendor_notes": d.get("vendor_notes", ""),
         })
 
     # Also check newly planned crm_updates (both POST and PUT)
@@ -898,14 +940,15 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "customer_id": c_id,
                 "deal_category": d_cat,
                 "closing_date": c_date,
+                "primary_vendors": p.get("primary_vendors", ""),
+                "vendor_notes": p.get("vendor_notes", ""),
             })
 
     def find_related_deal_and_context(text: str):
         t_low = text.lower()
         t_norm = normalize_arabic(text)
 
-        best_deal = None
-        best_score = 0.0
+        matching_deals = []
 
         for d in known_deals:
             d_id = d.get("deal_id")
@@ -915,29 +958,74 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             d_cat = d.get("deal_category")
             c_date = d.get("closing_date")
 
-            # Check customer similarity
+            cust_matched = False
+            # 1. Customer similarity
             if c_name:
                 sim = compute_customer_similarity(c_name, text)
-                if sim > best_score:
-                    best_score = sim
-                    best_deal = (d_id, d_name, c_name, c_id, d_cat, c_date)
                 for seg in text.split(" - "):
-                    seg_sim = compute_customer_similarity(c_name, seg.strip())
-                    if seg_sim > best_score:
-                        best_score = seg_sim
-                        best_deal = (d_id, d_name, c_name, c_id, d_cat, c_date)
+                    sim = max(sim, compute_customer_similarity(c_name, seg.strip()))
+                if sim >= 0.75:
+                    cust_matched = True
 
-            # Direct token / substring fallback
-            if c_name and len(c_name) > 2 and (c_name.lower() in t_low or normalize_arabic(c_name) in t_norm):
-                return d_id, d_name, c_name, c_id, d_cat, c_date
-            if d_name and len(d_name) > 3 and (d_name.lower() in t_low or t_low in d_name.lower() or normalize_arabic(d_name) in t_norm):
-                return d_id, d_name, c_name, c_id, d_cat, c_date
-            for token in c_name.split():
-                if len(token) > 2 and (token.lower() in t_low or normalize_arabic(token) in t_norm):
-                    return d_id, d_name, c_name, c_id, d_cat, c_date
+            # 2. Customer aliases
+            if not cust_matched and c_name:
+                c_norm = normalize_arabic(c_name)
+                for cluster_id, aliases in CUSTOMER_ALIASES.items():
+                    if any(normalize_arabic(a) in c_norm for a in aliases):
+                        if any(normalize_arabic(a) in t_norm or a.lower() in t_low for a in aliases):
+                            cust_matched = True
+                            break
 
-        if best_deal and best_score >= 0.80:
-            return best_deal
+            # 3. Direct core tokens (never noise words like وزارة / شركة)
+            if not cust_matched and c_name:
+                _, core_tokens, stripped_tokens = get_customer_tokens(c_name)
+                for token in core_tokens + stripped_tokens:
+                    if len(token) >= 3 and token not in NOISE_WORDS:
+                        t_word_boundary = rf"\b{re.escape(token)}\b"
+                        if re.search(t_word_boundary, t_norm) or token in t_norm.split():
+                            cust_matched = True
+                            break
+
+            # 4. Direct authentic deal title match
+            deal_title_matched = False
+            d_norm = normalize_arabic(d_name)
+            if d_name and len(d_norm) > 6 and d_norm in t_norm:
+                deal_title_matched = True
+
+            if cust_matched or deal_title_matched:
+                # Score this deal based on project scope keyword match with text
+                d_scope = extract_deal_scope_tokens(d_name, c_name)
+                scope_score = 1 if cust_matched else 4
+                for st in d_scope:
+                    if st in t_norm:
+                        scope_score += 4
+                # Check vendor keyword match
+                p_vendors = get_vendors_str(d.get("primary_vendors")).lower()
+                for v, ar in [("huawei", "هواوي"), ("cisco", "سيسكو"), ("micro focus", "ميكروفوكس"), ("incorta", "انكورت"), ("dell", "ديل"), ("hpe", "اتش بي"), ("veeam", "فيم"), ("nutanix", "نيوتانكس"), ("vmware", "فيموير")]:
+                    if (v in p_vendors or ar in p_vendors) and (v in t_low or ar in t_norm):
+                        scope_score += 3
+
+        # Fallback: if no match found via customer/deal name, check if text matches a unique vendor
+        # in newly discussed/updated deals from the same meeting
+        if not matching_deals:
+            for d in known_deals:
+                d_id = d.get("deal_id")
+                d_name = d.get("deal_name", "")
+                c_name = d.get("customer_name", "")
+                c_id = d.get("customer_id")
+                d_cat = d.get("deal_category")
+                c_date = d.get("closing_date")
+                p_vendors = get_vendors_str(d.get("primary_vendors")).lower()
+                notes_low = str(d.get("vendor_notes", "")).lower()
+                for v, ar in [("huawei", "هواوي"), ("cisco", "سيسكو"), ("micro focus", "ميكروفوكس"), ("incorta", "انكورت"), ("dell", "ديل"), ("hpe", "اتش بي"), ("veeam", "فيم"), ("nutanix", "نيوتانكس"), ("vmware", "فيموير")]:
+                    if (v in p_vendors or ar in p_vendors or v in notes_low or ar in notes_low) and (v in t_low or ar in t_norm):
+                        matching_deals.append((2, d_id, d_name, c_name, c_id, d_cat, c_date))
+                        break
+
+        if matching_deals:
+            matching_deals.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            best = matching_deals[0]
+            return best[1], best[2], best[3], best[4], best[5], best[6]
 
         return None, None, None, None, None, None
 
@@ -957,8 +1045,13 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
 
     def detect_assigned(text: str) -> str:
         t_low = text.lower()
-        if "presales 2" in t_low or "rep 2" in t_low:
+        t_norm = normalize_arabic(text)
+        if any(w in t_low for w in ["presales 2", "presales2", "rep 2", "rep2", "engineer 2", "presales-2", "rep-2"]):
             return "Presales 2"
+        if any(w in t_norm for w in ["بريسيلز 2", "بريسيلز2", "مهندس 2", "المهندس الثاني", "الزميل 2"]):
+            return "Presales 2"
+        if "abdullah" in t_low or "عبدالله" in t_norm or "عبد الله" in t_norm:
+            return "Presales 1"
         return "Presales 1"
 
     def detect_category(text: str):
@@ -978,7 +1071,8 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             return normalize_closing_date(m2.group(1))
         return None
 
-    # Enrich any tasks generated directly by Gemini
+    # Enrich and validate any tasks generated directly by Gemini
+    reconciled_task_updates = []
     for tu in task_updates:
         p = tu.get("payload", {})
         t_text = f"{p.get('task_title', '')} {p.get('management_blockers', '')} {p.get('deal_name', '')} {p.get('customer_name', '')}"
@@ -1002,19 +1096,128 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
         if raw_t and raw_t != p["task_title"] and not p.get("management_blockers"):
             p["management_blockers"] = f"Context: {raw_t}"
 
-    # 1. Reconcile tomorrow's actions
+        # CRITICAL MULTI-PRESALES & DISTRIBUTED SCOPE CHECK:
+        # If Gemini generated a PUT on an existing task owned by Presales 1, but this task/update
+        # is for Presales 2 (or vice versa) receiving a distributed scope:
+        if tu.get("method") == "PUT" and tu.get("task_id"):
+            t_id = tu.get("task_id")
+            old_task = next((bt for bt in (baseline_tasks or []) if bt.get("task_id") == t_id), None)
+            if old_task:
+                old_assigned = old_task.get("assigned_to", "Presales 1")
+                new_assigned = p.get("assigned_to") or detect_assigned(t_text)
+                is_dist = (
+                    p.get("category") == "RFP_DISTRIBUTED_SCOPE" or
+                    p.get("deal_category") == "2- RFP Distributed Scope Items" or
+                    any(kw in str(p.get("management_blockers", "")).lower() for kw in ["distributed", "scope", "موزع", "نطاق"]) or
+                    any(kw in str(raw_t).lower() for kw in ["distributed", "scope", "موزع", "نطاق"])
+                )
+                if is_dist and new_assigned != old_assigned:
+                    # Do NOT overwrite old_task! Convert into a new POST task for the other presales engineer
+                    tu = {
+                        "method": "POST",
+                        "payload": {
+                            **p,
+                            "assigned_to": new_assigned,
+                            "category": "RFP_DISTRIBUTED_SCOPE",
+                            "deal_category": "2- RFP Distributed Scope Items",
+                            "related_deal_id": p.get("related_deal_id") or old_task.get("related_deal_id"),
+                            "deal_name": p.get("deal_name") or old_task.get("deal_name"),
+                            "customer_name": p.get("customer_name") or old_task.get("customer_name"),
+                            "customer_id": p.get("customer_id") or old_task.get("customer_id"),
+                            "status": "In Progress",
+                        }
+                    }
+        reconciled_task_updates.append(tu)
+    task_updates = reconciled_task_updates
+
+    # 1. Process today_progress: check if another presales received a distributed scope on an existing deal
+    for prog in progress:
+        prog_text = str(prog).strip()
+        if not prog_text:
+            continue
+        prog_low = prog_text.lower()
+        prog_norm = normalize_arabic(prog_text)
+
+        is_dist_scope = (
+            any(w in prog_low for w in ["distributed scope", "received scope", "scope received", "distributed to", "received distributed", "scope breakdown", "assigned scope"]) or
+            any(w in prog_norm for w in ["نطاق موزع", "استلم نطاق", "استلمت نطاق", "توزيع نطاق", "نطاق العمل الموزع", "استلام كراسه", "استلام نطاق", "استلمت الكراسة"])
+        )
+        mentions_other_rep = (
+            any(w in prog_low for w in ["presales 2", "rep 2", "presales2"]) or
+            any(w in prog_norm for w in ["بريسيلز 2", "مهندس 2", "المهندس الثاني", "الزميل 2"])
+        )
+
+        if is_dist_scope or (mentions_other_rep and any(w in prog_low or w in prog_norm for w in ["scope", "rfp", "tender", "نطاق", "كراسة", "مناقصة"])):
+            d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(prog_text)
+            if d_id:
+                target_rep = detect_assigned(prog_text)
+                canonical_prog_title = normalize_to_catalog(prog_text, "2- RFP Distributed Scope Items")
+                if canonical_prog_title in ("Discovery & Technical Requirements Gathering", "RFP Decomposition & Scope Breakdown"):
+                    if any(w in prog_low or w in prog_norm for w in ["boq", "quotation", "تسعير", "اسعار", "سعات", "pricing"]):
+                        canonical_prog_title = "Final BoQ & Vendor Quotations"
+                    else:
+                        canonical_prog_title = "Low-Level Architecture & Technical Write-up"
+
+                # Check if a task for this rep on this deal is already enqueued
+                already_enqueued = any(
+                    t.get("payload", {}).get("related_deal_id") == d_id and
+                    t.get("payload", {}).get("assigned_to") == target_rep
+                    for t in task_updates
+                )
+                if not already_enqueued:
+                    task_updates.append({
+                        "method": "POST",
+                        "payload": {
+                            "task_title": canonical_prog_title,
+                            "management_blockers": f"Distributed scope received: {prog_text}",
+                            "category": "RFP_DISTRIBUTED_SCOPE",
+                            "deal_category": "2- RFP Distributed Scope Items",
+                            "closing_date": c_date or detect_closing_date(prog_text),
+                            "assigned_to": target_rep,
+                            "vendor_domain": detect_vendor(prog_text),
+                            "status": "In Progress",
+                            "priority": "High",
+                            "related_deal_id": d_id,
+                            "deal_name": d_name,
+                            "customer_id": c_id,
+                            "customer_name": c_name,
+                            "changed_by": "Voice Agent",
+                        }
+                    })
+                    existing_titles.append(canonical_prog_title.lower())
+
+    # 2. Reconcile tomorrow's actions
     for action in actions:
         action_text = str(action).strip()
         if not action_text:
             continue
         act_low = action_text.lower()
+        act_norm = normalize_arabic(action_text)
 
         d_id, d_name, c_name, c_id, d_cat, c_date = find_related_deal_and_context(action_text)
         cat_key, cat_name = detect_category(action_text)
         closing_dt = c_date or detect_closing_date(action_text)
+        target_rep = detect_assigned(action_text)
+
+        # If action mentions distributed scope or is for another presales on an existing RFP deal
+        if any(w in act_low for w in ["scope", "distributed", "renewal"]) or any(w in act_norm for w in ["موزع", "نطاق", "تجديد"]):
+            cat_key = "RFP_DISTRIBUTED_SCOPE"
+            cat_name = "2- RFP Distributed Scope Items"
+        elif d_id and target_rep == "Presales 2":
+            matched_bd = next((d for d in baseline_deals if d.get("deal_id") == d_id), None)
+            if matched_bd and matched_bd.get("assigned_presales") == "Presales 1":
+                cat_key = "RFP_DISTRIBUTED_SCOPE"
+                cat_name = "2- RFP Distributed Scope Items"
 
         canonical_action_title = normalize_to_catalog(action_text, d_cat or cat_name)
-        if any(t.get("payload", {}).get("task_title") == canonical_action_title and t.get("payload", {}).get("related_deal_id") == d_id for t in task_updates):
+        
+        # Deduplication must be per (task_title, related_deal_id, assigned_to) to avoid suppressing tasks for other presales
+        if any(
+            t.get("payload", {}).get("task_title") == canonical_action_title 
+            and t.get("payload", {}).get("related_deal_id") == d_id
+            and t.get("payload", {}).get("assigned_to") == target_rep
+            for t in task_updates
+        ):
             continue
 
         task_updates.append({
@@ -1025,7 +1228,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 "category": cat_key,
                 "deal_category": d_cat or cat_name,
                 "closing_date": closing_dt,
-                "assigned_to": detect_assigned(action_text),
+                "assigned_to": target_rep,
                 "vendor_domain": detect_vendor(action_text),
                 "status": "In Progress",
                 "priority": "High" if ("tender" in act_low or "rfp" in act_low or "مناقصة" in act_low) else "Medium",
@@ -1672,7 +1875,14 @@ CRITICAL LANGUAGE & TRANSCRIPTION RULES (STRICT REQUIREMENT):
    - Never translate Arabic deal names (e.g. keep "مناقصة وزارة التخطيط", "توريد أجهزة ديل", "مشروع منصة الحج والعمرة", "تجديد رخص فيم").
    - When creating or updating deals or tasks, use the original Arabic deal/opportunity name as spoken.
 
-BASELINE CRM DEALS:
+3. ONLY LOOK AT ACTIVE DEALS (SCALABILITY & ACCURACY RULE):
+   - BASELINE CRM DEALS contains ONLY CURRENT ACTIVE DEALS (Discovery, Gathering Requirements, RFP / Tender, PoC, Proposal).
+   - Historical closed deals (Closed-Won, Closed-Lost) are completed and omitted for scalability and to prevent confusion with previous deals.
+   - Always compare spoken opportunities and tenders against current ACTIVE deals in BASELINE CRM DEALS.
+   - If a deal is completed/won/lost, update the active deal's stage to "Closed-Won" or "Closed-Lost".
+   - Do NOT confuse new opportunities with previous closed tenders.
+
+BASELINE CRM DEALS (CURRENT ACTIVE DEALS ONLY):
 {json.dumps(deals, indent=2, ensure_ascii=False)}
 
 BASELINE TASK BOARD:
@@ -1726,15 +1936,17 @@ Your responsibilities:
          8. "Final Technical Review & Commercial Handover"
        * ANY spoken details, engineer comments, partner coordination, site visits, or specific hardware context MUST be placed in `management_blockers` or notes, NEVER replacing the standardized catalog `task_title`.
 
-        MANDATORY 4-STEP AGENT DATA PIPELINE:
-        1. Determine whether a deal is NEW or EXISTING (CRITICAL - NO DUPLICATES):
-           - ALWAYS extract the customer name and deal name from the conversation.
-           - Compare against BASELINE CRM DEALS above.
-           - If a customer or deal already exists in BASELINE CRM DEALS (e.g. "المراعي", "وزارة الداخلية") or if the speaker is following up on a previously mentioned RFP/opportunity:
-             * YOU MUST USE "method": "PUT" WITH "deal_id" TO UPDATE THAT EXISTING DEAL.
-             * NEVER use "POST" to create a duplicate deal for an existing customer's RFP/project.
-             * NEVER use generic fallback names like "مشروع General Client" or "General Client". ALWAYS use the real organization and deal name.
-           - ONLY if this is a genuinely new, distinct customer/project not present in BASELINE CRM DEALS: use "method": "POST" with payload.
+        MANDATORY 5-STEP AGENT DATA PIPELINE:
+        1. Determine whether a deal is NEW or EXISTING (CRITICAL - DEAL NAME SIMILARITY RULE):
+           - ALWAYS extract the exact customer name and deal/tender title from the conversation.
+           - A SINGLE customer can have MULTIPLE distinct tenders/RFPs/projects simultaneously (e.g. one for Software Licenses, one for Servers, one for Laptops, one for Networking).
+           - Compare the spoken deal/tender name against existing deal names in BASELINE CRM DEALS:
+             * IF AND ONLY IF the speaker is following up on an EXISTING deal with the SAME or SIMILAR deal name (e.g. updating prices, submitting clarifications, sending to tender department, changing stage for that project):
+               Use "method": "PUT" WITH that specific "deal_id" to update that existing deal.
+             * IF the speaker mentions receiving a NEW tender, a new RFP, or a project with a DIFFERENT name or scope (e.g. Incorta licenses, server procurement, laptops, networking):
+               YOU MUST USE "method": "POST" to create a BRAND NEW DEAL, even if the customer already has other deals!
+               NEVER modify an existing deal or append notes to an existing deal if the project/tender is distinct!
+             * NEVER use generic fallback names like "مشروع General Client" or "General Client". ALWAYS use the real organization and authentic deal name.
         2. Update Deal Context:
            - Capture deal stage progression, estimated value, closing date, vendor notes, and primary vendors.
         3. Update Existing Task Statuses:
@@ -1743,6 +1955,22 @@ Your responsibilities:
         4. Enqueue the Next Action strictly from the Catalog:
            - Choose the logical next deliverable strictly from PRE_RFP_TASKS (for Opportunity Efforts) or RFP_TASKS (for RFPs).
            - Formulate a "POST" in task_updates linked to the deal, chained to the finished task via "previous_task_id", and set status to "In Progress" or "Not Started".
+        5. MULTI-PRESALES & DISTRIBUTED SCOPE TASK CREATION RULE (CRITICAL):
+           - If the same deal has been distributed to another presales engineer as well, and the other presales engineer informs that he received the distributed scope (e.g. Deal owned by Presales 1, and Presales 2 informs he received the distributed scope for Dell / Nutanix, or vice versa):
+             * CRM DEAL: Add/amend the update to the SAME existing deal using "method": "PUT" with that deal's "deal_id". Append notes to "vendor_notes" and merge vendors into "primary_vendors". DO NOT create a duplicate deal!
+             * TASK BOARD: DO NOT add progress to the same task or overwrite the other presales' existing task!
+             * INSTEAD, GENERATE A BRAND NEW TASK ("method": "POST") for the other presales engineer:
+               - "assigned_to": The presales engineer who received the distributed scope ("Presales 2" or "Presales 1").
+               - "category": "RFP_DISTRIBUTED_SCOPE".
+               - "deal_category": "2- RFP Distributed Scope Items".
+               - "task_title": Standardized catalog item for their deliverable (e.g. "Low-Level Architecture & Technical Write-up", "Final BoQ & Vendor Quotations", "Technical Compliance Matrix", or "RFP Decomposition & Scope Breakdown").
+               - "vendor_domain": Technology domain of their distributed scope (e.g. "Nutanix", "Dell", "HPE", "Veeam", "VMware", "General").
+               - "status": "In Progress" (or "Not Started").
+               - "related_deal_id": The existing deal's integer deal_id.
+               - "deal_name": The existing deal's name.
+               - "customer_name": The customer name.
+               - "customer_id": The customer ID.
+               - "management_blockers": Specific distributed scope details and notes from that engineer.
 
         IMPORTANT CONSTRAINTS FOR TASKS:
         * task_title: MUST be verbatim from PRE_RFP_TASKS or RFP_TASKS above.
@@ -1837,10 +2065,16 @@ Return STRICT JSON matching this schema:
         raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
 
     # 3. Automatically synchronize detected updates to local APIs with comprehensive reconciliation
-    crm_updates = reconcile_crm_updates_from_conversation(ai_data, deals)
-    ai_data["crm_updates"] = crm_updates
-    task_updates = reconcile_tasks_from_conversation(ai_data, deals, tasks)
-    sync_log = await execute_api_sync(crm_updates, task_updates)
+    try:
+        crm_updates = reconcile_crm_updates_from_conversation(ai_data, deals)
+        ai_data["crm_updates"] = crm_updates
+        task_updates = reconcile_tasks_from_conversation(ai_data, deals, tasks)
+        sync_log = await execute_api_sync(crm_updates, task_updates)
+    except Exception as e:
+        print(f"Reconciliation or API sync error in process_audio: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"API Sync & Reconciliation error: {str(e)}")
 
     return {
         "status": "success",
@@ -2773,17 +3007,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 });
 
                 if (!res.ok) {
-                    const err = await res.json();
-                    alert('Audio processing error: ' + (err.detail || JSON.stringify(err)));
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
+                    let errDetail = 'Server error (' + res.status + ')';
+                    try {
+                        const err = await res.json();
+                        errDetail = err.detail || JSON.stringify(err);
+                    } catch(e) {
+                        try {
+                            const txt = await res.text();
+                            if (txt) errDetail = txt;
+                        } catch(e2) {}
+                    }
+                    alert('Audio processing error: ' + errDetail);
                     return;
                 }
 
                 const data = await res.json();
                 renderResults(data);
             } catch (err) {
-                alert('Network error communicating with Voice Agent server.');
+                console.error("Audio processing failed:", err);
+                alert('Communication error: ' + (err.message || 'Network error communicating with Voice Agent server.'));
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';

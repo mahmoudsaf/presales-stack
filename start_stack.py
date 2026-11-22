@@ -10,6 +10,16 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
+PLACEHOLDER_SUBSTRINGS = ["your_actual", "placeholder", "aizasyyouractual"]
+
+
+def is_placeholder(val: str) -> bool:
+    if not val:
+        return True
+    s = val.strip().lower()
+    return any(p in s for p in PLACEHOLDER_SUBSTRINGS) or s.startswith("your_")
+
+
 # Auto-load .env file if present
 if ENV_FILE.exists():
     try:
@@ -20,8 +30,10 @@ if ENV_FILE.exists():
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip("\"'")
-                    if k and not os.environ.get(k):
-                        os.environ[k] = v
+                    if k and v and not is_placeholder(v):
+                        curr = os.environ.get(k, "")
+                        if not curr or is_placeholder(curr) or k == "GEMINI_API_KEY":
+                            os.environ[k] = v
     except Exception:
         pass
 
@@ -87,6 +99,7 @@ def main():
     print("=" * 70)
 
     # Launch subprocesses
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     for svc in SERVICES:
         print(f"Starting {svc['name']} on port {svc['port']}...")
         proc = subprocess.Popen(
@@ -94,6 +107,7 @@ def main():
             cwd=str(BASE_DIR),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
+            creationflags=flags,
         )
         processes.append(proc)
 

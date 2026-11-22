@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  presales-stack:
+    build: .
+    container_name: presales-stack
+    restart: always
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      - ./crm.db:/app/crm.db
+      - ./tasks.db:/app/tasks.db
+      - ./.env:/app/.env

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: presales-stack
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: GEMINI_API_KEY
+        sync: false
+    autoDeploy: true

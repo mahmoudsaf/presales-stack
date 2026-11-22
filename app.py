@@ -1038,10 +1038,13 @@ def create_deal(payload: DealCreate):
     close_dt = normalize_closing_date(payload.closing_date)
     vendors_str = ", ".join(payload.primary_vendors) if payload.primary_vendors else "General"
 
-    # 2. Check for existing deal deduplication under this customer
+    # 2. Check for existing ACTIVE deal deduplication under this customer (strictly exclude Closed-Won / Closed-Lost)
     matched_existing_deal = None
     if existing_customer:
-        cursor.execute("SELECT * FROM deals WHERE customer_id = ? ORDER BY updated_at DESC, deal_id DESC;", (customer_id,))
+        cursor.execute(
+            "SELECT * FROM deals WHERE customer_id = ? AND stage NOT IN ('Closed-Won', 'Closed-Lost') ORDER BY updated_at DESC, deal_id DESC;",
+            (customer_id,),
+        )
         cust_deals = cursor.fetchall()
 
         req_deal_name = payload.deal_name.strip()
@@ -1281,7 +1284,7 @@ def update_deal(deal_id: int, payload: DealUpdate):
         update_clauses.append("vendor_notes = ?")
         params.append(payload.vendor_notes.strip())
 
-    now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     update_clauses.append("updated_at = ?")
     params.append(now_iso)
 
@@ -1673,6 +1676,41 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             box-shadow: 0 10px 15px -3px rgba(0,0,0,0.08);
             border-color: #0d6efd !important;
         }
+        /* Same-day status highlighting: Green = New Today, Orange = Modified Today */
+        .deal-row-new-today > td {
+            background-color: #dcfce7 !important;
+            transition: background-color 0.15s ease;
+        }
+        .deal-row-new-today > td:first-child {
+            border-left: 5px solid #16a34a !important;
+        }
+        .deal-row-new-today:hover > td {
+            background-color: #bbf7d0 !important;
+        }
+        .deal-row-modified-today > td {
+            background-color: #ffedd5 !important;
+            transition: background-color 0.15s ease;
+        }
+        .deal-row-modified-today > td:first-child {
+            border-left: 5px solid #ea580c !important;
+        }
+        .deal-row-modified-today:hover > td {
+            background-color: #fed7aa !important;
+        }
+        .badge-new-today {
+            background-color: #16a34a !important;
+            color: #ffffff !important;
+            font-weight: 700;
+            font-size: 0.72rem;
+            letter-spacing: 0.3px;
+        }
+        .badge-modified-today {
+            background-color: #ea580c !important;
+            color: #ffffff !important;
+            font-weight: 700;
+            font-size: 0.72rem;
+            letter-spacing: 0.3px;
+        }
     </style>
 </head>
 <body>
@@ -2056,6 +2094,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <div class="btn-group btn-group-sm ms-md-2" role="group">
                             <button type="button" class="btn btn-outline-secondary filter-btn" id="qf-P1" onclick="setQuickFilter('PRESALES_1', this)"><i class="bi bi-person me-1 text-primary"></i>Presales 1</button>
                             <button type="button" class="btn btn-outline-secondary filter-btn" id="qf-P2" onclick="setQuickFilter('PRESALES_2', this)"><i class="bi bi-person me-1 text-info"></i>Presales 2</button>
+                        </div>
+                        <div class="btn-group btn-group-sm ms-md-2" role="group">
+                            <button type="button" class="btn btn-outline-success filter-btn" id="qf-NEW_TODAY" onclick="setQuickFilter('NEW_TODAY', this)" title="Show new deals ingested today (Green)">
+                                <span class="d-inline-block rounded-circle me-1" style="width:8px;height:8px;background-color:#16a34a;"></span>New Today
+                            </button>
+                            <button type="button" class="btn btn-outline-warning text-dark filter-btn" id="qf-MODIFIED_TODAY" onclick="setQuickFilter('MODIFIED_TODAY', this)" title="Show deals modified today (Orange)">
+                                <span class="d-inline-block rounded-circle me-1" style="width:8px;height:8px;background-color:#ea580c;"></span>Modified Today
+                            </button>
                         </div>
                     </div>
 
@@ -2593,6 +2639,37 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         function formatCurrency(num) {
             return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(num || 0);
+        }
+
+        function getLocalTodayStr() {
+            const now = new Date();
+            const y = now.getFullYear();
+            const m = String(now.getMonth() + 1).padStart(2, '0');
+            const d = String(now.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+
+        function getUtcTodayStr() {
+            return new Date().toISOString().substring(0, 10);
+        }
+
+        function isTodayDateStr(datePart) {
+            if (!datePart) return false;
+            return datePart === getLocalTodayStr() || datePart === getUtcTodayStr();
+        }
+
+        function getRecordDayStatus(createdAt, updatedAt) {
+            const cStr = String(createdAt || '').trim();
+            const uStr = String(updatedAt || '').trim();
+            const cDate = cStr.substring(0, 10);
+            const uDate = uStr.substring(0, 10);
+            if (isTodayDateStr(uDate) && uStr && cStr && uStr !== cStr) {
+                return 'MODIFIED_TODAY';
+            }
+            if (isTodayDateStr(cDate)) {
+                return 'NEW_TODAY';
+            }
+            return null;
         }
 
         function renderMetrics() {
@@ -3200,6 +3277,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 // Quick filter condition
                 if (currentQuickFilter === 'ACTIVE') {
                     if (d.stage === 'Closed-Won' || d.stage === 'Closed-Lost') return false;
+                } else if (currentQuickFilter === 'NEW_TODAY') {
+                    if (getRecordDayStatus(d.created_at, d.updated_at) !== 'NEW_TODAY') return false;
+                } else if (currentQuickFilter === 'MODIFIED_TODAY') {
+                    if (getRecordDayStatus(d.created_at, d.updated_at) !== 'MODIFIED_TODAY') return false;
                 } else if (currentQuickFilter === 'PRESALES_1') {
                     if (d.assigned_presales !== 'Presales 1') return false;
                 } else if (currentQuickFilter === 'PRESALES_2') {
@@ -3371,13 +3452,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     }
                 }
 
+                const dayStatus = getRecordDayStatus(d.created_at, d.updated_at);
+                const rowClass = dayStatus === 'NEW_TODAY' ? 'deal-row-new-today' : (dayStatus === 'MODIFIED_TODAY' ? 'deal-row-modified-today' : '');
+                const dayBadge = dayStatus === 'NEW_TODAY'
+                    ? '<span class="badge badge-new-today ms-2" title="Newly ingested/created today"><i class="bi bi-plus-circle-fill me-1"></i>NEW TODAY</span>'
+                    : (dayStatus === 'MODIFIED_TODAY'
+                        ? '<span class="badge badge-modified-today ms-2" title="Modified/updated today"><i class="bi bi-pencil-fill me-1"></i>MODIFIED TODAY</span>'
+                        : '');
+
                 return `
-                    <tr>
+                    <tr class="${rowClass}">
                         <td class="text-center">
                             <span class="badge bg-primary-subtle text-primary border fw-bold">#${d.deal_id}</span>
                         </td>
                         <td>
-                            <div class="fw-bold text-dark">${d.deal_name}</div>
+                            <div class="fw-bold text-dark d-flex align-items-center flex-wrap">${d.deal_name}${dayBadge}</div>
                             ${d.vendor_notes ? `<div class="small text-muted text-truncate" style="max-width: 260px;" title="${d.vendor_notes}">${d.vendor_notes}</div>` : ''}
                         </td>
                         <td>${catBadge}</td>

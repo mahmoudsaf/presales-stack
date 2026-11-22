@@ -333,7 +333,7 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
-            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, d.assigned_presales, d.stage, d.estimated_value, c.company_name as customer_name
+            SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, d.assigned_presales, d.stage, d.estimated_value, d.created_at, d.updated_at, c.company_name as customer_name
             FROM deals d
             LEFT JOIN customers c ON d.customer_id = c.customer_id
             ORDER BY d.deal_id ASC
@@ -350,6 +350,8 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
                 "assigned_presales": r["assigned_presales"] or "Presales 1",
                 "stage": r["stage"] or "Discovery",
                 "estimated_value": r["estimated_value"] or 0.0,
+                "created_at": str(r["created_at"] or ""),
+                "updated_at": str(r["updated_at"] or ""),
             }
         conn.close()
     except Exception:
@@ -895,9 +897,9 @@ def get_tasks(
         query += " AND LOWER(vendor_domain) = LOWER(?)"
         params.append(vendor.strip())
     if created_today:
-        query += " AND date(created_at) = date('now')"
+        query += " AND (date(created_at) = date('now', 'localtime') OR date(created_at) = date('now'))"
     if completed_today:
-        query += " AND date(completed_at) = date('now')"
+        query += " AND (date(completed_at) = date('now', 'localtime') OR date(completed_at) = date('now'))"
     if completed_this_week:
         query += " AND date(completed_at) >= date('now', '-7 days')"
 
@@ -929,10 +931,10 @@ def get_velocity_metrics():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE date(created_at) = date('now');")
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE (date(created_at) = date('now', 'localtime') OR date(created_at) = date('now'));")
     created_today = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE date(completed_at) = date('now');")
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE (date(completed_at) = date('now', 'localtime') OR date(completed_at) = date('now'));")
     completed_today = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM tasks WHERE date(completed_at) >= date('now', '-7 days');")
@@ -1032,7 +1034,7 @@ def create_task(payload: TaskCreate):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cat_val = payload.category.value if hasattr(payload.category, "value") else str(payload.category)
     assigned_val = payload.assigned_to.value if hasattr(payload.assigned_to, "value") else str(payload.assigned_to)
@@ -1143,7 +1145,7 @@ def update_task(task_id: int, payload: TaskUpdate):
     old_started_at = current_row["started_at"]
     old_completed_at = current_row["completed_at"]
     old_assigned = current_row["assigned_to"]
-    now_iso = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     update_clauses = []
     params = []
@@ -1375,6 +1377,8 @@ def get_deals_lookup(active_only: bool = Query(False, description="Filter to act
             "assigned_presales": d.get("assigned_presales"),
             "stage": d.get("stage"),
             "estimated_value": d.get("estimated_value"),
+            "created_at": d.get("created_at"),
+            "updated_at": d.get("updated_at"),
         })
     return items
 
@@ -1717,6 +1721,57 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             height: 8px;
             transition: width 0.3s;
         }
+        /* Same-day status highlighting: Green = New Today, Orange = Modified Today */
+        .task-row-new-today > td {
+            background-color: #dcfce7 !important;
+            transition: background-color 0.15s ease;
+        }
+        .task-row-new-today > td:first-child {
+            border-left: 5px solid #16a34a !important;
+        }
+        .task-row-new-today:hover > td {
+            background-color: #bbf7d0 !important;
+        }
+        .task-row-modified-today > td {
+            background-color: #ffedd5 !important;
+            transition: background-color 0.15s ease;
+        }
+        .task-row-modified-today > td:first-child {
+            border-left: 5px solid #ea580c !important;
+        }
+        .task-row-modified-today:hover > td {
+            background-color: #fed7aa !important;
+        }
+        .deal-card-new-today {
+            border: 2px solid #16a34a !important;
+            box-shadow: 0 4px 12px rgba(22, 163, 74, 0.12) !important;
+        }
+        .deal-card-new-today > .card-header {
+            background-color: #f0fdf4 !important;
+            border-left: 5px solid #16a34a !important;
+        }
+        .deal-card-modified-today {
+            border: 2px solid #ea580c !important;
+            box-shadow: 0 4px 12px rgba(234, 88, 12, 0.12) !important;
+        }
+        .deal-card-modified-today > .card-header {
+            background-color: #fff7ed !important;
+            border-left: 5px solid #ea580c !important;
+        }
+        .badge-new-today {
+            background-color: #16a34a !important;
+            color: #ffffff !important;
+            font-weight: 700;
+            font-size: 0.72rem;
+            letter-spacing: 0.3px;
+        }
+        .badge-modified-today {
+            background-color: #ea580c !important;
+            color: #ffffff !important;
+            font-weight: 700;
+            font-size: 0.72rem;
+            letter-spacing: 0.3px;
+        }
     </style>
 </head>
 <body>
@@ -1749,7 +1804,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mt-3 pt-2 border-top">
             <div class="btn-group btn-group-sm flex-wrap" role="group">
                 <button type="button" class="btn btn-outline-secondary filter-btn active" onclick="setFilter('ALL', this)">All Items</button>
-                <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('CREATED_TODAY', this)"><i class="bi bi-calendar-plus me-1 text-primary"></i>Created Today</button>
+                <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('CREATED_TODAY', this)"><span class="d-inline-block rounded-circle me-1" style="width:8px;height:8px;background-color:#16a34a;"></span>New Today (Green)</button>
+                <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('MODIFIED_TODAY', this)"><span class="d-inline-block rounded-circle me-1" style="width:8px;height:8px;background-color:#ea580c;"></span>Modified Today (Orange)</button>
                 <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('COMPLETED_WEEK', this)"><i class="bi bi-calendar-check me-1 text-success"></i>Completed This Week</button>
                 <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('RFP_ONLY', this)">RFP Workstream</button>
                 <button type="button" class="btn btn-outline-secondary filter-btn" onclick="setFilter('PRESALES_1', this)">Presales 1</button>
@@ -2638,6 +2694,37 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             return '<span class="badge bg-success-subtle text-success border border-success-subtle"><i class="bi bi-bullseye me-1"></i>3- Opportunity Efforts & PO</span>';
         }
 
+        function getLocalTodayStr() {
+            const now = new Date();
+            const y = now.getFullYear();
+            const m = String(now.getMonth() + 1).padStart(2, '0');
+            const d = String(now.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+
+        function getUtcTodayStr() {
+            return new Date().toISOString().substring(0, 10);
+        }
+
+        function isTodayDateStr(datePart) {
+            if (!datePart) return false;
+            return datePart === getLocalTodayStr() || datePart === getUtcTodayStr();
+        }
+
+        function getRecordDayStatus(createdAt, updatedAt) {
+            const cStr = String(createdAt || '').trim();
+            const uStr = String(updatedAt || '').trim();
+            const cDate = cStr.substring(0, 10);
+            const uDate = uStr.substring(0, 10);
+            if (isTodayDateStr(uDate) && uStr && cStr && uStr !== cStr) {
+                return 'MODIFIED_TODAY';
+            }
+            if (isTodayDateStr(cDate)) {
+                return 'NEW_TODAY';
+            }
+            return null;
+        }
+
         function renderBoard() {
             const search = document.getElementById('searchInput').value.toLowerCase().trim();
 
@@ -2660,8 +2747,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 } else if (currentFilter === 'ACTIVE_ONLY') {
                     matchesFilter = t.status !== 'Completed';
                 } else if (currentFilter === 'CREATED_TODAY') {
-                    const todayStr = new Date().toISOString().substring(0, 10);
-                    matchesFilter = t.created_at && t.created_at.startsWith(todayStr);
+                    matchesFilter = getRecordDayStatus(t.created_at, t.updated_at) === 'NEW_TODAY' || isTodayDateStr((t.created_at || '').substring(0, 10));
+                } else if (currentFilter === 'MODIFIED_TODAY') {
+                    matchesFilter = getRecordDayStatus(t.created_at, t.updated_at) === 'MODIFIED_TODAY';
                 } else if (currentFilter === 'COMPLETED_WEEK') {
                     if (t.status !== 'Completed' || !t.completed_at) {
                         matchesFilter = false;
@@ -2771,8 +2859,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     </span>
                 ` : '';
 
+                const dealDayStatus = getRecordDayStatus(deal.created_at, deal.updated_at);
+                const dealCardDayClass = dealDayStatus === 'NEW_TODAY' ? 'deal-card-new-today' : (dealDayStatus === 'MODIFIED_TODAY' ? 'deal-card-modified-today' : '');
+                const dealDayBadge = dealDayStatus === 'NEW_TODAY'
+                    ? '<span class="badge badge-new-today py-1 px-2 d-inline-flex align-items-center gap-1" title="New deal ingested today"><i class="bi bi-plus-circle-fill"></i>NEW DEAL TODAY</span>'
+                    : (dealDayStatus === 'MODIFIED_TODAY'
+                        ? '<span class="badge badge-modified-today py-1 px-2 d-inline-flex align-items-center gap-1" title="Deal modified today"><i class="bi bi-pencil-fill"></i>MODIFIED TODAY</span>'
+                        : '');
+
                 html += `
-                    <div class="card border shadow-sm bg-white mb-3" style="border-radius: 12px; overflow: hidden; border: 1px solid var(--monday-border) !important;">
+                    <div class="card border shadow-sm bg-white mb-3 ${dealCardDayClass}" style="border-radius: 12px; overflow: hidden; ${dealCardDayClass ? '' : 'border: 1px solid var(--monday-border) !important;'}">
                         <!-- Deal Header -->
                         <div class="card-header bg-white border-bottom p-3">
                             <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
@@ -2782,6 +2878,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                         <i class="bi bi-briefcase-fill text-success"></i>
                                         <span>${deal.deal_name}</span>
                                     </h5>
+                                    ${dealDayBadge}
                                     <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem;">
                                         <i class="bi bi-building text-primary me-1"></i>${deal.customer_name || 'Customer'}
                                     </span>
@@ -2892,8 +2989,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 ? `<div class="small text-muted mt-1" style="font-size: 0.74rem;"><i class="bi bi-arrow-return-right text-primary me-1"></i>Follow-up to Task #${t.previous_task_id}</div>` 
                 : '';
 
+            const taskDayStatus = getRecordDayStatus(t.created_at, t.updated_at);
+            const taskRowDayClass = taskDayStatus === 'NEW_TODAY' ? 'task-row-new-today' : (taskDayStatus === 'MODIFIED_TODAY' ? 'task-row-modified-today' : '');
+            const taskDayBadge = taskDayStatus === 'NEW_TODAY'
+                ? `<span class="badge badge-new-today py-1 px-2 ms-2" title="New task ingested today"><i class="bi bi-plus-circle-fill me-1"></i>NEW TODAY</span>`
+                : (taskDayStatus === 'MODIFIED_TODAY'
+                    ? `<span class="badge badge-modified-today py-1 px-2 ms-2" title="Task modified today"><i class="bi bi-pencil-fill me-1"></i>MODIFIED TODAY</span>`
+                    : '');
+
             return `
-                <tr class="${isDone ? 'table-light bg-opacity-50' : ''}">
+                <tr class="${isDone ? 'table-light bg-opacity-50' : ''} ${taskRowDayClass}">
                     <!-- 1. Task Description -->
                     <td class="text-start ps-3">
                         <div class="d-flex align-items-start gap-2">
@@ -2909,6 +3014,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                        onclick="openEditTaskModal(${t.task_id})" title="Click to view/edit task details">
                                         ${t.task_title}
                                     </a>
+                                    ${taskDayBadge}
                                     ${latestBadge}
                                     ${parallelBadge}
                                 </div>
@@ -3098,8 +3204,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 </div>
             ` : '';
 
+            const taskDayStatus = getRecordDayStatus(t.created_at, t.updated_at);
+            const taskRowDayClass = taskDayStatus === 'NEW_TODAY' ? 'task-row-new-today' : (taskDayStatus === 'MODIFIED_TODAY' ? 'task-row-modified-today' : '');
+            const taskDayBadge = taskDayStatus === 'NEW_TODAY'
+                ? `<span class="badge badge-new-today py-1 px-2 ms-1" title="New task ingested today"><i class="bi bi-plus-circle-fill me-1"></i>NEW TODAY</span>`
+                : (taskDayStatus === 'MODIFIED_TODAY'
+                    ? `<span class="badge badge-modified-today py-1 px-2 ms-1" title="Task modified today"><i class="bi bi-pencil-fill me-1"></i>MODIFIED TODAY</span>`
+                    : '');
+
             return `
-                <tr>
+                <tr class="${taskRowDayClass}">
                     <!-- 1. Deal Name & Closing -->
                     <td class="text-start">
                         <div class="d-flex align-items-center gap-1">
@@ -3114,10 +3228,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
                     <!-- 2. Description (What it's about) -->
                     <td class="text-start">
-                        <div class="text-dark small fw-medium" title="${t.task_title}">
+                        <div class="text-dark small fw-medium d-flex align-items-center flex-wrap" title="${t.task_title}">
                             <a href="javascript:void(0)" class="text-dark text-decoration-none" onclick="openEditTaskModal(${t.task_id})">
                                 ${t.task_title}
                             </a>
+                            ${taskDayBadge}
                         </div>
                         ${blockerDisplay}
                     </td>

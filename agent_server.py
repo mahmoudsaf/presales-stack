@@ -278,6 +278,10 @@ async def fetch_baseline_state(active_only: bool = True) -> Dict[str, Any]:
                 "closing_date": d.get("closing_date"),
             }
 
+    # When active_only is enabled and CRM deals were fetched, exclude tasks tied to non-active (closed) deals
+    if active_only and crm_healthy:
+        tasks = [t for t in tasks if not t.get("related_deal_id") or t.get("related_deal_id") in deals_by_id]
+
     for t in tasks:
         rel_id = t.get("related_deal_id")
         if rel_id and rel_id in deals_by_id:
@@ -641,9 +645,11 @@ def sanitize_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Ensures that spoken updates regarding existing customers or deals are accurately mapped
-    to existing CRM deal records (using 'PUT' with deal_id) rather than creating duplicate deals (POST)
+    to existing ACTIVE CRM deal records (using 'PUT' with deal_id) rather than creating duplicate deals (POST)
     or phantom fallback deals named 'مشروع General Client'.
+    Strictly ignores non-active (Closed-Won / Closed-Lost) deals.
     """
+    baseline_deals = [d for d in (baseline_deals or []) if d.get("stage") not in ("Closed-Won", "Closed-Lost")]
     crm_updates = list(ai_data.get("crm_updates", []))
     summary = str(ai_data.get("transcript_summary", "") or "")
     exec_report = ai_data.get("executive_report", {}) or {}
@@ -653,14 +659,15 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
     full_context_low = full_context.lower()
     full_context_norm = normalize_arabic(full_context)
 
-    def find_matching_deal(text: str, candidate_company: Optional[str] = None, candidate_deal: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find_matching_deal(text: str, candidate_company: Optional[str] = None, candidate_deal: Optional[str] = None, item_notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
         t_low = text.lower()
         t_norm = normalize_arabic(text)
         cand_comp_norm = normalize_arabic(candidate_company or "")
         cand_deal_norm = normalize_arabic(candidate_deal or "")
+        item_specific_norm = normalize_arabic(f"{candidate_company or ''} {candidate_deal or ''} {item_notes or ''}")
 
-        # Check if incoming text introduces an explicitly new tender/project
-        is_explicit_new = any(kw in t_norm for kw in [
+        # Check if this specific item introduces an explicitly new tender/project
+        is_explicit_new = any(kw in item_specific_norm for kw in [
             "مناقصه جديده", "كراسه جديده", "فرصه جديده", "مناقصه اخري", "كراسه اخري", "مشروع جديد"
         ])
 
@@ -703,8 +710,8 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
             if not cust_matched:
                 continue
 
-            # If candidate introduces an explicit new tender, do NOT match existing deal!
-            if is_explicit_new:
+            # If candidate introduces an explicit new tender (and is not an exact deal name match), do NOT match existing deal!
+            if is_explicit_new and not (cand_deal_norm and bd_deal_norm and cand_deal_norm == bd_deal_norm):
                 continue
 
             score = 0.0
@@ -781,7 +788,8 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
                 bd_scope = extract_deal_scope_tokens(matched_candidate.get("deal_name", ""), matched_candidate.get("company_name", ""))
                 sim = compute_customer_similarity(matched_candidate.get("deal_name", ""), deal or "")
 
-                is_explicit_new = any(kw in normalize_arabic(notes) or kw in normalize_arabic(search_corpus) for kw in [
+                item_specific_norm = normalize_arabic(f"{comp or ''} {deal or ''} {notes}")
+                is_explicit_new = any(kw in item_specific_norm for kw in [
                     "مناقصه جديده", "كراسه جديده", "فرصه جديده", "مناقصه اخري", "كراسه اخري", "مشروع جديد"
                 ])
 
@@ -796,7 +804,7 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
                     matched_bd = matched_candidate
 
         if not matched_bd:
-            matched_bd = find_matching_deal(search_corpus, candidate_company=comp, candidate_deal=deal)
+            matched_bd = find_matching_deal(search_corpus, candidate_company=comp, candidate_deal=deal, item_notes=notes)
 
         if matched_bd:
             matched_id = matched_bd.get("deal_id")
@@ -879,7 +887,13 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
     Ensures that EVERY actionable deliverable, tender, or next step mentioned in the conversation
     is captured as a task in task_updates, eliminating gaps between executive report and task board.
     Attaches deal_id, deal_name, customer_name, deal_category, closing_date, and previous_task_id to tasks for full cross-system linkage.
+    Strictly operates only on active deals (excludes Closed-Won / Closed-Lost).
     """
+    baseline_deals = [d for d in (baseline_deals or []) if d.get("stage") not in ("Closed-Won", "Closed-Lost")]
+    active_deal_ids = {d.get("deal_id") for d in baseline_deals if d.get("deal_id")}
+    if baseline_tasks:
+        baseline_tasks = [t for t in baseline_tasks if not t.get("related_deal_id") or t.get("related_deal_id") in active_deal_ids]
+
     task_updates = list(ai_data.get("task_updates", []))
     existing_titles = [str(item.get("payload", {}).get("task_title", "")).lower() for item in task_updates]
     existing_titles += [str(item.get("payload", {}).get("title", "")).lower() for item in task_updates]
@@ -3051,18 +3065,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             if (!logs.length) {
                 tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-2">No API state deltas required modification.</td></tr>';
             } else {
-                tbody.innerHTML = logs.map(l => `
-                    <tr>
+                tbody.innerHTML = logs.map(l => {
+                    const isNew = l.method === 'POST';
+                    const rowStyle = isNew
+                        ? 'background-color: rgba(22, 163, 74, 0.18); border-left: 4px solid #16a34a;'
+                        : 'background-color: rgba(234, 88, 12, 0.18); border-left: 4px solid #ea580c;';
+                    const methodBadge = isNew
+                        ? '<span class="badge" style="background-color:#16a34a;color:#fff;">POST • NEW (Green)</span>'
+                        : `<span class="badge" style="background-color:#ea580c;color:#fff;">${l.method} • MODIFIED (Orange)</span>`;
+                    return `
+                    <tr style="${rowStyle}">
                         <td><span class="badge ${l.target === 'CRM' ? 'bg-primary' : 'bg-info'}">${l.target}</span></td>
-                        <td><code>${l.method}</code></td>
-                        <td class="small text-secondary text-truncate" style="max-width: 250px;">${l.endpoint}</td>
+                        <td>${methodBadge}</td>
+                        <td class="small text-light text-truncate" style="max-width: 250px;">${l.endpoint}</td>
                         <td>
                             <span class="badge ${l.success ? 'bg-success' : 'bg-danger'}">
                                 ${l.success ? '200 Synced' : 'Failed'}
                             </span>
                         </td>
                     </tr>
-                `).join('');
+                    `;
+                }).join('');
             }
 
             resultsCard.scrollIntoView({ behavior: 'smooth' });

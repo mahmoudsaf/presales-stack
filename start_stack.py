@@ -99,6 +99,7 @@ def main():
     print("=" * 70)
 
     # Launch subprocesses
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     for svc in SERVICES:
         print(f"Starting {svc['name']} on port {svc['port']}...")
         proc = subprocess.Popen(
@@ -106,6 +107,7 @@ def main():
             cwd=str(BASE_DIR),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
+            creationflags=flags,
         )
         processes.append(proc)
 

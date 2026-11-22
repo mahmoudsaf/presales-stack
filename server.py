@@ -1,6 +1,7 @@
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -38,9 +39,17 @@ INTERNAL_SERVICES = [
 ]
 
 
+def is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def start_internal_services():
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     for svc in INTERNAL_SERVICES:
+        if is_port_in_use(svc["port"]):
+            print(f"Service {svc['name']} is already active on 127.0.0.1:{svc['port']}.")
+            continue
         print(f"Starting internal service {svc['name']} on 127.0.0.1:{svc['port']}...")
         proc = subprocess.Popen(
             svc["command"],
@@ -89,6 +98,7 @@ http_client = httpx.AsyncClient(timeout=120.0)
 
 
 @gateway_app.get("/tasks", response_class=HTMLResponse)
+@gateway_app.get("/tasks/", response_class=HTMLResponse)
 async def tasks_ui():
     """Proxies Task Board HTML with rewritten relative asset paths."""
     try:
@@ -103,7 +113,9 @@ async def tasks_ui():
 
 
 @gateway_app.get("/voice", response_class=HTMLResponse)
+@gateway_app.get("/voice/", response_class=HTMLResponse)
 @gateway_app.get("/agent", response_class=HTMLResponse)
+@gateway_app.get("/agent/", response_class=HTMLResponse)
 async def voice_agent_ui():
     """Proxies Voice Agent HTML with rewritten relative asset paths."""
     try:
@@ -119,7 +131,7 @@ async def voice_agent_ui():
 @gateway_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def reverse_proxy(request: Request, path: str):
     """Dynamic reverse proxy dispatching to the 3 internal services seamlessly."""
-    # 1. Voice Agent Endpoints
+    # 1. Voice Agent Endpoints (Port 8002)
     agent_endpoints = [
         "api/process-audio",
         "api/audit-state",
@@ -130,10 +142,16 @@ async def reverse_proxy(request: Request, path: str):
     ]
     if any(path.startswith(ep) for ep in agent_endpoints):
         target_port = 8002
-    # 2. Tasks API Endpoints
-    elif path.startswith("api/tasks"):
+    # 2. Tasks API Endpoints (Task Board - Port 8001)
+    elif (
+        path.startswith("api/tasks")
+        or path.startswith("api/deals-lookup")
+        or path.startswith("api/customers-lookup")
+        or (path.startswith("api/deals/") and path.endswith("/tasks"))
+        or (request.method == "DELETE" and path.startswith("api/deals/"))
+    ):
         target_port = 8001
-    # 3. CRM Dashboard & All Other Endpoints
+    # 3. CRM Dashboard & All Other Endpoints (Port 8000)
     else:
         target_port = 8000
 

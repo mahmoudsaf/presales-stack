@@ -64,11 +64,15 @@ class VendorDomain(str, Enum):
 # -----------------------------------------------------------------------------
 # Database Setup & Initialization
 # -----------------------------------------------------------------------------
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+from db import get_db_connection as get_cloud_db, TASKS_DB_FILE, CRM_DB_FILE
+
+
+def get_db_connection():
+    return get_cloud_db(TASKS_DB_FILE)
+
+
+def get_crm_db_connection():
+    return get_cloud_db(CRM_DB_FILE)
 
 
 def init_db():
@@ -258,60 +262,58 @@ def init_db():
     cursor.execute("UPDATE tasks SET started_at = created_at WHERE status != 'Not Started' AND started_at IS NULL;")
     cursor.execute("UPDATE tasks SET completed_at = updated_at WHERE status = 'Completed' AND completed_at IS NULL;")
 
-    # Backfill deal_name, customer_name, and customer_id from crm.db if available
-    if CRM_DB_FILE.exists():
-        try:
-            crm_conn = sqlite3.connect(CRM_DB_FILE)
-            crm_conn.row_factory = sqlite3.Row
-            crm_cur = crm_conn.cursor()
-            crm_cur.execute("""
-                SELECT d.deal_id, d.deal_name, d.customer_id, d.deal_category, d.closing_date, c.company_name as customer_name
-                FROM deals d
-                LEFT JOIN customers c ON d.customer_id = c.customer_id
-            """)
-            for r in crm_cur.fetchall():
-                d_id = r["deal_id"]
-                d_name = r["deal_name"]
-                c_id = r["customer_id"]
-                c_name = r["customer_name"] or ""
-                d_cat = r["deal_category"] or ""
-                d_close = r["closing_date"] or ""
-                # Backfill linked tasks
+    # Backfill deal_name, customer_name, and customer_id from CRM if available
+    try:
+        crm_conn = get_crm_db_connection()
+        crm_cur = crm_conn.cursor()
+        crm_cur.execute("""
+            SELECT d.deal_id, d.deal_name, d.customer_id, d.deal_category, d.closing_date, c.company_name as customer_name
+            FROM deals d
+            LEFT JOIN customers c ON d.customer_id = c.customer_id
+        """)
+        for r in crm_cur.fetchall():
+            d_id = r["deal_id"]
+            d_name = r["deal_name"]
+            c_id = r["customer_id"]
+            c_name = r["customer_name"] or ""
+            d_cat = r["deal_category"] or ""
+            d_close = r["closing_date"] or ""
+            # Backfill linked tasks
+            cursor.execute("""
+                UPDATE tasks 
+                SET deal_name = COALESCE(deal_name, ?),
+                    customer_name = COALESCE(customer_name, ?),
+                    customer_id = COALESCE(customer_id, ?),
+                    deal_category = COALESCE(deal_category, ?),
+                    closing_date = COALESCE(closing_date, ?)
+                WHERE related_deal_id = ?;
+            """, (d_name, c_name, c_id, d_cat, d_close, d_id))
+            # Auto-link unlinked tasks by deal name or customer name keywords
+            if d_name and len(d_name) > 4:
                 cursor.execute("""
                     UPDATE tasks 
-                    SET deal_name = COALESCE(deal_name, ?),
+                    SET related_deal_id = COALESCE(related_deal_id, ?),
+                        deal_name = COALESCE(deal_name, ?),
                         customer_name = COALESCE(customer_name, ?),
                         customer_id = COALESCE(customer_id, ?),
                         deal_category = COALESCE(deal_category, ?),
                         closing_date = COALESCE(closing_date, ?)
-                    WHERE related_deal_id = ?;
-                """, (d_name, c_name, c_id, d_cat, d_close, d_id))
-                # Auto-link unlinked tasks by deal name or customer name keywords
-                if d_name and len(d_name) > 4:
-                    cursor.execute("""
-                        UPDATE tasks 
-                        SET related_deal_id = COALESCE(related_deal_id, ?),
-                            deal_name = COALESCE(deal_name, ?),
-                            customer_name = COALESCE(customer_name, ?),
-                            customer_id = COALESCE(customer_id, ?),
-                            deal_category = COALESCE(deal_category, ?),
-                            closing_date = COALESCE(closing_date, ?)
-                        WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{d_name.lower()}%"))
-                if c_name and len(c_name) > 3:
-                    cursor.execute("""
-                        UPDATE tasks 
-                        SET related_deal_id = COALESCE(related_deal_id, ?),
-                            deal_name = COALESCE(deal_name, ?),
-                            customer_name = COALESCE(customer_name, ?),
-                            customer_id = COALESCE(customer_id, ?),
-                            deal_category = COALESCE(deal_category, ?),
-                            closing_date = COALESCE(closing_date, ?)
-                        WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
-                    """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{c_name.lower()}%"))
-            crm_conn.close()
-        except Exception as e:
-            print(f"Notice: CRM backfill skipped: {e}")
+                    WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
+                """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{d_name.lower()}%"))
+            if c_name and len(c_name) > 3:
+                cursor.execute("""
+                    UPDATE tasks 
+                    SET related_deal_id = COALESCE(related_deal_id, ?),
+                        deal_name = COALESCE(deal_name, ?),
+                        customer_name = COALESCE(customer_name, ?),
+                        customer_id = COALESCE(customer_id, ?),
+                        deal_category = COALESCE(deal_category, ?),
+                        closing_date = COALESCE(closing_date, ?)
+                    WHERE related_deal_id IS NULL AND LOWER(task_title) LIKE ?;
+                """, (d_id, d_name, c_name, c_id, d_cat, d_close, f"%{c_name.lower()}%"))
+        crm_conn.close()
+    except Exception as e:
+        print(f"Notice: CRM backfill skipped: {e}")
 
     # Fallback keyword rules for customer_name and deal_name if still NULL
     cursor.execute("UPDATE tasks SET customer_name = 'Ministry of Human Resources', deal_name = COALESCE(deal_name, 'Ministry HR Renewal Tender') WHERE (customer_name IS NULL OR deal_name IS NULL) AND LOWER(task_title) LIKE '%human resources%';")
@@ -324,13 +326,10 @@ def init_db():
 
 
 def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
-    """Fetches deal_name, customer_id, customer_name, primary_vendors, deal_category, and closing_date for each deal_id from crm.db if available."""
+    """Fetches deal_name, customer_id, customer_name, primary_vendors, deal_category, and closing_date for each deal_id from CRM."""
     deal_map = {}
-    if not CRM_DB_FILE.exists():
-        return deal_map
     try:
-        conn = sqlite3.connect(CRM_DB_FILE)
-        conn.row_factory = sqlite3.Row
+        conn = get_crm_db_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT d.deal_id, d.deal_name, d.customer_id, d.primary_vendors, d.deal_category, d.closing_date, d.assigned_presales, d.stage, d.estimated_value, d.created_at, d.updated_at, c.company_name as customer_name
@@ -354,19 +353,16 @@ def get_deal_customer_map() -> Dict[int, Dict[str, Any]]:
                 "updated_at": str(r["updated_at"] or ""),
             }
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning in get_deal_customer_map: {e}")
     return deal_map
 
 
 def get_customer_list() -> List[Dict[str, Any]]:
-    """Fetches customer_id and company_name list from crm.db if available."""
+    """Fetches customer_id and company_name list from CRM."""
     cust_list = []
-    if not CRM_DB_FILE.exists():
-        return cust_list
     try:
-        conn = sqlite3.connect(CRM_DB_FILE)
-        conn.row_factory = sqlite3.Row
+        conn = get_crm_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT customer_id, company_name FROM customers ORDER BY customer_id ASC;")
         for r in cur.fetchall():
@@ -375,7 +371,8 @@ def get_customer_list() -> List[Dict[str, Any]]:
                 "company_name": r["company_name"] or "",
             })
         conn.close()
-    except Exception:
+    except Exception as e:
+        print(f"Warning in get_customer_list: {e}")
         pass
     return cust_list
 
@@ -1407,20 +1404,19 @@ def delete_deal_and_tasks(deal_id: int):
     and permanently deletes all tasks associated with that deal from tasks.db.
     """
     deal_name = ""
-    # 1. Fetch deal name and delete deal from crm.db
-    if CRM_DB_FILE.exists():
-        try:
-            crm_conn = sqlite3.connect(CRM_DB_FILE)
-            crm_cur = crm_conn.cursor()
-            crm_cur.execute("SELECT deal_name FROM deals WHERE deal_id = ?;", (deal_id,))
-            d_row = crm_cur.fetchone()
-            if d_row:
-                deal_name = d_row[0]
-                crm_cur.execute("DELETE FROM deals WHERE deal_id = ?;", (deal_id,))
-                crm_conn.commit()
-            crm_conn.close()
-        except Exception as e:
-            print(f"Warning: could not delete deal #{deal_id} from crm.db: {e}")
+    # 1. Fetch deal name and delete deal from CRM
+    try:
+        crm_conn = get_crm_db_connection()
+        crm_cur = crm_conn.cursor()
+        crm_cur.execute("SELECT deal_name FROM deals WHERE deal_id = ?;", (deal_id,))
+        d_row = crm_cur.fetchone()
+        if d_row:
+            deal_name = d_row[0]
+            crm_cur.execute("DELETE FROM deals WHERE deal_id = ?;", (deal_id,))
+            crm_conn.commit()
+        crm_conn.close()
+    except Exception as e:
+        print(f"Warning: could not delete deal #{deal_id} from CRM: {e}")
 
     # 2. Delete all tasks associated with this deal from tasks.db
     conn = get_db_connection()

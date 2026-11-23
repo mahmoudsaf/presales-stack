@@ -9,4 +9,8 @@ services:
         value: 3.12.0
       - key: GEMINI_API_KEY
         sync: false
+      - key: TURSO_DATABASE_URL
+        value: https://presales-db-mahmoudsaf.aws-eu-central-1.turso.io
+      - key: TURSO_AUTH_TOKEN
+        value: eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTU0MzgwNjksImlkIjoiMDFhMjA4NzItNjAwMS03ZmMyLThhMzQtMGExMDQ0NTM2M2Y2Iiwia2lkIjoiakQzTFBUZ2F5WGtCdEwxY0xTUVpnb0Y5VnhZWWd1Rkp3SlJ3dEp3UDc2YyIsInJpZCI6IjBmYmE5ZTM2LTQxMGItNDA0Mi1hNjZlLTQyN2Y0OTMyZjM4ZiJ9.1EooxDmPyNgtWOv-92rfaXTo6j7VIAdGNa_QR48mQgk0FyoQimSSDPGNdtMqSQ1YlOAdToXBTaEDZ8WbvqMsAQ
     autoDeploy: true

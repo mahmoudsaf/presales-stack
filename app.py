@@ -91,11 +91,15 @@ class PresalesRep(str, Enum):
 # -----------------------------------------------------------------------------
 # Database Helpers & Initialization
 # -----------------------------------------------------------------------------
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+from db import get_db_connection as get_cloud_db_connection, TASKS_DB_FILE
+
+
+def get_db_connection():
+    return get_cloud_db_connection(DB_FILE)
+
+
+def get_tasks_db_connection():
+    return get_cloud_db_connection(TASKS_DB_FILE)
 
 
 def init_db():
@@ -868,21 +872,19 @@ def update_customer(customer_id: int, payload: CustomerUpdate):
         cursor.execute(f"UPDATE customers SET {', '.join(updates)} WHERE customer_id = ?;", params)
         conn.commit()
 
-    # Sync cached customer_name in tasks.db if company_name changed
+    # Sync cached customer_name in tasks table if company_name changed
     if new_company_name != old_company_name:
         try:
-            tasks_db_path = Path(__file__).resolve().parent / "tasks.db"
-            if tasks_db_path.exists():
-                t_conn = sqlite3.connect(tasks_db_path)
-                t_cursor = t_conn.cursor()
-                t_cursor.execute(
-                    "UPDATE tasks SET customer_name = ? WHERE customer_id = ?;",
-                    (new_company_name, customer_id),
-                )
-                t_conn.commit()
-                t_conn.close()
+            t_conn = get_tasks_db_connection()
+            t_cursor = t_conn.cursor()
+            t_cursor.execute(
+                "UPDATE tasks SET customer_name = ? WHERE customer_id = ?;",
+                (new_company_name, customer_id),
+            )
+            t_conn.commit()
+            t_conn.close()
         except Exception as e:
-            print(f"Warning: could not sync customer name to tasks.db: {e}")
+            print(f"Warning: could not sync customer name to tasks: {e}")
 
     # Fetch updated aggregated record
     cursor.execute("""
@@ -1173,19 +1175,17 @@ def create_deal(payload: DealCreate):
         deal_id = cursor.lastrowid
         conn.commit()
 
-    # Sync to tasks.db if matching tasks exist
+    # Sync to tasks if matching tasks exist
     try:
-        tasks_db_path = Path(__file__).resolve().parent / "tasks.db"
-        if tasks_db_path.exists():
-            t_conn = sqlite3.connect(tasks_db_path)
-            t_cur = t_conn.cursor()
-            t_cur.execute("""
-                UPDATE tasks
-                SET deal_category = ?, closing_date = COALESCE(?, closing_date), deal_name = COALESCE(deal_name, ?)
-                WHERE related_deal_id = ?;
-            """, (deal_cat, close_dt, payload.deal_name.strip(), deal_id))
-            t_conn.commit()
-            t_conn.close()
+        t_conn = get_tasks_db_connection()
+        t_cur = t_conn.cursor()
+        t_cur.execute("""
+            UPDATE tasks
+            SET deal_category = ?, closing_date = COALESCE(?, closing_date), deal_name = COALESCE(deal_name, ?)
+            WHERE related_deal_id = ?;
+        """, (deal_cat, close_dt, payload.deal_name.strip(), deal_id))
+        t_conn.commit()
+        t_conn.close()
     except Exception as e:
         print(f"Notice: tasks sync on create skipped: {e}")
 
@@ -1295,21 +1295,19 @@ def update_deal(deal_id: int, payload: DealUpdate):
     )
     conn.commit()
 
-    # Sync updated deal category and closing date to tasks.db
+    # Sync updated deal category and closing date to tasks
     try:
-        tasks_db_path = Path(__file__).resolve().parent / "tasks.db"
-        if tasks_db_path.exists():
-            t_conn = sqlite3.connect(tasks_db_path)
-            t_cur = t_conn.cursor()
-            t_cur.execute("""
-                UPDATE tasks
-                SET deal_category = ?, closing_date = ?, deal_name = ?
-                WHERE related_deal_id = ?;
-            """, (final_category, final_closing_date, final_deal_name, deal_id))
-            t_conn.commit()
-            t_conn.close()
+        t_conn = get_tasks_db_connection()
+        t_cur = t_conn.cursor()
+        t_cur.execute("""
+            UPDATE tasks
+            SET deal_category = ?, closing_date = ?, deal_name = ?
+            WHERE related_deal_id = ?;
+        """, (final_category, final_closing_date, final_deal_name, deal_id))
+        t_conn.commit()
+        t_conn.close()
     except Exception as e:
-        print(f"Notice: sync to tasks.db skipped: {e}")
+        print(f"Notice: sync to tasks skipped: {e}")
 
     # Retrieve updated deal
     cursor.execute(
@@ -1372,18 +1370,17 @@ def delete_deal(deal_id: int):
     conn.commit()
     conn.close()
 
-    # If tasks.db exists, delete tasks associated with this deal
-    if TASKS_DB_FILE.exists():
-        try:
-            t_conn = sqlite3.connect(TASKS_DB_FILE)
-            t_conn.execute(
-                "DELETE FROM tasks WHERE related_deal_id = ? OR (related_deal_id IS NULL AND deal_name = ?);",
-                (deal_id, deal["deal_name"]),
-            )
-            t_conn.commit()
-            t_conn.close()
-        except Exception:
-            pass
+    # Delete tasks associated with this deal
+    try:
+        t_conn = get_tasks_db_connection()
+        t_conn.execute(
+            "DELETE FROM tasks WHERE related_deal_id = ? OR (related_deal_id IS NULL AND deal_name = ?);",
+            (deal_id, deal["deal_name"]),
+        )
+        t_conn.commit()
+        t_conn.close()
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -1489,43 +1486,41 @@ def get_dashboard_metrics(presales: Optional[str] = None) -> Dict[str, Any]:
         "blockers": [],
     }
 
-    if TASKS_DB_FILE.exists():
-        try:
-            t_conn = sqlite3.connect(TASKS_DB_FILE)
-            t_conn.row_factory = sqlite3.Row
-            t_cur = t_conn.cursor()
+    try:
+        t_conn = get_tasks_db_connection()
+        t_cur = t_conn.cursor()
 
-            t_query = "SELECT task_id, task_title, category, assigned_to, vendor_domain, status, priority, due_date, management_blockers FROM tasks"
-            t_params = []
-            if presales:
-                t_query += " WHERE assigned_to = ?"
-                t_params.append(presales)
-            t_cur.execute(t_query, t_params)
-            t_rows = [dict(r) for r in t_cur.fetchall()]
+        t_query = "SELECT task_id, task_title, category, assigned_to, vendor_domain, status, priority, due_date, management_blockers FROM tasks"
+        t_params = []
+        if presales:
+            t_query += " WHERE assigned_to = ?"
+            t_params.append(presales)
+        t_cur.execute(t_query, t_params)
+        t_rows = [dict(r) for r in t_cur.fetchall()]
 
-            task_metrics["total_tasks"] = len(t_rows)
-            for t in t_rows:
-                st = t["status"]
-                cat = t["category"]
-                if st == "Completed":
-                    task_metrics["completed_tasks"] += 1
-                else:
-                    task_metrics["active_tasks"] += 1
+        task_metrics["total_tasks"] = len(t_rows)
+        for t in t_rows:
+            st = t["status"]
+            cat = t["category"]
+            if st == "Completed":
+                task_metrics["completed_tasks"] += 1
+            else:
+                task_metrics["active_tasks"] += 1
 
-                task_metrics["status_breakdown"][st] = task_metrics["status_breakdown"].get(st, 0) + 1
-                task_metrics["category_breakdown"][cat] = task_metrics["category_breakdown"].get(cat, 0) + 1
+            task_metrics["status_breakdown"][st] = task_metrics["status_breakdown"].get(st, 0) + 1
+            task_metrics["category_breakdown"][cat] = task_metrics["category_breakdown"].get(cat, 0) + 1
 
-                if t.get("management_blockers") and str(t["management_blockers"]).strip():
-                    task_metrics["blockers"].append({
-                        "task_id": t["task_id"],
-                        "task_title": t["task_title"],
-                        "assigned_to": t["assigned_to"],
-                        "vendor_domain": t["vendor_domain"],
-                        "blocker": t["management_blockers"],
-                    })
-            t_conn.close()
-        except Exception as ex:
-            print("Warning: Could not fetch task metrics for dashboard:", ex)
+            if t.get("management_blockers") and str(t["management_blockers"]).strip():
+                task_metrics["blockers"].append({
+                    "task_id": t["task_id"],
+                    "task_title": t["task_title"],
+                    "assigned_to": t["assigned_to"],
+                    "vendor_domain": t["vendor_domain"],
+                    "blocker": t["management_blockers"],
+                })
+        t_conn.close()
+    except Exception as ex:
+        print("Warning: Could not fetch task metrics for dashboard:", ex)
 
     return {
         "total_pipeline": total_pipeline,

@@ -1939,13 +1939,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         <!-- Single Active Tab Container: Deals > Tasks > Presales 1 or 2 -->
         <div id="activeTabContainer" class="card border-0 shadow-sm bg-transparent mb-4">
-            <div class="group-header py-3 px-3 border rounded-3 d-flex align-items-center justify-content-between bg-white shadow-sm mb-3" id="activeTabHeader">
-                <div class="d-flex align-items-center gap-2">
+            <div class="group-header py-2 px-3 border rounded-3 d-flex flex-wrap align-items-center justify-content-between bg-white shadow-sm mb-3 gap-2" id="activeTabHeader">
+                <div class="d-flex align-items-center flex-wrap gap-2">
                     <span class="fw-bold fs-6" id="currentTabHeading">1- RFP Ownership & Prime Proposals</span>
                     <span class="badge bg-secondary-subtle text-dark border" id="currentTabItemCount">0 items</span>
+                    <span class="text-muted small ms-2 d-none d-lg-inline" id="currentTabSubtext">
+                        Prime proposals & tenders owned end-to-end
+                    </span>
                 </div>
-                <div class="text-muted small" id="currentTabSubtext">
-                    Prime proposals & tenders owned end-to-end
+                <div class="d-flex align-items-center gap-2">
+                    <div class="btn-group btn-group-sm shadow-sm" role="group" aria-label="Deal View Mode">
+                        <button type="button" class="btn btn-primary active fw-semibold d-inline-flex align-items-center gap-1" id="dealViewBtnActive" onclick="setDealView('ACTIVE')" title="Show deals with active in-flight tasks or completed recently (Last 7 Days)">
+                            <i class="bi bi-lightning-charge-fill text-warning"></i>Active Deals (<span id="viewCountActive">0</span>)
+                        </button>
+                        <button type="button" class="btn btn-outline-success fw-semibold d-inline-flex align-items-center gap-1" id="dealViewBtnCompleted" onclick="setDealView('COMPLETED')" title="Show deals where all tasks are 100% completed / submitted">
+                            <i class="bi bi-check-circle-fill"></i>Completed (<span id="viewCountCompleted">0</span>)
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary fw-semibold d-inline-flex align-items-center gap-1" id="dealViewBtnAll" onclick="setDealView('ALL')" title="Show all deals including historical and archived">
+                            <i class="bi bi-archive-fill"></i>All / Archive (<span id="viewCountAll">0</span>)
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -2348,6 +2361,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         let currentFilter = 'ALL';
         let currentVendorFilter = '';
         let currentCategoryTab = 'RFP_OWNERSHIP';
+        let currentDealView = 'ACTIVE'; // 'ACTIVE' (Default), 'COMPLETED', 'ALL'
         const newModal = new bootstrap.Modal(document.getElementById('newTaskModal'));
         const editModal = new bootstrap.Modal(document.getElementById('editTaskModal'));
         const historyModal = new bootstrap.Modal(document.getElementById('historyModal'));
@@ -2356,8 +2370,95 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const STATUS_FLOW = ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"];
         const PRIORITY_FLOW = ["Low", "Medium", "High"];
 
-        document.addEventListener('DOMContentLoaded', () => {
-            loadTasks();
+        function getDealStatusInfo(deal) {
+            const dealTasks = allTasks.filter(t => t.related_deal_id === deal.deal_id || (!t.related_deal_id && t.deal_name && t.deal_name === deal.deal_name));
+            const totalTasks = dealTasks.length;
+            const completedTasks = dealTasks.filter(t => t.status === 'Completed').length;
+            const openTasks = totalTasks - completedTasks;
+            const inProgressTasks = dealTasks.filter(t => t.status === 'In Progress' || t.status === 'Waiting on Vendor' || t.status === 'Pending Review').length;
+
+            // Check if recently completed (within last 7 days)
+            let isRecentlyCompleted = false;
+            let latestCompletedTime = 0;
+            if (totalTasks > 0 && openTasks === 0) {
+                dealTasks.forEach(t => {
+                    if (t.completed_at) {
+                        const compTime = new Date(t.completed_at.replace(' ', 'T')).getTime();
+                        if (compTime > latestCompletedTime) latestCompletedTime = compTime;
+                    }
+                });
+                const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+                if (!latestCompletedTime || latestCompletedTime >= sevenDaysAgo) {
+                    isRecentlyCompleted = true;
+                }
+            }
+
+            // Check if brand new deal created within last 48 hours
+            let isNewDeal = false;
+            if (deal.created_at) {
+                const createdTime = new Date(deal.created_at.replace(' ', 'T')).getTime();
+                const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
+                if (createdTime >= twoDaysAgo) isNewDeal = true;
+            }
+
+            const isClosedStage = ['Closed-Won', 'Closed-Lost', 'Closed Won', 'Closed Lost', 'Won', 'Lost'].includes(deal.stage);
+            const isSubmitted = ['Submitted', 'Proposal Submitted', 'Delivered'].includes(deal.stage);
+
+            const isActive = (openTasks > 0) || (totalTasks === 0 && isNewDeal && !isClosedStage && !isSubmitted);
+            const isCompleted = (totalTasks > 0 && openTasks === 0);
+            const isArchived = !isActive && !isRecentlyCompleted;
+
+            return {
+                dealTasks,
+                totalTasks,
+                completedTasks,
+                openTasks,
+                inProgressTasks,
+                isActive,
+                isCompleted,
+                isRecentlyCompleted,
+                isArchived,
+                isNewDeal
+            };
+        }
+
+        function dealMatchesView(deal) {
+            const info = getDealStatusInfo(deal);
+            if (currentDealView === 'ACTIVE') {
+                return info.isActive || info.isRecentlyCompleted;
+            } else if (currentDealView === 'COMPLETED') {
+                return info.isCompleted;
+            } else if (currentDealView === 'ALL') {
+                return true;
+            }
+            return true;
+        }
+
+        function setDealView(mode) {
+            currentDealView = mode;
+            const btnActive = document.getElementById('dealViewBtnActive');
+            const btnComp = document.getElementById('dealViewBtnCompleted');
+            const btnAll = document.getElementById('dealViewBtnAll');
+            if (btnActive) {
+                btnActive.className = (mode === 'ACTIVE')
+                    ? 'btn btn-primary active fw-semibold d-inline-flex align-items-center gap-1'
+                    : 'btn btn-outline-primary fw-semibold d-inline-flex align-items-center gap-1';
+            }
+            if (btnComp) {
+                btnComp.className = (mode === 'COMPLETED')
+                    ? 'btn btn-success active fw-semibold d-inline-flex align-items-center gap-1'
+                    : 'btn btn-outline-success fw-semibold d-inline-flex align-items-center gap-1';
+            }
+            if (btnAll) {
+                btnAll.className = (mode === 'ALL')
+                    ? 'btn btn-secondary active fw-semibold d-inline-flex align-items-center gap-1'
+                    : 'btn btn-outline-secondary fw-semibold d-inline-flex align-items-center gap-1';
+            }
+            renderBoard();
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            await loadTasks();
         });
 
         function switchCategoryTab(catKey) {
@@ -2424,6 +2525,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 populateCustomerSelects();
                 populateDealSelects();
                 populateCustomerDatalist();
+                if (allTasks && allTasks.length > 0) {
+                    renderBoard();
+                }
             } catch(e) {
                 console.warn("Failed to load lookups:", e);
             }
@@ -2637,7 +2741,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         async function loadTasks() {
             try {
-                loadLookups();
+                await loadLookups();
                 const res = await fetch('/api/tasks');
                 allTasks = await res.json();
                 populateCustomerDatalist();
@@ -2770,10 +2874,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             updateVendorCounts(allTasks);
             updateMacroProgress(allTasks);
 
-            // Tab badge counts across all deals
-            const countOwnerDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_OWNERSHIP').length;
-            const countScopeDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_DISTRIBUTED_SCOPE').length;
-            const countEffortsDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'GENERAL_ACTION').length;
+            // Tab badge counts across all deals (filtered by currentDealView)
+            const countOwnerDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_OWNERSHIP' && dealMatchesView(d)).length;
+            const countScopeDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'RFP_DISTRIBUTED_SCOPE' && dealMatchesView(d)).length;
+            const countEffortsDeals = allDeals.filter(d => getDealCategoryKey(d.deal_category) === 'GENERAL_ACTION' && dealMatchesView(d)).length;
+            const countAllDeals = allDeals.filter(d => dealMatchesView(d)).length;
 
             const bOwner = document.getElementById('tabCountOwner');
             const bScope = document.getElementById('tabCountScope');
@@ -2782,7 +2887,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             if (bOwner) bOwner.textContent = countOwnerDeals;
             if (bScope) bScope.textContent = countScopeDeals;
             if (bEfforts) bEfforts.textContent = countEffortsDeals;
-            if (bAll) bAll.textContent = allDeals.length;
+            if (bAll) bAll.textContent = countAllDeals;
+
+            // Update Deal View Mode Counters for current category
+            const categoryDeals = allDeals.filter(d => currentCategoryTab === 'ALL' || getDealCategoryKey(d.deal_category) === currentCategoryTab);
+            const countActiveView = categoryDeals.filter(d => { const i = getDealStatusInfo(d); return i.isActive || i.isRecentlyCompleted; }).length;
+            const countCompView = categoryDeals.filter(d => { const i = getDealStatusInfo(d); return i.isCompleted; }).length;
+            const countAllView = categoryDeals.length;
+
+            const elActive = document.getElementById('viewCountActive');
+            const elComp = document.getElementById('viewCountCompleted');
+            const elAll = document.getElementById('viewCountAll');
+            if (elActive) elActive.textContent = countActiveView;
+            if (elComp) elComp.textContent = countCompView;
+            if (elAll) elAll.textContent = countAllView;
 
             // Also keep taskTableBody populated for compatibility
             const tabItems = filtered.filter(t => currentCategoryTab === 'ALL' || t.category === currentCategoryTab);
@@ -2794,31 +2912,48 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             const container = document.getElementById('dealsContainer');
             if (!container) return;
 
-            // Filter deals matching current category tab
+            // Filter deals matching current category tab AND deal view mode
             const tabDeals = allDeals.filter(d => {
                 if (currentCategoryTab !== 'ALL' && getDealCategoryKey(d.deal_category) !== currentCategoryTab) {
                     return false;
                 }
-                if (!search) return true;
-                const dNameMatch = (d.deal_name && d.deal_name.toLowerCase().includes(search));
-                const cNameMatch = (d.customer_name && d.customer_name.toLowerCase().includes(search));
-                const hasTaskMatch = filtered.some(t => t.related_deal_id === d.deal_id);
-                return dNameMatch || cNameMatch || hasTaskMatch;
+                if (search) {
+                    const dNameMatch = (d.deal_name && d.deal_name.toLowerCase().includes(search));
+                    const cNameMatch = (d.customer_name && d.customer_name.toLowerCase().includes(search));
+                    const hasTaskMatch = filtered.some(t => t.related_deal_id === d.deal_id);
+                    return dNameMatch || cNameMatch || hasTaskMatch;
+                }
+                return dealMatchesView(d);
             });
 
             const countLabel = document.getElementById('currentTabItemCount');
-            if (countLabel) countLabel.textContent = `${tabDeals.length} Deals`;
+            if (countLabel) {
+                const viewName = currentDealView === 'ACTIVE' ? 'Active' : (currentDealView === 'COMPLETED' ? 'Completed' : 'Total');
+                countLabel.textContent = `${tabDeals.length} ${viewName} Deals`;
+            }
 
             // Tasks unlinked to any deal
             const unlinkedTasks = filtered.filter(t => !t.related_deal_id || !allDeals.some(d => d.deal_id === t.related_deal_id));
 
             if (tabDeals.length === 0 && unlinkedTasks.length === 0) {
+                const emptyTitle = currentDealView === 'ACTIVE'
+                    ? 'All clear! No active deals in this category'
+                    : (currentDealView === 'COMPLETED' ? 'No completed deals in this category' : 'No deals found in this category');
+                const emptyDesc = currentDealView === 'ACTIVE'
+                    ? 'All deals in this category have either completed their tasks, been submitted, or have no active tasks.'
+                    : 'There are no deals or tasks matching current view / search / filters.';
+
                 container.innerHTML = `
                     <div class="card border-0 shadow-sm p-5 text-center text-muted bg-white" style="border-radius: 12px;">
                         <i class="bi bi-inbox fs-1 d-block mb-3 text-secondary opacity-50"></i>
-                        <h6 class="fw-bold text-dark">No deals found in this category</h6>
-                        <p class="small text-muted mb-3">There are no deals or tasks matching current search / filters.</p>
-                        <div>
+                        <h6 class="fw-bold text-dark">${emptyTitle}</h6>
+                        <p class="small text-muted mb-3">${emptyDesc}</p>
+                        <div class="d-flex justify-content-center gap-2">
+                            ${currentDealView !== 'ALL' ? `
+                                <button class="btn btn-sm btn-outline-secondary" onclick="setDealView('ALL')">
+                                    <i class="bi bi-archive me-1"></i>View All / Archived Deals
+                                </button>
+                            ` : ''}
                             <button class="btn btn-sm btn-primary" onclick="openNewTaskModal()">
                                 <i class="bi bi-plus-circle me-1"></i>Create New Task
                             </button>
@@ -2832,6 +2967,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
             // Render each Deal as a section containing its tasks (Deals > Tasks > Presales 1 or 2)
             tabDeals.forEach(deal => {
+                const dealStatusInfo = getDealStatusInfo(deal);
                 const dealTasks = filtered.filter(t => t.related_deal_id === deal.deal_id || (!t.related_deal_id && t.deal_name && t.deal_name === deal.deal_name));
                 dealTasks.sort((a, b) => a.task_id - b.task_id);
                 const totalTasks = dealTasks.length;
@@ -2842,6 +2978,35 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 const latestTaskId = latestDealTask ? latestDealTask.task_id : null;
 
                 const progressColor = progressPct === 100 ? 'bg-success' : (progressPct >= 50 ? 'bg-primary' : (progressPct > 0 ? 'bg-warning' : 'bg-secondary'));
+
+                let dealLifecycleBadge = '';
+                if (dealStatusInfo.isCompleted) {
+                    if (dealStatusInfo.isRecentlyCompleted) {
+                        dealLifecycleBadge = `
+                            <span class="badge bg-success text-white border border-success py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.76rem; font-weight: 700;" title="All tasks finished within the last 7 days">
+                                <i class="bi bi-check2-circle"></i>COMPLETED THIS WEEK
+                            </span>
+                        `;
+                    } else {
+                        dealLifecycleBadge = `
+                            <span class="badge bg-success-subtle text-success border border-success-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.76rem;" title="All tasks completed (Submitted / Closed)">
+                                <i class="bi bi-check2-all"></i>ALL TASKS COMPLETED
+                            </span>
+                        `;
+                    }
+                } else if (dealStatusInfo.totalTasks === 0) {
+                    dealLifecycleBadge = `
+                        <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.76rem;" title="No tasks assigned to this deal yet">
+                            <i class="bi bi-exclamation-triangle-fill text-warning"></i>NO TASKS ASSIGNED
+                        </span>
+                    `;
+                } else {
+                    dealLifecycleBadge = `
+                        <span class="badge bg-primary-subtle text-primary border border-primary-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.76rem;" title="Deal is currently active with in-progress tasks">
+                            <i class="bi bi-lightning-charge-fill text-warning"></i>ACTIVE IN-FLIGHT
+                        </span>
+                    `;
+                }
 
                 const closingBadge = deal.closing_date ? `
                     <span class="badge bg-danger-subtle text-danger border border-danger-subtle py-1 px-2 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem; font-weight: 700;" title="RFP Submission Deadline">
@@ -2863,8 +3028,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         ? '<span class="badge badge-modified-today py-1 px-2 d-inline-flex align-items-center gap-1" title="Deal modified today"><i class="bi bi-pencil-fill"></i>MODIFIED TODAY</span>'
                         : '');
 
+                const dealBorderColor = dealStatusInfo.isRecentlyCompleted ? 'border: 1px solid #22c55e !important;' : (dealStatusInfo.isArchived ? 'opacity: 0.88; border: 1px solid var(--monday-border) !important;' : (dealCardDayClass ? '' : 'border: 1px solid var(--monday-border) !important;'));
+
                 html += `
-                    <div class="card border shadow-sm bg-white mb-3 ${dealCardDayClass}" style="border-radius: 12px; overflow: hidden; ${dealCardDayClass ? '' : 'border: 1px solid var(--monday-border) !important;'}">
+                    <div class="card border shadow-sm bg-white mb-3 ${dealCardDayClass}" style="border-radius: 12px; overflow: hidden; ${dealBorderColor}">
                         <!-- Deal Header -->
                         <div class="card-header bg-white border-bottom p-3">
                             <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
@@ -2875,6 +3042,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                         <span>${deal.deal_name}</span>
                                     </h5>
                                     ${dealDayBadge}
+                                    ${dealLifecycleBadge}
                                     <span class="badge bg-light text-dark border px-2 py-1" style="font-size: 0.8rem;">
                                         <i class="bi bi-building text-primary me-1"></i>${deal.customer_name || 'Customer'}
                                     </span>

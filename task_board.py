@@ -1779,12 +1779,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <div class="board-title">
                     <i class="bi bi-kanban-fill text-primary"></i>
                     <span>Presales Workstream & RFP Execution Board</span>
-                    <span class="badge bg-secondary-subtle text-dark border ms-2">tasks.db</span>
+                    <span class="badge bg-info-subtle text-info-emphasis border ms-2"><i class="bi bi-cloud-check-fill text-primary me-1"></i>Turso Cloud DB</span>
                 </div>
                 <div class="text-muted small">Monday.com-style tracking for RFP Ownership, Distributed Scopes & Technical Actions</div>
             </div>
             <div class="d-flex align-items-center gap-2">
-                <a href="http://127.0.0.1:8000/dashboard" class="btn btn-sm btn-outline-primary d-flex align-items-center gap-1" title="Executive Visual Analytics & Metrics Dashboard">
+                <a href="/dashboard" class="btn btn-sm btn-outline-primary d-flex align-items-center gap-1" title="Executive Visual Analytics & Metrics Dashboard">
                     <i class="bi bi-bar-chart-line-fill"></i> 📊 Visual Dashboard
                 </a>
                 <a href="/docs" target="_blank" class="btn btn-sm btn-outline-secondary">
@@ -1793,6 +1793,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <button class="btn btn-sm btn-primary d-flex align-items-center gap-1" onclick="openNewTaskModal()">
                     <i class="bi bi-plus-lg"></i> New Item
                 </button>
+                <!-- Deployed Release Version & Date -->
+                <div class="d-flex align-items-center ms-2 ps-2 border-start">
+                    <div class="text-end" style="line-height: 1.2;">
+                        <span class="badge bg-success-subtle text-success border border-success-subtle fw-bold px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.75rem;" title="Deployed Release Version">
+                            <i class="bi bi-tag-fill"></i> v1.3.1 - Turso
+                        </span>
+                        <div class="text-muted small mt-1" style="font-size: 0.68rem; font-family: monospace;" title="Deployment Date">
+                            <i class="bi bi-calendar-event me-1"></i>2026-11-25
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 

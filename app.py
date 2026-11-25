@@ -1718,14 +1718,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <span>Enterprise Presales CRM</span>
             </a>
             <div class="d-flex flex-wrap align-items-center gap-2">
-                <a href="http://127.0.0.1:8001" target="_blank" class="btn btn-sm btn-outline-secondary text-light d-flex align-items-center gap-1">
-                    <i class="bi bi-kanban text-info"></i> Task Board (8001)
+                <a href="/tasks" class="btn btn-sm btn-outline-secondary text-light d-flex align-items-center gap-1">
+                    <i class="bi bi-kanban text-info"></i> Task Board
                 </a>
-                <a href="http://127.0.0.1:8002" target="_blank" class="btn btn-sm btn-outline-secondary text-light d-flex align-items-center gap-1">
-                    <i class="bi bi-soundwave text-warning"></i> Voice Agent (8002)
+                <a href="/voice" class="btn btn-sm btn-outline-secondary text-light d-flex align-items-center gap-1">
+                    <i class="bi bi-soundwave text-warning"></i> Voice Agent
                 </a>
-                <span class="badge bg-secondary-subtle text-dark border px-2 py-1">
-                    <i class="bi bi-database me-1"></i>SQLite (crm.db)
+                <span class="badge bg-info-subtle text-info-emphasis border px-2 py-1">
+                    <i class="bi bi-cloud-check-fill text-primary me-1"></i>Turso Cloud DB
                 </span>
                 <a href="/docs" target="_blank" class="btn btn-sm btn-outline-light">
                     <i class="bi bi-code-slash me-1"></i>Swagger API
@@ -1733,6 +1733,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <button class="btn btn-sm btn-primary d-flex align-items-center gap-1" onclick="openNewDealModal()">
                     <i class="bi bi-plus-circle"></i> New Deal
                 </button>
+                <!-- Deployed Release Version & Date (Right Corner) -->
+                <div class="d-flex align-items-center ms-lg-2 ps-lg-2 border-start border-secondary">
+                    <div class="text-end" style="line-height: 1.2;">
+                        <span class="badge bg-success-subtle text-success border border-success-subtle fw-bold px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem;" title="Deployed Release Version">
+                            <i class="bi bi-tag-fill"></i> v1.3.1 - Turso
+                        </span>
+                        <div class="small text-secondary mt-1" style="font-size: 0.70rem; font-family: monospace;" title="Deployment Date">
+                            <i class="bi bi-calendar-event me-1"></i>2026-11-25
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </nav>

@@ -310,7 +310,7 @@ LOGIN_HTML = """<!DOCTYPE html>
                         window.location.href = document.getElementById('nextUrl').value || '/dashboard';
                     }, 500);
                 } else {
-                    errAlert.textContent = data.detail || 'بيانات الدخول غير صحيحة.';
+                    errAlert.innerHTML = `<i class="bi bi-exclamation-triangle-fill me-1"></i> ` + (data.detail || 'بيانات الدخول غير صحيحة.');
                     errAlert.classList.remove('d-none');
                 }
             } catch (err) {
@@ -452,11 +452,11 @@ SIGNUP_HTML = """<!DOCTYPE html>
             </div>
 
             <button type="submit" class="btn btn-success w-100 btn-submit mb-3" id="submitBtn">
-                <i class="bi bi-check-circle-fill me-1"></i> إنشاء الحساب وتفعيل الدخول
+                <i class="bi bi-person-plus-fill me-1"></i> إرسال طلب إنشاء الحساب (Register)
             </button>
         </form>
 
-        <div class="text-center pt-2 border-top border-secondary border-opacity-25">
+        <div class="text-center pt-2 border-top border-secondary border-opacity-25" id="footerLink">
             <span class="small text-muted">لديك حساب مسجل بالفعل؟</span>
             <a href="/login" class="small text-primary text-decoration-none fw-bold ms-1">تسجيل الدخول (Sign In) <i class="bi bi-arrow-left"></i></a>
         </div>
@@ -490,7 +490,7 @@ SIGNUP_HTML = """<!DOCTYPE html>
             }
 
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>جارٍ إنشاء الحساب...';
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>جارٍ إرسال الطلب...';
 
             try {
                 const res = await fetch('/api/auth/signup', {
@@ -501,11 +501,19 @@ SIGNUP_HTML = """<!DOCTYPE html>
 
                 const data = await res.json();
                 if (res.ok) {
-                    succAlert.textContent = 'تم إنشاء الحساب بنجاح! جارٍ تحويلك للوحة التحكم...';
+                    succAlert.innerHTML = `
+                        <div class="fw-bold mb-1"><i class="bi bi-clock-history me-1"></i> تم استلام طلب التسجيل بنجاح!</div>
+                        <div class="small mb-2">حسابك الآن قيد المراجعة وبانتظار موافقة مسؤول النظام (Admin) لاعتماده وتفعيله لتتمكن من تسجيل الدخول.</div>
+                        <div class="mt-3 text-center">
+                            <a href="/login" class="btn btn-outline-success btn-sm px-3 fw-bold">
+                                <i class="bi bi-box-arrow-in-left me-1"></i> الانتقال لصفحة تسجيل الدخول
+                            </a>
+                        </div>
+                    `;
                     succAlert.classList.remove('d-none');
-                    setTimeout(() => {
-                        window.location.href = '/dashboard';
-                    }, 600);
+                    document.getElementById('signupForm').style.display = 'none';
+                    const foot = document.getElementById('footerLink');
+                    if (foot) foot.style.display = 'none';
                 } else {
                     errAlert.textContent = data.detail || 'فشل إنشاء الحساب.';
                     errAlert.classList.remove('d-none');
@@ -515,7 +523,7 @@ SIGNUP_HTML = """<!DOCTYPE html>
                 errAlert.classList.remove('d-none');
             } finally {
                 btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i> إنشاء الحساب وتفعيل الدخول';
+                btn.innerHTML = '<i class="bi bi-person-plus-fill me-1"></i> إرسال طلب إنشاء الحساب (Register)';
             }
         }
     </script>
@@ -555,14 +563,24 @@ def is_public_path(path: str) -> bool:
 
 
 def inject_user_badge(html: str, user: Dict[str, Any]) -> str:
-    """Injects authenticated user badge and Logout button into the navigation header."""
+    """Injects authenticated user badge and Logout button into the navigation header, plus admin management modal for admins."""
     username = user.get("username", "user")
     role = user.get("role", "presales")
     role_badge = "Admin" if role == "admin" else "Presales"
 
+    admin_btn = ""
+    if role == "admin":
+        admin_btn = """
+        <button type="button" class="btn btn-sm btn-warning py-0 px-2 d-inline-flex align-items-center gap-1 fw-bold shadow-sm" style="font-size:0.75rem;" onclick="openAdminUsersModal()" title="إدارة المستخدمين وطلبات التسجيل">
+            <i class="bi bi-people-fill"></i> المستخدمين
+            <span id="adminPendingBadge" class="badge bg-danger rounded-pill px-1 ms-1" style="font-size:0.65rem; display:none;">0</span>
+        </button>
+        """
+
     badge_html = f"""
     <!-- Authenticated User Profile & Logout -->
     <div class="d-flex align-items-center gap-2 ms-2 ps-2 border-start border-secondary user-auth-badge">
+        {admin_btn}
         <span class="badge bg-primary-subtle text-primary border border-primary-subtle px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size:0.75rem;" title="Logged-in Presales Account">
             <i class="bi bi-person-fill"></i> {username} ({role_badge})
         </span>
@@ -576,6 +594,265 @@ def inject_user_badge(html: str, user: Dict[str, Any]) -> str:
     pattern = r'(<div class="d-flex align-items-center ms[^>]*border-start[^>]*>)'
     if re.search(pattern, html):
         html = re.sub(pattern, badge_html + r"\1", html, count=1)
+
+    # For Admin, also inject the Admin Users Management Modal before </body>
+    if role == "admin" and "adminUsersModal" not in html and "</body>" in html:
+        admin_modal_html = """
+        <!-- Admin User Management & Registration Approval Modal -->
+        <div class="modal fade" id="adminUsersModal" tabindex="-1" aria-labelledby="adminUsersModalLabel" aria-hidden="true" dir="rtl">
+            <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+                <div class="modal-content text-light" style="background-color: #1e293b; border: 1px solid #334155; border-radius: 12px;">
+                    <div class="modal-header border-bottom border-secondary border-opacity-50 py-3">
+                        <div class="d-flex align-items-center gap-2">
+                            <div class="bg-warning bg-opacity-10 p-2 rounded-circle text-warning">
+                                <i class="bi bi-shield-lock-fill fs-5"></i>
+                            </div>
+                            <div>
+                                <h5 class="modal-title fw-bold text-white mb-0" id="adminUsersModalLabel">إدارة المستخدمين والموافقات</h5>
+                                <small class="text-muted">مراجعة طلبات التسجيل الجديدة وتفعيل الحسابات</small>
+                            </div>
+                        </div>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body p-4" style="background-color: #0f172a;">
+                        <div id="adminActionAlert" class="alert d-none py-2 px-3 mb-3 small fw-bold"></div>
+
+                        <!-- Section: Pending Registration Approvals -->
+                        <div class="card mb-4 border-warning border-opacity-50" style="background-color: #1e293b;">
+                            <div class="card-header d-flex justify-content-between align-items-center py-2 px-3 border-warning border-opacity-25" style="background-color: rgba(234, 179, 8, 0.1);">
+                                <span class="fw-bold text-warning d-flex align-items-center gap-2">
+                                    <i class="bi bi-hourglass-split"></i> طلبات التسجيل الجديدة (بانتظار الموافقة)
+                                </span>
+                                <span id="modalPendingCountBadge" class="badge bg-warning text-dark fw-bold">0</span>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="table-responsive">
+                                    <table class="table table-dark table-hover mb-0 align-middle" style="background-color: transparent; font-size: 0.85rem;">
+                                        <thead class="table-dark text-secondary">
+                                            <tr>
+                                                <th class="ps-3">اسم المستخدم</th>
+                                                <th>الاسم الكامل</th>
+                                                <th>البريد الإلكتروني</th>
+                                                <th>تاريخ الطلب</th>
+                                                <th class="text-center pe-3">الإجراء المطلوب</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="pendingUsersTableBody">
+                                            <tr><td colspan="5" class="text-center text-muted py-3">جارٍ التحميل...</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Section: Active Users -->
+                        <div class="card border-secondary border-opacity-50" style="background-color: #1e293b;">
+                            <div class="card-header d-flex justify-content-between align-items-center py-2 px-3 border-secondary border-opacity-25" style="background-color: rgba(148, 163, 184, 0.05);">
+                                <span class="fw-bold text-info d-flex align-items-center gap-2">
+                                    <i class="bi bi-people-fill"></i> المستخدمون المفعلون (Active Users)
+                                </span>
+                                <span id="modalActiveCountBadge" class="badge bg-secondary">0</span>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="table-responsive">
+                                    <table class="table table-dark table-hover mb-0 align-middle" style="background-color: transparent; font-size: 0.85rem;">
+                                        <thead class="table-dark text-secondary">
+                                            <tr>
+                                                <th class="ps-3">اسم المستخدم</th>
+                                                <th>الاسم الكامل</th>
+                                                <th>البريد الإلكتروني</th>
+                                                <th>الصلاحية</th>
+                                                <th>آخر تسجيل دخول</th>
+                                                <th class="text-center pe-3">الإجراء</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="activeUsersTableBody">
+                                            <tr><td colspan="6" class="text-center text-muted py-3">جارٍ التحميل...</td></tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer border-top border-secondary border-opacity-50 py-2">
+                        <button type="button" class="btn btn-secondary btn-sm px-3" data-bs-dismiss="modal">إغلاق</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        let adminUsersModalInstance = null;
+
+        async function checkAdminPendingUsers() {
+            try {
+                const res = await fetch('/api/admin/users');
+                if (!res.ok) return;
+                const data = await res.json();
+                const badge = document.getElementById('adminPendingBadge');
+                if (badge) {
+                    if (data.pending_count > 0) {
+                        badge.textContent = data.pending_count;
+                        badge.style.display = 'inline-block';
+                    } else {
+                        badge.style.display = 'none';
+                    }
+                }
+            } catch(e) {
+                console.error('Error fetching admin pending users count:', e);
+            }
+        }
+
+        async function loadAdminUsersData() {
+            const pendingTbody = document.getElementById('pendingUsersTableBody');
+            const activeTbody = document.getElementById('activeUsersTableBody');
+            const pendingBadge = document.getElementById('modalPendingCountBadge');
+            const activeBadge = document.getElementById('modalActiveCountBadge');
+
+            try {
+                const res = await fetch('/api/admin/users');
+                if (!res.ok) {
+                    throw new Error('Failed to load users: ' + res.statusText);
+                }
+                const data = await res.json();
+
+                if (pendingBadge) pendingBadge.textContent = data.pending_count;
+                if (activeBadge) activeBadge.textContent = data.active.length;
+                const navBadge = document.getElementById('adminPendingBadge');
+                if (navBadge) {
+                    navBadge.textContent = data.pending_count;
+                    navBadge.style.display = data.pending_count > 0 ? 'inline-block' : 'none';
+                }
+
+                if (data.pending.length === 0) {
+                    pendingTbody.innerHTML = '<tr><td colspan="5" class="text-center text-success py-3"><i class="bi bi-check-circle me-1"></i> لا توجد طلبات تسجيل جديدة بانتظار الموافقة.</td></tr>';
+                } else {
+                    pendingTbody.innerHTML = data.pending.map(u => `
+                        <tr>
+                            <td class="ps-3 fw-bold text-white">${u.username}</td>
+                            <td>${u.full_name || '-'}</td>
+                            <td class="text-muted">${u.email}</td>
+                            <td class="small text-muted">${u.created_at || '-'}</td>
+                            <td class="text-center pe-3">
+                                <button class="btn btn-sm btn-success py-1 px-2 fw-bold" onclick="approveAdminUser(${u.id}, '${u.username}')" title="موافقة وتفعيل">
+                                    <i class="bi bi-check-lg me-1"></i> موافقة
+                                </button>
+                                <button class="btn btn-sm btn-outline-danger py-1 px-2 ms-1" onclick="deleteAdminUser(${u.id}, '${u.username}')" title="رفض وحذف">
+                                    <i class="bi bi-trash"></i> رفض
+                                </button>
+                            </td>
+                        </tr>
+                    `).join('');
+                }
+
+                if (data.active.length === 0) {
+                    activeTbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">لا يوجد مستخدمون مفعلون.</td></tr>';
+                } else {
+                    activeTbody.innerHTML = data.active.map(u => `
+                        <tr>
+                            <td class="ps-3 fw-bold text-white">${u.username}</td>
+                            <td>${u.full_name || '-'}</td>
+                            <td class="text-muted">${u.email}</td>
+                            <td><span class="badge ${u.role === 'admin' ? 'bg-primary' : 'bg-secondary'}">${u.role}</span></td>
+                            <td class="small text-muted">${u.last_login || 'لم يسجل دخول بعد'}</td>
+                            <td class="text-center pe-3">
+                                ${u.username === 'msafia' ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle">المدير العام (Protected)</span>' : `
+                                    <button class="btn btn-sm btn-outline-warning py-0 px-2" onclick="deactivateAdminUser(${u.id}, '${u.username}')" title="تعليق وتجميد الحساب">
+                                        <i class="bi bi-pause-circle me-1"></i> تعطيل
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-danger py-0 px-1 ms-1" onclick="deleteAdminUser(${u.id}, '${u.username}')" title="حذف الحساب">
+                                        <i class="bi bi-x-lg"></i>
+                                    </button>
+                                `}
+                            </td>
+                        </tr>
+                    `).join('');
+                }
+
+            } catch (err) {
+                showAdminAlert('danger', 'خطأ أثناء جلب بيانات المستخدمين: ' + err.message);
+            }
+        }
+
+        function showAdminAlert(type, msg) {
+            const alertBox = document.getElementById('adminActionAlert');
+            if (!alertBox) return;
+            alertBox.className = `alert alert-${type} py-2 px-3 mb-3 small fw-bold`;
+            alertBox.innerHTML = msg;
+            alertBox.classList.remove('d-none');
+            setTimeout(() => {
+                alertBox.classList.add('d-none');
+            }, 4000);
+        }
+
+        function openAdminUsersModal() {
+            const modalEl = document.getElementById('adminUsersModal');
+            if (!modalEl) return;
+            if (!adminUsersModalInstance && typeof bootstrap !== 'undefined') {
+                adminUsersModalInstance = new bootstrap.Modal(modalEl);
+            }
+            loadAdminUsersData();
+            if (adminUsersModalInstance) {
+                adminUsersModalInstance.show();
+            }
+        }
+
+        async function approveAdminUser(id, username) {
+            try {
+                const res = await fetch('/api/admin/users/' + id + '/approve', { method: 'POST' });
+                const resData = await res.json();
+                if (res.ok) {
+                    showAdminAlert('success', `<i class="bi bi-check-circle-fill me-1"></i> تم تفعيل واعتماد حساب <strong>${username}</strong> بنجاح! يمكنه الآن تسجيل الدخول.`);
+                    loadAdminUsersData();
+                } else {
+                    showAdminAlert('danger', resData.detail || 'فشل تفعيل الحساب.');
+                }
+            } catch (err) {
+                showAdminAlert('danger', 'خطأ بالاتصال: ' + err.message);
+            }
+        }
+
+        async function deactivateAdminUser(id, username) {
+            if (!confirm(`هل أنت متأكد من رغبتك في تعطيل حساب ${username}؟ لن يتمكن من تسجيل الدخول حتى تعيد تفعيله.`)) return;
+            try {
+                const res = await fetch('/api/admin/users/' + id + '/deactivate', { method: 'POST' });
+                const resData = await res.json();
+                if (res.ok) {
+                    showAdminAlert('warning', `<i class="bi bi-pause-fill me-1"></i> تم تعطيل حساب <strong>${username}</strong>.`);
+                    loadAdminUsersData();
+                } else {
+                    showAdminAlert('danger', resData.detail || 'فشل تعطيل الحساب.');
+                }
+            } catch (err) {
+                showAdminAlert('danger', 'خطأ بالاتصال: ' + err.message);
+            }
+        }
+
+        async function deleteAdminUser(id, username) {
+            if (!confirm(`تحذير: هل أنت متأكد من رفض وحذف حساب ${username} نهائياً؟`)) return;
+            try {
+                const res = await fetch('/api/admin/users/' + id, { method: 'DELETE' });
+                const resData = await res.json();
+                if (res.ok) {
+                    showAdminAlert('danger', `<i class="bi bi-trash-fill me-1"></i> تم حذف حساب <strong>${username}</strong> بنجاح.`);
+                    loadAdminUsersData();
+                } else {
+                    showAdminAlert('danger', resData.detail || 'فشل حذف الحساب.');
+                }
+            } catch (err) {
+                showAdminAlert('danger', 'خطأ بالاتصال: ' + err.message);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', checkAdminPendingUsers);
+        } else {
+            checkAdminPendingUsers();
+        }
+        </script>
+        """
+        html = html.replace("</body>", admin_modal_html + "\n</body>")
+
     return html
 
 
@@ -602,11 +879,13 @@ async def signup_page(request: Request):
 
 @gateway_app.post("/api/auth/login")
 async def api_login(payload: LoginPayload):
-    """Authenticates user and returns session cookie."""
-    user = auth.authenticate_user(payload.username, payload.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة (Invalid credentials).")
+    """Authenticates user and returns session cookie if active."""
+    auth_res = auth.authenticate_user(payload.username, payload.password)
+    if not auth_res.get("success"):
+        status_code = status.HTTP_403_FORBIDDEN if auth_res.get("status") == "pending_approval" else status.HTTP_401_UNAUTHORIZED
+        raise HTTPException(status_code=status_code, detail=auth_res.get("message", "بيانات الدخول غير صحيحة."))
 
+    user = auth_res["user"]
     token = auth.create_session_token(
         user_id=user["id"],
         username=user["username"],
@@ -641,7 +920,7 @@ async def api_login(payload: LoginPayload):
 
 @gateway_app.post("/api/auth/signup")
 async def api_signup(payload: SignupPayload):
-    """Registers a new user and auto-logs in."""
+    """Registers a new user in pending state (is_active=0) awaiting admin approval."""
     try:
         user = auth.create_user(
             username=payload.username,
@@ -649,35 +928,74 @@ async def api_signup(payload: SignupPayload):
             password=payload.password,
             full_name=payload.full_name,
             role="presales",
+            is_active=0,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Registration error: {e}")
 
-    token = auth.create_session_token(
-        user_id=user["id"],
-        username=user["username"],
-        role=user.get("role", "presales"),
-        full_name=user.get("full_name", ""),
-    )
-
-    response = JSONResponse(content={
-        "status": "success",
-        "message": "Registration successful",
-        "user": user,
-        "token": token,
+    # Gated account: pending admin approval (no session cookie issued)
+    return JSONResponse(content={
+        "status": "pending_approval",
+        "message": "تم استلام طلب التسجيل بنجاح! حسابك قيد المراجعة وبانتظار موافقة مسؤول النظام (Admin) لتفعيله.",
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "full_name": user.get("full_name"),
+            "role": user.get("role"),
+            "is_active": user.get("is_active", 0),
+        },
     })
 
-    response.set_cookie(
-        key=auth.SESSION_COOKIE_NAME,
-        value=token,
-        max_age=30 * 86400,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-    )
-    return response
+
+# -----------------------------------------------------------------------------
+# Admin User Management APIs
+# -----------------------------------------------------------------------------
+@gateway_app.get("/api/admin/users")
+async def admin_list_users(request: Request):
+    """Lists pending and active users for admin."""
+    user = auth.get_current_user_from_request(request)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="صلاحيات مسؤول النظام مطلوبة (Admin privileges required).")
+    return auth.list_users()
+
+
+@gateway_app.post("/api/admin/users/{user_id}/approve")
+async def admin_approve_user(user_id: int, request: Request):
+    """Approves and activates a pending user account."""
+    user = auth.get_current_user_from_request(request)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="صلاحيات مسؤول النظام مطلوبة (Admin privileges required).")
+    success = auth.approve_user(user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود.")
+    return {"status": "success", "message": f"تم تفعيل واعتماد المستخدم بنجاح."}
+
+
+@gateway_app.post("/api/admin/users/{user_id}/deactivate")
+async def admin_deactivate_user(user_id: int, request: Request):
+    """Deactivates an active user account."""
+    user = auth.get_current_user_from_request(request)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="صلاحيات مسؤول النظام مطلوبة (Admin privileges required).")
+    success = auth.deactivate_user(user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="لا يمكن تعطيل هذا الحساب أو المستخدم غير موجود.")
+    return {"status": "success", "message": f"تم تعطيل الحساب بنجاح."}
+
+
+@gateway_app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: int, request: Request):
+    """Rejects registration or deletes a user account."""
+    user = auth.get_current_user_from_request(request)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="صلاحيات مسؤول النظام مطلوبة (Admin privileges required).")
+    success = auth.delete_user(user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="لا يمكن حذف هذا الحساب أو المستخدم غير موجود.")
+    return {"status": "success", "message": f"تم حذف الطلب / الحساب بنجاح."}
 
 
 @gateway_app.get("/api/auth/logout")

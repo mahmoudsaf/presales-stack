@@ -609,7 +609,7 @@ def inject_user_badge(html: str, user: Dict[str, Any]) -> str:
                             </div>
                             <div>
                                 <h5 class="modal-title fw-bold text-white mb-0" id="adminUsersModalLabel">إدارة المستخدمين والموافقات</h5>
-                                <small class="text-muted">مراجعة طلبات التسجيل الجديدة وتفعيل الحسابات</small>
+                                <small style="color: #94a3b8 !important;">مراجعة طلبات التسجيل الجديدة وتفعيل الحسابات</small>
                             </div>
                         </div>
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -730,9 +730,9 @@ def inject_user_badge(html: str, user: Dict[str, Any]) -> str:
                     pendingTbody.innerHTML = data.pending.map(u => `
                         <tr>
                             <td class="ps-3 fw-bold text-white">${u.username}</td>
-                            <td>${u.full_name || '-'}</td>
-                            <td class="text-muted">${u.email}</td>
-                            <td class="small text-muted">${u.created_at || '-'}</td>
+                            <td class="text-light">${u.full_name || '-'}</td>
+                            <td style="color: #93c5fd; font-family: monospace;">${u.email}</td>
+                            <td class="small" style="color: #cbd5e1;">${u.created_at || '-'}</td>
                             <td class="text-center pe-3">
                                 <button class="btn btn-sm btn-success py-1 px-2 fw-bold" onclick="approveAdminUser(${u.id}, '${u.username}')" title="موافقة وتفعيل">
                                     <i class="bi bi-check-lg me-1"></i> موافقة
@@ -746,15 +746,15 @@ def inject_user_badge(html: str, user: Dict[str, Any]) -> str:
                 }
 
                 if (data.active.length === 0) {
-                    activeTbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">لا يوجد مستخدمون مفعلون.</td></tr>';
+                    activeTbody.innerHTML = '<tr><td colspan="6" class="text-center py-3" style="color: #94a3b8;">لا يوجد مستخدمون مفعلون.</td></tr>';
                 } else {
                     activeTbody.innerHTML = data.active.map(u => `
                         <tr>
                             <td class="ps-3 fw-bold text-white">${u.username}</td>
-                            <td>${u.full_name || '-'}</td>
-                            <td class="text-muted">${u.email}</td>
+                            <td class="text-light">${u.full_name || '-'}</td>
+                            <td style="color: #93c5fd; font-family: monospace;">${u.email}</td>
                             <td><span class="badge ${u.role === 'admin' ? 'bg-primary' : 'bg-secondary'}">${u.role}</span></td>
-                            <td class="small text-muted">${u.last_login || 'لم يسجل دخول بعد'}</td>
+                            <td class="small" style="color: #cbd5e1;">${u.last_login || 'لم يسجل دخول بعد'}</td>
                             <td class="text-center pe-3">
                                 ${u.username === 'msafia' ? '<span class="badge bg-primary-subtle text-primary border border-primary-subtle">المدير العام (Protected)</span>' : `
                                     <button class="btn btn-sm btn-outline-warning py-0 px-2" onclick="deactivateAdminUser(${u.id}, '${u.username}')" title="تعليق وتجميد الحساب">

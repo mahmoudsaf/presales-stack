@@ -703,32 +703,43 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
 
             # Check if this baseline deal matches the candidate customer
             cust_matched = False
-            # 1. Direct Customer Alias Cluster Check
-            for cluster_id, aliases in CUSTOMER_ALIASES.items():
-                if any(normalize_arabic(a) in bd_comp_norm for a in aliases):
-                    if any(normalize_arabic(a) in t_norm or (cand_comp_norm and normalize_arabic(a) in cand_comp_norm) for a in aliases):
-                        cust_matched = True
-                        break
-
-            # 2. Customer Name Similarity
-            if not cust_matched and bd_comp:
-                if cand_comp_norm and cand_comp_norm not in ("general client", "client", "general", "عميل"):
-                    if compute_customer_similarity(bd_comp, candidate_company) >= 0.75:
-                        cust_matched = True
-                if not cust_matched and compute_customer_similarity(bd_comp, text) >= 0.75:
+            # When candidate_company is explicitly provided and is a specific entity (not generic)
+            if cand_comp_norm and cand_comp_norm not in ("general client", "client", "general", "عميل"):
+                # 1. Alias cluster match
+                for cluster_id, aliases in CUSTOMER_ALIASES.items():
+                    if any(normalize_arabic(a) in bd_comp_norm for a in aliases):
+                        if any(normalize_arabic(a) in cand_comp_norm for a in aliases):
+                            cust_matched = True
+                            break
+                # 2. String similarity
+                if not cust_matched and compute_customer_similarity(bd_comp, candidate_company) >= 0.75:
                     cust_matched = True
+                # If candidate_company was specific and did NOT match bd_comp, this deal belongs to a DIFFERENT entity!
                 if not cust_matched:
-                    _, core_tokens, stripped_tokens = get_customer_tokens(bd_comp)
-                    for token in core_tokens + stripped_tokens:
-                        if len(token) >= 3 and token not in NOISE_WORDS:
-                            t_boundary = rf"\b{re.escape(token)}\b"
-                            if re.search(t_boundary, t_norm) or token in t_norm.split():
-                                cust_matched = True
-                                break
+                    continue
+            else:
+                # Candidate company is missing or generic - infer from text
+                # 1. Direct Customer Alias Cluster Check in text
+                for cluster_id, aliases in CUSTOMER_ALIASES.items():
+                    if any(normalize_arabic(a) in bd_comp_norm for a in aliases):
+                        if any(normalize_arabic(a) in t_norm for a in aliases):
+                            cust_matched = True
+                            break
 
-            # If customer does not match bd, continue
-            if not cust_matched:
-                continue
+                # 2. Customer Name Similarity in text
+                if not cust_matched and bd_comp:
+                    if compute_customer_similarity(bd_comp, text) >= 0.75:
+                        cust_matched = True
+                    if not cust_matched:
+                        _, core_tokens, stripped_tokens = get_customer_tokens(bd_comp)
+                        for token in core_tokens + stripped_tokens:
+                            if len(token) >= 3 and token not in NOISE_WORDS:
+                                t_boundary = rf"\b{re.escape(token)}\b"
+                                if re.search(t_boundary, t_norm) or token in t_norm.split():
+                                    cust_matched = True
+                                    break
+                if not cust_matched:
+                    continue
 
             # If candidate introduces an explicit new tender (and is not an exact deal name match), do NOT match existing deal!
             if is_explicit_new and not (cand_deal_norm and bd_deal_norm and cand_deal_norm == bd_deal_norm):
@@ -797,13 +808,24 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
         comp = payload.get("company_name") or payload.get("customer_name")
         deal = payload.get("deal_name") or payload.get("title")
         notes = str(payload.get("vendor_notes") or "")
-        search_corpus = f"{comp or ''} {deal or ''} {notes} {full_context}"
+        search_corpus = f"{comp or ''} {deal or ''} {notes}"
 
         matched_bd = None
         if deal_id:
             matched_candidate = next((d for d in baseline_deals if d.get("deal_id") == deal_id), None)
             if matched_candidate:
-                # Strictly verify that candidate deal name matches the existing deal name/scope
+                # Strictly verify customer and deal scope match
+                cand_comp_norm = normalize_arabic(comp or "")
+                bd_comp_norm = normalize_arabic(matched_candidate.get("company_name", ""))
+                is_alias = False
+                for cluster_id, aliases in CUSTOMER_ALIASES.items():
+                    if any(normalize_arabic(a) in bd_comp_norm for a in aliases):
+                        if any(normalize_arabic(a) in cand_comp_norm for a in aliases):
+                            is_alias = True
+                            break
+                comp_sim = compute_customer_similarity(matched_candidate.get("company_name", ""), comp or "")
+                is_different_company = (cand_comp_norm and cand_comp_norm not in ("general client", "client", "general", "عميل") and not is_alias and comp_sim < 0.75)
+
                 cand_scope = extract_deal_scope_tokens(deal or "", matched_candidate.get("company_name", ""))
                 bd_scope = extract_deal_scope_tokens(matched_candidate.get("deal_name", ""), matched_candidate.get("company_name", ""))
                 sim = compute_customer_similarity(matched_candidate.get("deal_name", ""), deal or "")
@@ -813,8 +835,8 @@ def reconcile_crm_updates_from_conversation(ai_data: Dict[str, Any], baseline_de
                     "مناقصه جديده", "كراسه جديده", "فرصه جديده", "مناقصه اخري", "كراسه اخري", "مشروع جديد"
                 ])
 
-                if (cand_scope and bd_scope and not (cand_scope & bd_scope)) or (is_explicit_new and sim < 0.80):
-                    # Gemini erroneously sent PUT on an existing deal for a new/different tender!
+                if is_different_company or (cand_scope and bd_scope and not (cand_scope & bd_scope)) or (is_explicit_new and sim < 0.80):
+                    # Gemini erroneously sent PUT on an existing deal for a new/different customer or tender!
                     # Convert to POST to create a brand new deal!
                     matched_bd = None
                     deal_id = None
@@ -1041,7 +1063,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 matching_deals.append((scope_score, d_id, d_name, c_name, c_id, d_cat, c_date))
 
         # Fallback: if no match found via customer/deal name, check if text matches a unique vendor
-        # in newly discussed/updated deals from the same meeting
+        # ONLY if text does not explicitly mention another distinct customer/ministry
         if not matching_deals:
             for d in known_deals:
                 d_id = d.get("deal_id")
@@ -1050,6 +1072,12 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 c_id = d.get("customer_id")
                 d_cat = d.get("deal_category")
                 c_date = d.get("closing_date")
+
+                # If text specifically mentions another entity/ministry, do NOT link to this deal!
+                c_norm = normalize_arabic(c_name)
+                if c_norm and compute_customer_similarity(c_name, text) < 0.40 and any(kw in t_norm for kw in ["وزاره", "امانه", "هيئه", "شركه", "جامعه", "مركز", "صندوق"]):
+                    continue
+
                 p_vendors = get_vendors_str(d.get("primary_vendors")).lower()
                 notes_low = str(d.get("vendor_notes", "")).lower()
                 for v, ar in [("huawei", "هواوي"), ("cisco", "سيسكو"), ("micro focus", "ميكروفوكس"), ("incorta", "انكورت"), ("dell", "ديل"), ("hpe", "اتش بي"), ("veeam", "فيم"), ("nutanix", "نيوتانكس"), ("vmware", "فيموير")]:

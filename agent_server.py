@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from google import genai
@@ -34,6 +34,11 @@ class DealCategory(str, Enum):
     RFP_OWNERSHIP = "1- RFP Ownership & Prime Proposals"
     RFP_DISTRIBUTED_SCOPE = "2- RFP Distributed Scope Items"
     OPPORTUNITY_EFFORTS = "3- Opportunity Efforts & PO"
+
+
+class ApproveSyncPayload(BaseModel):
+    crm_updates: List[Dict[str, Any]] = []
+    task_updates: List[Dict[str, Any]] = []
 
 
 def normalize_deal_category(v: Optional[Any]) -> str:
@@ -1900,14 +1905,16 @@ Return STRICT JSON format:
 
 
 @app.post("/api/process-audio")
-async def process_audio(file: UploadFile = File(...)):
+async def process_audio(
+    file: Optional[UploadFile] = File(None),
+    text_input: Optional[str] = Form(None),
+    auto_sync: Optional[bool] = Form(False),
+):
     """
-    Receives recorded standup audio, processes it using Gemini 2.5 Flash's native speech recognition,
-    detects state deltas vs CRM & Tasks, outputs a structured executive report, and executes live API syncs.
+    Receives recorded standup audio OR pasted text transcript, processes it using Gemini,
+    extracts hierarchical structured entities (Customer -> Deal -> Tasks),
+    detects state deltas vs CRM & Tasks, and either stages them for review or automatically syncs.
     """
-    audio_bytes = await file.read()
-    content_type = file.content_type or "audio/webm"
-
     # 1. Fetch current baseline
     baseline = await fetch_baseline_state()
     deals = baseline["deals"]
@@ -1917,15 +1924,30 @@ async def process_audio(file: UploadFile = File(...)):
     if not client:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="GEMINI_API_KEY is not set. Please provide your API key in the top navigation bar to process audio with Gemini.",
+            detail="GEMINI_API_KEY is not set. Please provide your API key in the top navigation bar to process audio or text with Gemini.",
         )
 
-    # 2. Build Multimodal Content
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
+    # 2. Determine input modality
+    contents = []
+    if file and file.filename:
+        audio_bytes = await file.read()
+        if len(audio_bytes) > 0:
+            content_type = file.content_type or "audio/webm"
+            audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=content_type)
+            contents.append(audio_part)
+
+    if not contents:
+        if text_input and str(text_input).strip():
+            contents.append(f"MEETING TRANSCRIPT / TEXT CONTENT TO PROCESS:\n{str(text_input).strip()}")
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="يرجى إرسال تسجيل صوتي أو نص للاجتماع للمعالجة والفرز (Please provide an audio recording or text transcript)."
+            )
 
     instructions = f"""
 You are an expert bilingual (Saudi Arabic & English) Enterprise Presales Operations AI.
-You are listening to an audio recording of a presales team standup meeting. The engineers speak in their natural languages: Saudi Arabic and English IT terminology.
+You are listening to an audio recording OR reading a written transcript of a presales team standup meeting. The engineers speak in their natural languages: Saudi Arabic and English IT terminology.
 
 CRITICAL LANGUAGE & TRANSCRIPTION RULES (STRICT REQUIREMENT):
 1. KEEP THE TRANSCRIPT AND SUMMARY IN ARABIC AND ENGLISH EXACTLY AS SPOKEN — NO TRANSLATION:
@@ -1945,6 +1967,45 @@ CRITICAL LANGUAGE & TRANSCRIPTION RULES (STRICT REQUIREMENT):
    - If a deal is completed/won/lost, update the active deal's stage to "Closed-Won" or "Closed-Lost".
    - Do NOT confuse new opportunities with previous closed tenders.
 
+4. CRITICAL HIERARCHY RULE: CUSTOMER-FIRST DATABASE STRUCTURING
+   Every piece of information MUST be structured hierarchically:
+   CUSTOMER (العميل) -> DEAL / OPPORTUNITY (الفرصة/المناقصة) -> INTERNAL SUB-TASKS (المهام والمتعلقات التابعة).
+   - When an engineer reports on multiple customer items (e.g. 1. وزارة الرياضة, 2. الشؤون الصحية للحرس الوطني, 3. هيئة الجمارك والزكاة):
+     TREAT EACH AS AN INDEPENDENT DEAL AND CUSTOMER!
+     DO NOT combine or merge distinct customer entities into one deal.
+     DO NOT attach notes from one customer to another customer's deal.
+   - In `crm_updates`:
+     * company_name: Name of the client or enterprise organization (e.g. "وزارة الرياضة", "الشؤون الصحية للحرس الوطني", "هيئة الزكاة والضريبة والجمارك").
+     * deal_name: Descriptive deal/project title in original Arabic/English (e.g. "مناقصة وزارة الرياضة - تسعير رخص Veeam").
+     * deal_category: "1- RFP Ownership & Prime Proposals" OR "2- RFP Distributed Scope Items" OR "3- Opportunity Efforts & PO".
+     * stage: "RFP / Tender" for RFPs, tenders, distributed scopes, pricing requests; "Gathering Requirements" for early opportunity efforts; "Proposal" if pricing received and ready to submit; "PoC" for proof of concept.
+     * primary_vendors: Array of vendor technologies mentioned for this specific deal.
+     * closing_date: Deadline (YYYY-MM-DD) if mentioned.
+   - In `task_updates`:
+     * customer_name: MUST match the deal's `company_name`.
+     * deal_name: MUST match the deal's `deal_name`.
+     * deal_category: Matching deal category.
+     * task_title: MUST BE STRICTLY SELECTED FROM THE STANDARDIZED CATALOG:
+       --- RFP TASKS (Categories 1 & 2) ---
+       "Bid / No-Bid Qualification & Owner Assignment"
+       "RFP Decomposition & Scope Breakdown"
+       "Clarification Questions Submission"
+       "Low-Level Architecture & Technical Write-up"
+       "Final BoQ & Vendor Quotations"
+       "Technical Compliance Matrix"
+       "Proposal Integration & Master Compliance Audit"
+       "Final Technical Review & Commercial Handover"
+       --- PRE-RFP TASKS (Category 3) ---
+       "Discovery & Technical Requirements Gathering"
+       "High-Level Architecture (HLA) Design"
+       "Preliminary BoQ & Budgetary Sizing"
+       "RFP Specifications Shaping & Advisory"
+       "Technical Proposal Draft & Client Review"
+     * management_blockers: Exact spoken action, vendor communication status, blockers, or specific item details.
+     * vendor_domain: "HPE", "Veeam", "Dell", "Nutanix", "VMware", or "General".
+     * status: "In Progress", "Waiting on Vendor", "Pending Review", "Completed", or "Not Started".
+     * priority: "High", "Medium", or "Low".
+
 BASELINE CRM DEALS (CURRENT ACTIVE DEALS ONLY):
 {json.dumps(deals, indent=2, ensure_ascii=False)}
 
@@ -1952,139 +2013,34 @@ BASELINE TASK BOARD:
 {json.dumps(tasks, indent=2, ensure_ascii=False)}
 
 Your responsibilities:
-1. Listen carefully and transcribe/understand all spoken updates from Presales 1 and Presales 2 exactly in their spoken languages without translation.
-2. Compare spoken updates against the baseline CRM deals and Task Board items above to detect DELTAS:
-   - Deal stage changes (e.g. Discovery -> RFP / Tender, RFP / Tender -> Proposal, PoC -> Proposal, Proposal -> Closed-Won).
-   - Estimated deal value revisions.
-   - Task status transitions (e.g. In Progress -> Completed, Waiting on Vendor -> In Progress, Not Started -> In Progress).
-   - Resolved or newly raised management blockers.
-   - Any newly mentioned deals or tasks to create.
+1. Listen carefully or read the text to understand all updates from Presales 1 and Presales 2.
+2. Compare updates against baseline CRM deals and Task Board items above to detect DELTAS.
 3. Formulate structured REST API updates:
    - `crm_updates`: Array of deal updates.
-     * For existing baseline deals: Use "PUT" with "deal_id" and "payload".
-     * For newly discussed projects/opportunities (e.g. "مشروع كاست", "مشروع المراعي"): Use "POST" with "payload".
-     IMPORTANT REQUIREMENTS FOR CRM DEALS (CRITICAL):
-     * company_name: REQUIRED for "POST". Name of the client or enterprise organization (e.g. "كاست", "المراعي", "وزارة الصحة", "MOI"). If an existing customer in BASELINE CRM DEALS matches this entity (e.g. "المراعي" when mentioned as "شركة المراعي"), reuse the existing customer's registered company name.
-     * deal_name: REQUIRED for "POST". Descriptive deal/project title in original Arabic/English as spoken (e.g. "تجديد الدعم الفني للأجهزة", "مشروع كاست - تحديث مركز البيانات", "مشروع شركة المراعي - حلول الأجهزة ومستلزمات Dell").
-     * deal_category: MUST be one of the three standardized business categories:
-       1. "1- RFP Ownership & Prime Proposals": When presales mentions owning a prime RFP/tender end-to-end (e.g. "I got an RFP for customer MOI and the name is renewal for hardware" / "استلمت مناقصة" / "اعمل على مناقصة").
-       2. "2- RFP Distributed Scope Items": When receiving or working on a distributed vendor/partner scope within an RFP (e.g. "received a scope for the RFP name تجديد الدعم الفني للتجهيزات للعميل وزارة الداخلية").
-       3. "3- Opportunity Efforts & PO": For early discovery, consultative assessment visits prior to public RFP ("received request to visit customer", "met customer to identify opportunity", "working early to cook the RFP before release") or direct PO.
-     * closing_date: Tender closing date or submission deadline in format "YYYY-MM-DD" (e.g. if speaker says "تاريخ الاغلاق او حتسكر ب 21/8/2026", output "2026-08-21"). Mentioned especially for RFP tenders and distributed scopes. For early opportunity efforts without deadline, can be null.
-     * primary_vendors: Array of vendor technologies (e.g. ["Hitachi Vantara"], ["Dell"], ["HPE"], ["Veeam"]).
-     * stage: MUST be one of: ["Discovery", "Gathering Requirements", "RFP / Tender", "PoC", "Proposal", "Closed-Won", "Closed-Lost"]. (Never use "In Progress" for deal stage).
-     * RFP & REQUEST FOR PRICING RULE (STRICT): If the presales engineer mentions receiving an RFP (طلب تقديم عروض), RFQ, or a request for pricing (طلب تسعير / استدراج عروض أسعار / تسعيرة مباشرة), set the deal stage to "RFP / Tender". This represents a direct request for pricing or tender proposal, usually for opportunities or private/commercial accounts not related to the Eitimad (منصة اعتماد) portal which is designated for government tenders.
-     * assigned_presales: "Presales 1" or "Presales 2" (Engineer Abdullah maps to "Presales 1").
-     * estimated_value: Numeric float in SAR/USD (e.g. 1.25M to 1.5M -> 1350000.0, 10M -> 10000000.0). Remember 1 million = 1000000.0.
-     * vendor_notes: Technical requirements, scope, target close dates, in original spoken language.
-    - `task_updates`: Array of task updates.
-       STRICT TASK CATALOG REQUIREMENT (CRITICAL - CEASE FREE-FORM TASKS):
-       * The presales operations pipeline uses a FIXED, PREDEFINED TASK CATALOG.
-       * You MUST NOT generate open-ended or arbitrary free-form task titles.
-       * Every task's `task_title` MUST BE EXACTLY ONE OF THE FOLLOWING PREDEFINED CATALOG ITEMS:
-         --- PRE-RFP TASKS (for Category 3: Opportunity Efforts & PO) ---
-         1. "Discovery & Technical Requirements Gathering"
-         2. "High-Level Architecture (HLA) Design"
-         3. "Preliminary BoQ & Budgetary Sizing"
-         4. "RFP Specifications Shaping & Advisory"
-         5. "Technical Proposal Draft & Client Review"
-         --- RFP TASKS (for Category 1: RFP Ownership & Category 2: RFP Distributed Scope) ---
-         1. "Bid / No-Bid Qualification & Owner Assignment"
-         2. "RFP Decomposition & Scope Breakdown"
-         3. "Clarification Questions Submission"
-         4. "Low-Level Architecture & Technical Write-up"
-         5. "Final BoQ & Vendor Quotations"
-         6. "Technical Compliance Matrix"
-         7. "Proposal Integration & Master Compliance Audit"
-         8. "Final Technical Review & Commercial Handover"
-       * ANY spoken details, engineer comments, partner coordination, site visits, or specific hardware context MUST be placed in `management_blockers` or notes, NEVER replacing the standardized catalog `task_title`.
-
-        MANDATORY 5-STEP AGENT DATA PIPELINE:
-        1. Determine whether a deal is NEW or EXISTING (CRITICAL - DEAL NAME SIMILARITY RULE):
-           - ALWAYS extract the exact customer name and deal/tender title from the conversation.
-           - A SINGLE customer can have MULTIPLE distinct tenders/RFPs/projects simultaneously (e.g. one for Software Licenses, one for Servers, one for Laptops, one for Networking).
-           - Compare the spoken deal/tender name against existing deal names in BASELINE CRM DEALS:
-             * IF AND ONLY IF the speaker is following up on an EXISTING deal with the SAME or SIMILAR deal name (e.g. updating prices, submitting clarifications, sending to tender department, changing stage for that project):
-               Use "method": "PUT" WITH that specific "deal_id" to update that existing deal.
-             * IF the speaker mentions receiving a NEW tender, a new RFP, or a project with a DIFFERENT name or scope (e.g. Incorta licenses, server procurement, laptops, networking):
-               YOU MUST USE "method": "POST" to create a BRAND NEW DEAL, even if the customer already has other deals!
-               NEVER modify an existing deal or append notes to an existing deal if the project/tender is distinct!
-             * NEVER use generic fallback names like "مشروع General Client" or "General Client". ALWAYS use the real organization and authentic deal name.
-        2. Update Deal Context:
-           - Capture deal stage progression, estimated value, closing date, vendor notes, and primary vendors.
-        3. Update Existing Task Statuses:
-           - Check BASELINE TASK BOARD. If speech indicates an active task on the deal finished (e.g. "خلصنا زيارة الموقع" / "we finished site survey" / "we submitted questions"):
-             formulate a "PUT" on that task's "task_id" with payload {{ "status": "Completed" }}.
-        4. Enqueue the Next Action strictly from the Catalog:
-           - Choose the logical next deliverable strictly from PRE_RFP_TASKS (for Opportunity Efforts) or RFP_TASKS (for RFPs).
-           - Formulate a "POST" in task_updates linked to the deal, chained to the finished task via "previous_task_id", and set status to "In Progress" or "Not Started".
-        5. MULTI-PRESALES & DISTRIBUTED SCOPE TASK CREATION RULE (CRITICAL):
-           - If the same deal has been distributed to another presales engineer as well, and the other presales engineer informs that he received the distributed scope (e.g. Deal owned by Presales 1, and Presales 2 informs he received the distributed scope for Dell / Nutanix, or vice versa):
-             * CRM DEAL: Add/amend the update to the SAME existing deal using "method": "PUT" with that deal's "deal_id". Append notes to "vendor_notes" and merge vendors into "primary_vendors". DO NOT create a duplicate deal!
-             * TASK BOARD: DO NOT add progress to the same task or overwrite the other presales' existing task!
-             * INSTEAD, GENERATE A BRAND NEW TASK ("method": "POST") for the other presales engineer:
-               - "assigned_to": The presales engineer who received the distributed scope ("Presales 2" or "Presales 1").
-               - "category": "RFP_DISTRIBUTED_SCOPE".
-               - "deal_category": "2- RFP Distributed Scope Items".
-               - "task_title": Standardized catalog item for their deliverable (e.g. "Low-Level Architecture & Technical Write-up", "Final BoQ & Vendor Quotations", "Technical Compliance Matrix", or "RFP Decomposition & Scope Breakdown").
-               - "vendor_domain": Technology domain of their distributed scope (e.g. "Nutanix", "Dell", "HPE", "Veeam", "VMware", "General").
-               - "status": "In Progress" (or "Not Started").
-               - "related_deal_id": The existing deal's integer deal_id.
-               - "deal_name": The existing deal's name.
-               - "customer_name": The customer name.
-               - "customer_id": The customer ID.
-               - "management_blockers": Specific distributed scope details and notes from that engineer.
-
-        IMPORTANT CONSTRAINTS FOR TASKS:
-        * task_title: MUST be verbatim from PRE_RFP_TASKS or RFP_TASKS above.
-        * management_blockers: Specific spoken context, blockers, or next step details.
-        * customer_name: Name of customer or organization (e.g. "كاست", "المراعي", "MOI").
-        * deal_name: Descriptive deal/project title.
-        * deal_category: Corresponding deal category ("1- RFP Ownership & Prime Proposals", "2- RFP Distributed Scope Items", or "3- Opportunity Efforts & PO").
-        * closing_date: Closing deadline (YYYY-MM-DD) if mentioned or associated with RFP tender.
-        * status: MUST be one of: ["Not Started", "In Progress", "Waiting on Vendor", "Pending Review", "Completed"].
-        * assigned_to: MUST be: "Presales 1" or "Presales 2".
-        * category: MUST be: "RFP_OWNERSHIP" (prime tenders), "RFP_DISTRIBUTED_SCOPE" (vendor scopes/renewals), or "GENERAL_ACTION" (opportunity efforts / general deliverables).
-        * vendor_domain: MUST be one of: ["HPE", "Veeam", "Dell", "Nutanix", "VMware", "General"]. NOTE: HP / Hewlett Packard MUST be set to "HPE"; Hitachi Vantara maps to "General".
-        * priority: MUST be one of: ["High", "Medium", "Low"].
-        * related_deal_id: Integer deal ID if associated with a CRM deal, else null.
-        * previous_task_id: Integer ID of previous completed task on same deal, else null.
-        * changed_by: "Voice Agent" (or the speaking engineer).
+     * For existing baseline deals of the SAME customer & deal name: Use "PUT" with "deal_id" and "payload".
+     * For newly discussed projects/opportunities or new tenders: Use "POST" with "payload".
+   - `task_updates`: Array of task updates linked to their respective deals.
 4. Produce an Executive Briefing Report in the original spoken language without translation:
-   - `today_progress`: Array of key accomplishments in the spoken language.
-   - `tomorrow_actions`: Array of prioritized next steps in the spoken language.
-   - `management_warnings`: Array of critical risks, vendor roadblocks, or management escalations in the spoken language.
+   - `today_progress`: Array of key accomplishments.
+   - `tomorrow_actions`: Array of prioritized next steps.
+   - `management_warnings`: Array of critical risks, vendor roadblocks, or management escalations.
 
 Return STRICT JSON matching this schema:
 {{
-  "transcript_summary": "Authentic transcript and summary of the meeting highlights preserving the exact language as spoken (Arabic and English mixed as spoken, NO translation).",
+  "transcript_summary": "Authentic transcript and summary of the meeting highlights preserving the exact language as spoken.",
   "crm_updates": [
     {{
       "method": "POST",
       "payload": {{
-        "company_name": "MOI",
-        "deal_name": "تجديد الدعم الفني للأجهزة",
-        "deal_category": "1- RFP Ownership & Prime Proposals",
-        "closing_date": "2026-08-21",
-        "primary_vendors": ["Dell", "HPE"],
+        "company_name": "Customer Name",
+        "deal_name": "Tender or Deal Name",
+        "deal_category": "2- RFP Distributed Scope Items",
+        "closing_date": "YYYY-MM-DD or null",
+        "primary_vendors": ["Veeam"],
         "stage": "RFP / Tender",
-        "estimated_value": 10000000.0,
-        "assigned_presales": "Presales 1",
-        "vendor_notes": "كراسة تجديد الدعم الفني للأجهزة، تاريخ الإغلاق 21/8/2026"
-      }}
-    }},
-    {{
-      "method": "POST",
-      "payload": {{
-        "company_name": "كاست",
-        "deal_name": "مشروع كاست - تحديث مركز البيانات",
-        "deal_category": "3- Opportunity Efforts & PO",
-        "closing_date": null,
-        "primary_vendors": ["Hitachi Vantara"],
-        "stage": "Gathering Requirements",
-        "estimated_value": 1250000.0,
-        "assigned_presales": "Presales 1",
-        "vendor_notes": "تحديث مركز البيانات Data Center Tech Refresh بحلول Hitachi Vantara ميزانية 1 إلى 1.5 مليون ريال"
+        "estimated_value": 0.0,
+        "assigned_presales": "Presales 2",
+        "vendor_notes": "Technical scope and status"
       }}
     }}
   ],
@@ -2092,17 +2048,17 @@ Return STRICT JSON matching this schema:
     {{
       "method": "POST",
       "payload": {{
-        "task_title": "RFP Decomposition & Scope Breakdown",
-        "management_blockers": "توزيع نطاق العمل لشركاء Dell و Cisco لمناقصة وزارة الداخلية",
-        "customer_name": "MOI",
-        "deal_name": "تجديد الدعم الفني للأجهزة",
-        "deal_category": "1- RFP Ownership & Prime Proposals",
-        "closing_date": "2026-08-21",
-        "category": "RFP_OWNERSHIP",
-        "assigned_to": "Presales 1",
-        "vendor_domain": "Dell",
-        "status": "In Progress",
-        "priority": "High",
+        "task_title": "Final BoQ & Vendor Quotations",
+        "management_blockers": "بانتظار استلام الأسعار والـ Technical Proposal من الفندور",
+        "customer_name": "Customer Name",
+        "deal_name": "Tender or Deal Name",
+        "deal_category": "2- RFP Distributed Scope Items",
+        "closing_date": "YYYY-MM-DD or null",
+        "category": "RFP_DISTRIBUTED_SCOPE",
+        "assigned_to": "Presales 2",
+        "vendor_domain": "Veeam",
+        "status": "Waiting on Vendor",
+        "priority": "Medium",
         "related_deal_id": null,
         "previous_task_id": null,
         "changed_by": "Voice Agent"
@@ -2110,34 +2066,94 @@ Return STRICT JSON matching this schema:
     }}
   ],
   "executive_report": {{
-    "today_progress": ["... (in original spoken language)"],
-    "tomorrow_actions": ["... (in original spoken language)"],
-    "management_warnings": ["... (in original spoken language)"]
+    "today_progress": ["..."],
+    "tomorrow_actions": ["..."],
+    "management_warnings": ["..."]
   }}
 }}
 """
 
+    contents.append(instructions)
+
     try:
         response = generate_with_model_fallback(
             client=client,
-            contents=[audio_part, instructions],
+            contents=contents,
         )
         ai_data = extract_json(response.text)
     except Exception as e:
-        print(f"Multimodal Gemini error: {e}")
+        print(f"Gemini processing error: {e}")
         raise HTTPException(status_code=500, detail=f"Gemini processing error: {str(e)}")
 
-    # 3. Automatically synchronize detected updates to local APIs with comprehensive reconciliation
+    # 3. Synchronize detected updates to local APIs with comprehensive reconciliation
     try:
         crm_updates = reconcile_crm_updates_from_conversation(ai_data, deals)
         ai_data["crm_updates"] = crm_updates
         task_updates = reconcile_tasks_from_conversation(ai_data, deals, tasks)
-        sync_log = await execute_api_sync(crm_updates, task_updates)
+        ai_data["task_updates"] = task_updates
     except Exception as e:
-        print(f"Reconciliation or API sync error in process_audio: {e}")
+        print(f"Reconciliation error in process_audio: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"API Sync & Reconciliation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Data Reconciliation error: {str(e)}")
+
+    # 4. Group into structured Customer -> Deal -> Tasks hierarchy for staging review
+    staged_deals = []
+    for idx, cu in enumerate(crm_updates):
+        payload = cu.get("payload", {})
+        deal_name = payload.get("deal_name") or ""
+        cust_name = payload.get("company_name") or payload.get("customer_name") or ""
+        deal_id = cu.get("deal_id")
+
+        deal_tasks = []
+        for tu in task_updates:
+            t_payload = tu.get("payload", {})
+            t_deal_id = tu.get("deal_id") or t_payload.get("related_deal_id")
+            t_deal_name = t_payload.get("deal_name") or ""
+            t_cust_name = t_payload.get("customer_name") or ""
+
+            is_match = False
+            if deal_id and t_deal_id and deal_id == t_deal_id:
+                is_match = True
+            elif deal_name and t_deal_name and (
+                deal_name.strip().lower() in t_deal_name.strip().lower() or
+                t_deal_name.strip().lower() in deal_name.strip().lower() or
+                compute_customer_similarity(deal_name, t_deal_name) >= 0.7
+            ):
+                is_match = True
+            elif cust_name and t_cust_name and compute_customer_similarity(cust_name, t_cust_name) >= 0.75:
+                is_match = True
+
+            if is_match and tu not in deal_tasks:
+                deal_tasks.append(tu)
+
+        staged_deals.append({
+            "deal_index": idx,
+            "method": cu.get("method", "POST"),
+            "deal_id": deal_id,
+            "customer_name": cust_name,
+            "deal_name": deal_name,
+            "deal_category": payload.get("deal_category", "2- RFP Distributed Scope Items"),
+            "stage": payload.get("stage", "RFP / Tender"),
+            "primary_vendors": payload.get("primary_vendors", ["General"]),
+            "closing_date": payload.get("closing_date"),
+            "estimated_value": payload.get("estimated_value", 0.0),
+            "assigned_presales": payload.get("assigned_presales", "Presales 1"),
+            "vendor_notes": payload.get("vendor_notes", ""),
+            "tasks": deal_tasks,
+        })
+
+    linked_tasks_set = {id(t) for sd in staged_deals for t in sd["tasks"]}
+    unlinked_tasks = [tu for tu in task_updates if id(tu) not in linked_tasks_set]
+
+    # 5. Execute sync immediately if auto_sync is True, otherwise return staged items
+    sync_log = []
+    if auto_sync:
+        try:
+            sync_log = await execute_api_sync(crm_updates, task_updates)
+        except Exception as e:
+            print(f"API sync error in process_audio: {e}")
+            raise HTTPException(status_code=500, detail=f"API Sync error: {str(e)}")
 
     return {
         "status": "success",
@@ -2145,8 +2161,31 @@ Return STRICT JSON matching this schema:
         "executive_report": ai_data.get("executive_report", {}),
         "crm_updates_planned": crm_updates,
         "task_updates_planned": task_updates,
+        "staged_deals": staged_deals,
+        "unlinked_tasks": unlinked_tasks,
+        "auto_synced": bool(auto_sync),
         "api_sync_log": sync_log,
     }
+
+
+@app.post("/api/approve-sync")
+async def approve_sync(payload: ApproveSyncPayload):
+    """
+    Receives user-reviewed and approved CRM deals and Tasks from the staging UI,
+    sanitizes them, and executes live synchronization to the CRM and Task Board.
+    """
+    try:
+        sync_log = await execute_api_sync(payload.crm_updates, payload.task_updates)
+        return {
+            "status": "success",
+            "message": "Successfully synchronized approved updates.",
+            "api_sync_log": sync_log
+        }
+    except Exception as e:
+        print(f"Error in approve_sync: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to sync approved updates: {str(e)}")
 
 
 # -----------------------------------------------------------------------------
@@ -2274,6 +2313,22 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             cursor: pointer;
             transition: all 0.15s ease;
         }
+        .staged-deal-card {
+            background: #111a2e;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            transition: all 0.2s ease;
+        }
+        .staged-deal-card:hover {
+            border-color: #3b82f6;
+        }
+        .staged-task-row {
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 8px;
+        }
         .modal.show {
             display: block !important;
         }
@@ -2327,7 +2382,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <div class="d-flex align-items-center ms-lg-2 ps-lg-2 border-start border-secondary">
                     <div class="text-end" style="line-height: 1.2;">
                         <span class="badge bg-success-subtle text-success border border-success-subtle fw-bold px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem;" title="Deployed Release Version">
-                            <i class="bi bi-tag-fill"></i> v1.3.1 - Turso
+                            <i class="bi bi-tag-fill"></i> v1.3.2 - Staged Review
                         </span>
                         <div class="small text-secondary mt-1" style="font-size: 0.70rem; font-family: monospace;" title="Deployment Date">
                             <i class="bi bi-calendar-event me-1"></i>2026-11-25
@@ -2442,36 +2497,131 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <!-- RIGHT COLUMN: Multimodal Voice Recording & Live Sync Execution -->
             <div class="col-12 col-xl-7">
                 <div class="app-card p-4 mb-4">
-                    <h6 class="fw-bold text-white mb-1"><i class="bi bi-mic-fill text-danger me-2"></i>Multimodal Voice Standup Processor</h6>
-                    <div class="small text-muted mb-4">Record your bilingual (Saudi Arabic / English) presales standup or upload audio</div>
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <h6 class="fw-bold text-white mb-0"><i class="bi bi-cpu-fill text-primary me-2"></i>معالج ومصنف اجتماعات Presales الذكي</h6>
+                        <span class="badge bg-primary bg-opacity-25 text-primary border border-primary border-opacity-25 px-2 py-1 small">Bilingual Audio &amp; Text</span>
+                    </div>
+                    <div class="small text-muted mb-3">سجل صوتياً أو الصق ملخص التحديثات لفرز وتصنيف البيانات وفق هيكلية: العميل ➔ المناقصة ➔ المهام والمتعلقات</div>
 
-                    <!-- Mic & Recording Section -->
-                    <div class="text-center py-3">
+                    <!-- Input Mode Switcher Tabs -->
+                    <ul class="nav nav-pills nav-tabs-custom gap-2 mb-3 pb-2 border-bottom border-secondary border-opacity-25" id="inputModeTabs" role="tablist">
+                        <li class="nav-item">
+                            <button class="nav-link active" id="btn-mode-mic" onclick="switchInputMode('mic')" type="button">
+                                <i class="bi bi-mic-fill me-1 text-danger"></i> 🎙️ تسجيل صوتي مباشر
+                            </button>
+                        </li>
+                        <li class="nav-item">
+                            <button class="nav-link" id="btn-mode-text" onclick="switchInputMode('text')" type="button">
+                                <i class="bi bi-card-text me-1 text-info"></i> 📝 إدخال نص أو ملخص الاجتماع
+                            </button>
+                        </li>
+                        <li class="nav-item">
+                            <button class="nav-link" id="btn-mode-file" onclick="switchInputMode('file')" type="button">
+                                <i class="bi bi-file-earmark-music me-1 text-warning"></i> 📁 رفع ملف صوتي
+                            </button>
+                        </li>
+                    </ul>
+
+                    <!-- Review & Approval Control Bar -->
+                    <div class="d-flex align-items-center justify-content-between p-2 mb-3 rounded-3 bg-dark border border-secondary border-opacity-50">
+                        <div class="form-check form-switch mb-0 d-flex align-items-center gap-2">
+                            <input class="form-check-input" type="checkbox" id="reviewBeforeSyncToggle" checked style="cursor: pointer; width: 2.2em; height: 1.1em;">
+                            <label class="form-check-label small fw-semibold text-light" for="reviewBeforeSyncToggle" style="cursor: pointer;">
+                                <i class="bi bi-shield-check text-success me-1"></i> معاينة واعتماد وتعديل البيانات قبل الإرسال (Staging Review &amp; Approval)
+                            </label>
+                        </div>
+                        <span class="badge bg-secondary-subtle text-secondary small d-none d-sm-inline-block">Customer ➔ Deal ➔ Tasks</span>
+                    </div>
+
+                    <!-- MODE 1: Direct Mic Recording Pane -->
+                    <div id="pane-input-mic" class="text-center py-2">
                         <div class="d-flex justify-content-center mb-3">
                             <button id="recordBtn" class="mic-button mic-idle" onclick="toggleRecording()" title="Click to Start/Stop Recording">
                                 <i class="bi bi-mic-fill" id="micIcon"></i>
                             </button>
                         </div>
                         <div class="fw-bold fs-5 text-white" id="recordingTimer">00:00</div>
-                        <div class="small text-muted mt-1" id="recordingPrompt">Click microphone to begin recording standup update</div>
+                        <div class="small text-muted mt-1" id="recordingPrompt">اضغط على المايكروفون لبدء تسجيل تحديثات الاجتماع الصوتي</div>
 
                         <!-- Audio playback container -->
                         <div class="mt-3 d-none" id="audioPlaybackContainer">
                             <audio id="audioPlayer" controls class="w-75 mb-3"></audio>
                             <div>
                                 <button class="btn btn-success px-4 py-2 fw-semibold" id="processAudioBtn" onclick="processRecordedAudio()">
-                                    <i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs
+                                    <i class="bi bi-cpu-fill me-1"></i> معالجة وفرز الصوت
                                 </button>
                             </div>
                         </div>
+                    </div>
 
-                        <!-- Fallback File Upload -->
-                        <div class="mt-4 pt-3 border-top border-secondary border-opacity-25 text-start">
-                            <label class="form-label small text-muted">Or upload pre-recorded audio file (.webm, .wav, .mp3, .m4a):</label>
-                            <div class="input-group input-group-sm">
-                                <input type="file" id="audioFileInput" class="form-control" accept="audio/*">
-                                <button class="btn btn-outline-light" onclick="uploadAudioFile()">Upload & Process</button>
-                            </div>
+                    <!-- MODE 2: Text Transcript Input Pane -->
+                    <div id="pane-input-text" class="d-none">
+                        <label class="form-label small text-muted mb-1">الصق محتوى أو ملخص الاجتماع الصوتي والتحديثات الشفهية:</label>
+                        <textarea id="meetingTextInput" class="form-control bg-dark text-light border-secondary font-arabic p-3 mb-3" rows="6" dir="auto" placeholder="مثال:&#10;1. مناقصة وزارة الرياضة: استلام نطاق عمل موزع (Distributed Scope) من المبيعات لتسعير رخص Veeam، وتم التواصل مع الفندور وبانتظار الأسعار.&#10;2. مناقصة الشؤون الصحية للحرس الوطني: استلام RFP لتجديد رخص SolarWinds لعدد 10 بنود، وبانتظار العرض الفني والمالي.&#10;3. مناقصة هيئة الجمارك والزكاة: استلام RFP Tender لتجديد 3 بنود تشمل NetApp و ThinkCell و LogMeIn، وتاريخ الإغلاق بعد أسبوعين."></textarea>
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                            <small class="text-muted"><i class="bi bi-info-circle me-1"></i>يتم فرز كل بند إلى العميل الصحيح، وتوليد الصفقة والمهام والمتعلقات التابعة تلقائياً.</small>
+                            <button class="btn btn-info px-4 py-2 fw-semibold text-white d-flex align-items-center gap-1" id="processTextBtn" onclick="processMeetingText()">
+                                <i class="bi bi-lightning-charge-fill"></i> فرز وتصنيف المحتوى
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- MODE 3: Audio File Upload Pane -->
+                    <div id="pane-input-file" class="d-none text-start py-2">
+                        <label class="form-label small text-muted">اختر ملفاً صوتياً مسجلاً مسبقاً (.webm, .wav, .mp3, .m4a):</label>
+                        <div class="input-group mb-3">
+                            <input type="file" id="audioFileInput" class="form-control bg-dark text-light border-secondary" accept="audio/*">
+                            <button class="btn btn-warning px-4 fw-semibold" id="uploadFileBtn" onclick="uploadAudioFile()">
+                                <i class="bi bi-cloud-arrow-up-fill me-1"></i> رفع ومعالجة الملف
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Staged Review & Approval Card (Human-in-the-Loop) -->
+                <div class="app-card p-4 mb-4 d-none" id="stagedApprovalCard">
+                    <div class="d-flex flex-wrap justify-content-between align-items-center pb-3 mb-3 border-bottom border-secondary border-opacity-25 gap-2">
+                        <div>
+                            <h6 class="fw-bold text-white mb-0 d-flex align-items-center gap-2">
+                                <i class="bi bi-ui-checks-grid text-warning fs-5"></i>
+                                <span>معاينة وتعديل البيانات المستخلصة قبل الإرسال (Staging Review)</span>
+                            </h6>
+                            <div class="small text-muted mt-1">تم تصنيف البيانات وفق هيكلية: <strong>العميل (Customer) ➔ الصفقة/المناقصة (Deal) ➔ المهام التابعة (Tasks)</strong>. راجع أو عدل أي حقول قبل اعتمادها.</div>
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <button class="btn btn-sm btn-outline-info" onclick="addNewDealCard()">
+                                <i class="bi bi-plus-circle me-1"></i> + إضافة صفقة يدوياً
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Staged Deals Container -->
+                    <div id="stagedDealsContainer" class="d-flex flex-column gap-3 mb-3">
+                        <!-- Dynamically populated deal cards -->
+                    </div>
+
+                    <!-- Unlinked General Tasks (if any) -->
+                    <div id="unlinkedTasksCard" class="staged-deal-card p-3 mb-3 d-none">
+                        <div class="fw-bold text-secondary mb-2 small text-uppercase">
+                            <i class="bi bi-list-task me-1"></i> مهام عامة غير مرتبطة بصفقة محددة
+                        </div>
+                        <div id="unlinkedTasksContainer"></div>
+                    </div>
+
+                    <!-- Bottom Approval Bar -->
+                    <div class="p-3 rounded-3 bg-dark border border-secondary border-opacity-50 d-flex flex-wrap justify-content-between align-items-center gap-3">
+                        <div class="small text-light">
+                            <i class="bi bi-shield-lock-fill text-success me-1"></i>
+                            عند الضغط على <strong>"اعتماد ومزامنة البيانات"</strong>، سيتم إرسال الصفقات إلى CRM والمهام إلى لوحة المهام مباشرة.
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <button class="btn btn-outline-secondary btn-sm" onclick="discardStagedReview()">
+                                <i class="bi bi-x-circle me-1"></i> إلغاء وتجاهل
+                            </button>
+                            <button class="btn btn-success fw-bold px-4 py-2 shadow d-flex align-items-center gap-2" id="approveSyncBtn" onclick="submitApprovedSync()">
+                                <i class="bi bi-cloud-arrow-up-fill fs-5"></i>
+                                <span>🚀 اعتماد ومزامنة البيانات مع النظام (Approve &amp; Sync)</span>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -2479,12 +2629,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <!-- Live Results: Transcript, Executive Report & API Sync Log -->
                 <div class="app-card p-4 d-none" id="resultsCard">
                     <h6 class="fw-bold text-white mb-3 pb-2 border-bottom border-secondary border-opacity-25">
-                        <i class="bi bi-check2-circle text-success me-2"></i>Standup Intelligence & Sync Execution
+                        <i class="bi bi-check2-circle text-success me-2"></i>Standup Intelligence &amp; Sync Execution
                     </h6>
 
                     <!-- Meeting Summary -->
                     <div class="mb-4">
-                        <div class="small text-uppercase fw-semibold text-muted mb-1">Standup Meeting Transcript & Summary</div>
+                        <div class="small text-uppercase fw-semibold text-muted mb-1">Standup Meeting Transcript &amp; Summary</div>
                         <div class="p-3 bg-dark rounded-3 border border-secondary border-opacity-25 text-light font-arabic" id="summaryText" dir="auto" style="white-space: pre-wrap; line-height: 1.6;"></div>
                     </div>
 
@@ -3055,30 +3205,108 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             }
         }
 
+        // ---------------------------------------------------------------------
+        // Input Mode Switcher
+        // ---------------------------------------------------------------------
+        function switchInputMode(mode) {
+            document.getElementById('btn-mode-mic').classList.toggle('active', mode === 'mic');
+            document.getElementById('btn-mode-text').classList.toggle('active', mode === 'text');
+            document.getElementById('btn-mode-file').classList.toggle('active', mode === 'file');
+
+            document.getElementById('pane-input-mic').classList.toggle('d-none', mode !== 'mic');
+            document.getElementById('pane-input-text').classList.toggle('d-none', mode !== 'text');
+            document.getElementById('pane-input-file').classList.toggle('d-none', mode !== 'file');
+        }
+
         async function processRecordedAudio() {
             if (!recordedBlob) {
-                alert('No audio recorded.');
+                alert('يرجى تسجيل الصوت أولاً.');
                 return;
             }
-            uploadAndAnalyze(recordedBlob, 'standup_recording.webm');
+            const btn = document.getElementById('processAudioBtn');
+            sendForProcessing({ blobOrFile: recordedBlob, filename: 'standup_recording.webm', triggerBtn: btn });
+        }
+
+        function processMeetingText() {
+            const text = document.getElementById('meetingTextInput').value.trim();
+            if (!text) {
+                alert('يرجى لصق أو كتابة نص الاجتماع أولاً.');
+                return;
+            }
+            const btn = document.getElementById('processTextBtn');
+            sendForProcessing({ textInput: text, triggerBtn: btn });
         }
 
         function uploadAudioFile() {
             const input = document.getElementById('audioFileInput');
             if (!input.files.length) {
-                alert('Please select an audio file first.');
+                alert('يرجى اختيار ملف صوتي أولاً.');
                 return;
             }
-            uploadAndAnalyze(input.files[0], input.files[0].name);
+            const btn = document.getElementById('uploadFileBtn');
+            sendForProcessing({ blobOrFile: input.files[0], filename: input.files[0].name, triggerBtn: btn });
         }
 
-        async function uploadAndAnalyze(blobOrFile, filename) {
-            const btn = document.getElementById('processAudioBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Gemini Processing Speech & Syncing APIs...';
+        // ---------------------------------------------------------------------
+        // Processing & Staging Architecture
+        // ---------------------------------------------------------------------
+        let currentStagedData = null;
+        let dealCardCounter = 0;
 
+        const TASK_CATALOG_OPTIONS = [
+            "Bid / No-Bid Qualification & Owner Assignment",
+            "RFP Decomposition & Scope Breakdown",
+            "Clarification Questions Submission",
+            "Low-Level Architecture & Technical Write-up",
+            "Final BoQ & Vendor Quotations",
+            "Technical Compliance Matrix",
+            "Proposal Integration & Master Compliance Audit",
+            "Final Technical Review & Commercial Handover",
+            "Discovery & Technical Requirements Gathering",
+            "High-Level Architecture (HLA) Design",
+            "Preliminary BoQ & Budgetary Sizing",
+            "RFP Specifications Shaping & Advisory",
+            "Technical Proposal Draft & Client Review"
+        ];
+
+        const DEAL_CATEGORIES = [
+            "1- RFP Ownership & Prime Proposals",
+            "2- RFP Distributed Scope Items",
+            "3- Opportunity Efforts & PO"
+        ];
+
+        const STAGE_OPTIONS = [
+            "RFP / Tender",
+            "Gathering Requirements",
+            "Discovery",
+            "PoC",
+            "Proposal",
+            "Closed-Won",
+            "Closed-Lost"
+        ];
+
+        const VENDOR_DOMAINS = ["Veeam", "SolarWinds", "Dell", "HPE", "Nutanix", "VMware", "General"];
+        const STATUS_OPTIONS = ["In Progress", "Waiting on Vendor", "Pending Review", "Completed", "Not Started"];
+        const PRIORITY_OPTIONS = ["High", "Medium", "Low"];
+        const PRESALES_OPTIONS = ["Presales 1", "Presales 2"];
+
+        async function sendForProcessing({ blobOrFile = null, filename = 'recording.webm', textInput = null, triggerBtn = null }) {
+            let originalHtml = '';
+            if (triggerBtn) {
+                originalHtml = triggerBtn.innerHTML;
+                triggerBtn.disabled = true;
+                triggerBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>جارٍ المعالجة والفرز بالذكاء الاصطناعي...';
+            }
+
+            const reviewBeforeSync = document.getElementById('reviewBeforeSyncToggle').checked;
             const formData = new FormData();
-            formData.append('file', blobOrFile, filename);
+            if (blobOrFile) {
+                formData.append('file', blobOrFile, filename);
+            }
+            if (textInput) {
+                formData.append('text_input', textInput);
+            }
+            formData.append('auto_sync', (!reviewBeforeSync).toString());
 
             try {
                 const res = await fetch('/api/process-audio', {
@@ -3097,39 +3325,51 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                             if (txt) errDetail = txt;
                         } catch(e2) {}
                     }
-                    alert('Audio processing error: ' + errDetail);
+                    alert('خطأ أثناء المعالجة: ' + errDetail);
                     return;
                 }
 
                 const data = await res.json();
-                renderResults(data);
+                currentStagedData = data;
+
+                // Render Summary and Executive Report
+                renderSummaryAndReport(data);
+
+                if (data.auto_synced) {
+                    // Instantly synced
+                    document.getElementById('stagedApprovalCard').classList.add('d-none');
+                    renderSyncLogs(data.api_sync_log || []);
+                } else {
+                    // Staged for Human-in-the-Loop review & editing
+                    renderStagedApproval(data);
+                }
             } catch (err) {
-                console.error("Audio processing failed:", err);
-                alert('Communication error: ' + (err.message || 'Network error communicating with Voice Agent server.'));
+                console.error("Processing failed:", err);
+                alert('خطأ في الاتصال بالخادم: ' + (err.message || 'Network error'));
             } finally {
-                btn.disabled = false;
-                btn.innerHTML = '<i class="bi bi-cpu-fill me-1"></i> Analyze Speech & Sync APIs';
+                if (triggerBtn) {
+                    triggerBtn.disabled = false;
+                    triggerBtn.innerHTML = originalHtml;
+                }
             }
         }
 
-        function renderResults(data) {
+        function renderSummaryAndReport(data) {
             const resultsCard = document.getElementById('resultsCard');
             resultsCard.classList.remove('d-none');
 
-            // Summary
-            document.getElementById('summaryText').textContent = data.transcript_summary || 'Meeting processed.';
+            document.getElementById('summaryText').textContent = data.transcript_summary || 'تمت معالجة الاجتماع بنجاح.';
 
-            // Executive Report lists
             const exec = data.executive_report || {};
-            document.getElementById('todayProgressList').innerHTML = (exec.today_progress || []).map(p => `<li>${p}</li>`).join('') || '<li>No items noted.</li>';
-            document.getElementById('tomorrowActionsList').innerHTML = (exec.tomorrow_actions || []).map(a => `<li>${a}</li>`).join('') || '<li>No items noted.</li>';
-            document.getElementById('managementWarningsList').innerHTML = (exec.management_warnings || []).map(w => `<li>${w}</li>`).join('') || '<li>No critical blockers detected.</li>';
+            document.getElementById('todayProgressList').innerHTML = (exec.today_progress || []).map(p => `<li>${p}</li>`).join('') || '<li>لا توجد بنود منجزة محددة.</li>';
+            document.getElementById('tomorrowActionsList').innerHTML = (exec.tomorrow_actions || []).map(a => `<li>${a}</li>`).join('') || '<li>لا توجد إجراءات قادمة محددة.</li>';
+            document.getElementById('managementWarningsList').innerHTML = (exec.management_warnings || []).map(w => `<li>${w}</li>`).join('') || '<li>لا توجد معوقات أو مخاطر حرجة.</li>';
+        }
 
-            // Sync Log table
+        function renderSyncLogs(logs) {
             const tbody = document.getElementById('syncLogBody');
-            const logs = data.api_sync_log || [];
-            if (!logs.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-2">No API state deltas required modification.</td></tr>';
+            if (!logs || !logs.length) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-2">لا توجد عمليات مزامنة مطلوبة.</td></tr>';
             } else {
                 tbody.innerHTML = logs.map(l => {
                     const isNew = l.method === 'POST';
@@ -3140,14 +3380,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         ? '<span class="badge" style="background-color:#16a34a;color:#fff;">POST • NEW (Green)</span>'
                         : `<span class="badge" style="background-color:#ea580c;color:#fff;">${l.method} • MODIFIED (Orange)</span>`;
 
-                    // Format endpoint to ensure it always displays the clean public online URL of current host
                     let endpointUrl = l.endpoint || '';
                     try {
                         const parsed = new URL(endpointUrl, window.location.origin);
                         endpointUrl = `${window.location.origin}${parsed.pathname}`;
-                    } catch (e) {
-                        // Keep as is if unparseable
-                    }
+                    } catch (e) {}
 
                     return `
                     <tr style="${rowStyle}">
@@ -3165,8 +3402,422 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     `;
                 }).join('');
             }
+            document.getElementById('resultsCard').scrollIntoView({ behavior: 'smooth' });
+        }
 
-            resultsCard.scrollIntoView({ behavior: 'smooth' });
+        // ---------------------------------------------------------------------
+        // Interactive Staging UI Builders
+        // ---------------------------------------------------------------------
+        function renderStagedApproval(data) {
+            const stagedCard = document.getElementById('stagedApprovalCard');
+            const container = document.getElementById('stagedDealsContainer');
+            stagedCard.classList.remove('d-none');
+            container.innerHTML = '';
+
+            const deals = data.staged_deals || [];
+            dealCardCounter = deals.length;
+
+            if (!deals.length) {
+                container.innerHTML = '<div class="alert alert-info py-2 small font-arabic">لم يتم اكتشاف صفقات جديدة أو محدثة في النص. يمكنك إضافة صفقة يدوياً بالزر أعلاه.</div>';
+            } else {
+                deals.forEach((d, idx) => {
+                    container.appendChild(createDealElement(d, idx));
+                });
+            }
+
+            // Unlinked Tasks
+            const unlinked = data.unlinked_tasks || [];
+            const unlinkedCard = document.getElementById('unlinkedTasksCard');
+            const unlinkedContainer = document.getElementById('unlinkedTasksContainer');
+            if (unlinked.length > 0) {
+                unlinkedCard.classList.remove('d-none');
+                unlinkedContainer.innerHTML = '';
+                unlinked.forEach((t, tIdx) => {
+                    unlinkedContainer.appendChild(createTaskElement(-1, t.payload || t, tIdx));
+                });
+            } else {
+                unlinkedCard.classList.add('d-none');
+            }
+
+            stagedCard.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function createDealElement(d, dIdx) {
+            const card = document.createElement('div');
+            card.className = 'staged-deal-card p-3 p-md-4';
+            card.setAttribute('data-deal-idx', dIdx);
+            card.setAttribute('data-method', d.method || 'POST');
+            card.setAttribute('data-deal-id', d.deal_id || '');
+
+            const isNew = (d.method || 'POST') === 'POST';
+            const methodBadge = isNew
+                ? '<span class="badge bg-success px-2 py-1"><i class="bi bi-plus-circle me-1"></i>POST • إنشاء صفقة جديدة</span>'
+                : `<span class="badge bg-warning text-dark px-2 py-1"><i class="bi bi-pencil-square me-1"></i>PUT • تحديث صفقة قائمة #${d.deal_id}</span>`;
+
+            const vendorsStr = Array.isArray(d.primary_vendors) ? d.primary_vendors.join(', ') : (d.primary_vendors || '');
+
+            card.innerHTML = `
+                <div class="d-flex flex-wrap justify-content-between align-items-center pb-2 mb-3 border-bottom border-secondary border-opacity-25 gap-2">
+                    <div class="d-flex align-items-center gap-2">
+                        ${methodBadge}
+                        <span class="text-white fw-bold font-arabic fs-6">العميل والصفقة #${dIdx + 1}</span>
+                    </div>
+                    <button type="button" class="btn btn-outline-danger btn-sm py-1 px-2" onclick="removeDealCard(${dIdx})" title="حذف هذه الصفقة من الاعتماد">
+                        <i class="bi bi-trash3-fill me-1"></i> حذف الصفقة
+                    </button>
+                </div>
+
+                <!-- Deal Core Fields Grid -->
+                <div class="row g-2 mb-3 font-arabic" dir="auto">
+                    <div class="col-12 col-md-5">
+                        <label class="form-label small text-info fw-bold mb-1">اسم العميل / الجهة (Customer):</label>
+                        <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary input-comp-name fw-semibold" value="${escapeHtml(d.customer_name || '')}" placeholder="مثال: وزارة الرياضة">
+                    </div>
+                    <div class="col-12 col-md-7">
+                        <label class="form-label small text-info fw-bold mb-1">عنوان الفرصة / المناقصة (Deal Title):</label>
+                        <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary input-deal-name fw-semibold" value="${escapeHtml(d.deal_name || '')}" placeholder="مثال: مناقصة وزارة الرياضة - تسعير رخص Veeam">
+                    </div>
+
+                    <div class="col-12 col-md-4">
+                        <label class="form-label small text-secondary mb-1">تصنيف الصفقة (Category):</label>
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary input-deal-cat">
+                            ${DEAL_CATEGORIES.map(c => `<option value="${c}" ${c === d.deal_category ? 'selected' : ''}>${c}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="col-12 col-md-3">
+                        <label class="form-label small text-secondary mb-1">المرحلة (Stage):</label>
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary input-deal-stage">
+                            ${STAGE_OPTIONS.map(s => `<option value="${s}" ${s === d.stage ? 'selected' : ''}>${s}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="col-12 col-md-3">
+                        <label class="form-label small text-secondary mb-1">تاريخ الإغلاق (Closing Date):</label>
+                        <input type="date" class="form-control form-control-sm bg-dark text-light border-secondary input-deal-date" value="${d.closing_date || ''}">
+                    </div>
+                    <div class="col-12 col-md-2">
+                        <label class="form-label small text-secondary mb-1">مسؤول Presales:</label>
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary input-deal-assigned">
+                            ${PRESALES_OPTIONS.map(p => `<option value="${p}" ${p === d.assigned_presales ? 'selected' : ''}>${p}</option>`).join('')}
+                        </select>
+                    </div>
+
+                    <div class="col-12 col-md-6">
+                        <label class="form-label small text-secondary mb-1">الفندورز (Primary Vendors):</label>
+                        <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary input-deal-vendors" value="${escapeHtml(vendorsStr)}" placeholder="Veeam, Dell, HPE...">
+                    </div>
+                    <div class="col-12 col-md-6">
+                        <label class="form-label small text-secondary mb-1">القيمة التقديرية (SAR):</label>
+                        <input type="number" step="1000" class="form-control form-control-sm bg-dark text-light border-secondary input-deal-val" value="${d.estimated_value || 0}">
+                    </div>
+
+                    <div class="col-12">
+                        <label class="form-label small text-secondary mb-1">ملاحظات ونطاق العمل (Vendor Notes):</label>
+                        <textarea class="form-control form-control-sm bg-dark text-light border-secondary input-deal-notes" rows="2" placeholder="المتطلبات الفنية، حالة التسعير، أو ملاحظات الاجتماع...">${escapeHtml(d.vendor_notes || '')}</textarea>
+                    </div>
+                </div>
+
+                <!-- Sub-Tasks Section -->
+                <div class="p-3 rounded-3 bg-black bg-opacity-30 border border-secondary border-opacity-30">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <div class="small fw-bold text-success font-arabic">
+                            <i class="bi bi-diagram-3-fill me-1"></i> المهام والمتعلقات التابعة لهذه الصفقة (<span class="task-count">${(d.tasks || []).length}</span>):
+                        </div>
+                        <button type="button" class="btn btn-outline-success btn-sm py-0 px-2" style="font-size:0.75rem;" onclick="addSubTask(${dIdx})">
+                            <i class="bi bi-plus-lg me-1"></i> + إضافة مهمة تابعة
+                        </button>
+                    </div>
+                    <div class="deal-tasks-list" id="tasks-list-${dIdx}">
+                        ${(d.tasks || []).map((t, tIdx) => createTaskHtml(dIdx, t.payload || t, tIdx)).join('')}
+                    </div>
+                </div>
+            `;
+            return card;
+        }
+
+        function createTaskHtml(dIdx, t, tIdx) {
+            const title = t.task_title || t.title || '';
+            const isCatalog = TASK_CATALOG_OPTIONS.includes(title);
+            const assigned = t.assigned_to || 'Presales 1';
+            const domain = t.vendor_domain || 'General';
+            const status = t.status || 'In Progress';
+            const priority = t.priority || 'Medium';
+            const blockers = t.management_blockers || '';
+
+            return `
+                <div class="staged-task-row font-arabic" data-task-idx="${tIdx}" dir="auto">
+                    <div class="row g-2 align-items-center">
+                        <div class="col-12 col-md-4">
+                            <label class="form-label small text-muted mb-0" style="font-size:0.70rem;">عنوان المهمة (من الكتالوج المعتمد):</label>
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary input-task-title" style="font-size:0.78rem;">
+                                ${!isCatalog && title ? `<option value="${escapeHtml(title)}" selected>${escapeHtml(title)}</option>` : ''}
+                                ${TASK_CATALOG_OPTIONS.map(opt => `<option value="${opt}" ${opt === title ? 'selected' : ''}>${opt}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <label class="form-label small text-muted mb-0" style="font-size:0.70rem;">المسؤول:</label>
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary input-task-assigned" style="font-size:0.78rem;">
+                                ${PRESALES_OPTIONS.map(p => `<option value="${p}" ${p === assigned ? 'selected' : ''}>${p}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <label class="form-label small text-muted mb-0" style="font-size:0.70rem;">الفندور:</label>
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary input-task-domain" style="font-size:0.78rem;">
+                                ${VENDOR_DOMAINS.map(v => `<option value="${v}" ${v === domain ? 'selected' : ''}>${v}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-6 col-md-2">
+                            <label class="form-label small text-muted mb-0" style="font-size:0.70rem;">الحالة:</label>
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary input-task-status" style="font-size:0.78rem;">
+                                ${STATUS_OPTIONS.map(s => `<option value="${s}" ${s === status ? 'selected' : ''}>${s}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-5 col-md-1">
+                            <label class="form-label small text-muted mb-0" style="font-size:0.70rem;">الأولوية:</label>
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary input-task-priority" style="font-size:0.78rem;">
+                                ${PRIORITY_OPTIONS.map(p => `<option value="${p}" ${p === priority ? 'selected' : ''}>${p}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="col-1 text-end">
+                            <button type="button" class="btn btn-outline-danger btn-sm p-1 mt-3" onclick="removeTask(${dIdx}, this)" title="حذف هذه المهمة">
+                                <i class="bi bi-x-lg"></i>
+                            </button>
+                        </div>
+                        <div class="col-12 mt-1">
+                            <input type="text" class="form-control form-control-sm bg-dark text-secondary border-secondary input-task-blockers" value="${escapeHtml(blockers)}" placeholder="المعوقات، الإجراء المطلوب، أو السياق التفصيلي للمهمة..." style="font-size:0.76rem;">
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function createTaskElement(dIdx, t, tIdx) {
+            const div = document.createElement('div');
+            div.innerHTML = createTaskHtml(dIdx, t, tIdx);
+            return div.firstElementChild;
+        }
+
+        function addNewDealCard() {
+            dealCardCounter++;
+            const container = document.getElementById('stagedDealsContainer');
+            const newDeal = {
+                method: 'POST',
+                deal_id: null,
+                customer_name: '',
+                deal_name: '',
+                deal_category: '2- RFP Distributed Scope Items',
+                stage: 'RFP / Tender',
+                primary_vendors: ['General'],
+                closing_date: '',
+                estimated_value: 0,
+                assigned_presales: 'Presales 1',
+                vendor_notes: '',
+                tasks: [
+                    {
+                        task_title: 'Final BoQ & Vendor Quotations',
+                        assigned_to: 'Presales 1',
+                        vendor_domain: 'General',
+                        status: 'In Progress',
+                        priority: 'Medium',
+                        management_blockers: ''
+                    }
+                ]
+            };
+            const dealEl = createDealElement(newDeal, dealCardCounter);
+            container.prepend(dealEl);
+            dealEl.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function removeDealCard(dIdx) {
+            const card = document.querySelector(`.staged-deal-card[data-deal-idx="${dIdx}"]`);
+            if (card) {
+                card.remove();
+            }
+        }
+
+        function addSubTask(dIdx) {
+            const list = document.getElementById(`tasks-list-${dIdx}`);
+            if (!list) return;
+            const newTIdx = list.children.length;
+            const newTask = {
+                task_title: 'Final BoQ & Vendor Quotations',
+                assigned_to: 'Presales 1',
+                vendor_domain: 'General',
+                status: 'In Progress',
+                priority: 'Medium',
+                management_blockers: ''
+            };
+            const taskEl = createTaskElement(dIdx, newTask, newTIdx);
+            list.appendChild(taskEl);
+
+            const countEl = list.closest('.staged-deal-card').querySelector('.task-count');
+            if (countEl) countEl.textContent = list.children.length;
+        }
+
+        function removeTask(dIdx, btnEl) {
+            const row = btnEl.closest('.staged-task-row');
+            if (row) {
+                const list = row.parentElement;
+                row.remove();
+                if (list) {
+                    const card = list.closest('.staged-deal-card');
+                    if (card) {
+                        const countEl = card.querySelector('.task-count');
+                        if (countEl) countEl.textContent = list.children.length;
+                    }
+                }
+            }
+        }
+
+        async function submitApprovedSync() {
+            const btn = document.getElementById('approveSyncBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>جارٍ المزامنة مع CRM والمهام...';
+
+            // Collect All Staged Deals
+            const dealCards = document.querySelectorAll('.staged-deal-card[data-deal-idx]');
+            const crm_updates = [];
+            const task_updates = [];
+
+            dealCards.forEach(card => {
+                const method = card.getAttribute('data-method') || 'POST';
+                const dealIdStr = card.getAttribute('data-deal-id');
+                const dealId = dealIdStr && dealIdStr !== 'null' ? parseInt(dealIdStr) : null;
+
+                const compName = card.querySelector('.input-comp-name').value.trim();
+                const dealName = card.querySelector('.input-deal-name').value.trim();
+                const dealCategory = card.querySelector('.input-deal-cat').value;
+                const stage = card.querySelector('.input-deal-stage').value;
+                const closingDate = card.querySelector('.input-deal-date').value || null;
+                const vendorsRaw = card.querySelector('.input-deal-vendors').value.trim();
+                const vendors = vendorsRaw ? vendorsRaw.split(',').map(v => v.trim()).filter(Boolean) : ['General'];
+                const assigned = card.querySelector('.input-deal-assigned').value;
+                const estVal = parseFloat(card.querySelector('.input-deal-val').value) || 0.0;
+                const notes = card.querySelector('.input-deal-notes').value.trim();
+
+                if (compName && dealName) {
+                    crm_updates.push({
+                        method: method,
+                        deal_id: dealId,
+                        payload: {
+                            company_name: compName,
+                            deal_name: dealName,
+                            deal_category: dealCategory,
+                            stage: stage,
+                            closing_date: closingDate,
+                            primary_vendors: vendors,
+                            assigned_presales: assigned,
+                            estimated_value: estVal,
+                            vendor_notes: notes
+                        }
+                    });
+                }
+
+                // Collect sub-tasks of this deal
+                const taskRows = card.querySelectorAll('.staged-task-row');
+                taskRows.forEach(tRow => {
+                    const taskTitle = tRow.querySelector('.input-task-title').value.trim();
+                    const taskAssigned = tRow.querySelector('.input-task-assigned').value;
+                    const taskDomain = tRow.querySelector('.input-task-domain').value;
+                    const taskStatus = tRow.querySelector('.input-task-status').value;
+                    const taskPriority = tRow.querySelector('.input-task-priority').value;
+                    const taskBlockers = tRow.querySelector('.input-task-blockers').value.trim();
+
+                    if (taskTitle) {
+                        task_updates.push({
+                            method: 'POST',
+                            payload: {
+                                task_title: taskTitle,
+                                assigned_to: taskAssigned,
+                                vendor_domain: taskDomain,
+                                status: taskStatus,
+                                priority: taskPriority,
+                                management_blockers: taskBlockers || null,
+                                customer_name: compName,
+                                deal_name: dealName,
+                                deal_category: dealCategory,
+                                closing_date: closingDate,
+                                related_deal_id: dealId
+                            }
+                        });
+                    }
+                });
+            });
+
+            // Collect unlinked tasks
+            const unlinkedRows = document.querySelectorAll('#unlinkedTasksContainer .staged-task-row');
+            unlinkedRows.forEach(tRow => {
+                const taskTitle = tRow.querySelector('.input-task-title').value.trim();
+                const taskAssigned = tRow.querySelector('.input-task-assigned').value;
+                const taskDomain = tRow.querySelector('.input-task-domain').value;
+                const taskStatus = tRow.querySelector('.input-task-status').value;
+                const taskPriority = tRow.querySelector('.input-task-priority').value;
+                const taskBlockers = tRow.querySelector('.input-task-blockers').value.trim();
+
+                if (taskTitle) {
+                    task_updates.push({
+                        method: 'POST',
+                        payload: {
+                            task_title: taskTitle,
+                            assigned_to: taskAssigned,
+                            vendor_domain: taskDomain,
+                            status: taskStatus,
+                            priority: taskPriority,
+                            management_blockers: taskBlockers || null
+                        }
+                    });
+                }
+            });
+
+            if (!crm_updates.length && !task_updates.length) {
+                alert('لا توجد صفقات أو مهام للاعتماد والمزامنة.');
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-cloud-arrow-up-fill fs-5"></i> <span>🚀 اعتماد ومزامنة البيانات مع النظام (Approve &amp; Sync)</span>';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/approve-sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ crm_updates, task_updates })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    alert('خطأ أثناء المزامنة: ' + (err.detail || 'Failed'));
+                    return;
+                }
+
+                const resData = await res.json();
+
+                // Hide Staging Card & Display Success Log
+                document.getElementById('stagedApprovalCard').classList.add('d-none');
+                renderSyncLogs(resData.api_sync_log || []);
+
+                alert('✅ تم اعتماد ومزامنة البيانات بنجاح مع CRM ولوحة المهام!');
+            } catch (e) {
+                console.error("Approval sync failed:", e);
+                alert('خطأ في الاتصال: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-cloud-arrow-up-fill fs-5"></i> <span>🚀 اعتماد ومزامنة البيانات مع النظام (Approve &amp; Sync)</span>';
+            }
+        }
+
+        function discardStagedReview() {
+            if (confirm('هل أنت متأكد من تجاهل المسودة الحالية دون مزامنتها؟')) {
+                document.getElementById('stagedApprovalCard').classList.add('d-none');
+            }
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         // ---------------------------------------------------------------------

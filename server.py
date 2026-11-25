@@ -144,6 +144,7 @@ async def reverse_proxy(request: Request, path: str):
         "api/pre-meeting-questions",
         "api/health",
         "api/set-api-key",
+        "api/approve-sync",
     ]
     if any(path.startswith(ep) for ep in agent_endpoints):
         target_port = 8002

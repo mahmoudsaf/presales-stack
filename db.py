@@ -40,6 +40,7 @@ class TursoCursor:
         self.last_res = None
         self._row_idx = 0
         self._converted_rows: List[TursoRow] = []
+        self._last_rowid: Optional[int] = None
 
     def execute(self, sql: str, params: Optional[Union[List[Any], Tuple[Any, ...]]] = None):
         if params is None:
@@ -58,6 +59,21 @@ class TursoCursor:
         self._row_idx = 0
         cols = tuple(self.last_res.columns)
         self._converted_rows = [TursoRow(cols, tuple(row)) for row in self.last_res.rows]
+
+        # Automatically capture last_insert_rowid if this statement is an INSERT
+        first_token = sql.strip().split(None, 1)[0].upper() if sql.strip() else ""
+        if first_token == "INSERT":
+            try:
+                rowid_res = self.client.execute("SELECT last_insert_rowid()")
+                if rowid_res and rowid_res.rows and rowid_res.rows[0][0] is not None:
+                    self._last_rowid = int(rowid_res.rows[0][0])
+                else:
+                    self._last_rowid = None
+            except Exception:
+                self._last_rowid = None
+        else:
+            self._last_rowid = None
+
         return self
 
     def executemany(self, sql: str, seq_of_params: Any):
@@ -84,6 +100,8 @@ class TursoCursor:
 
     @property
     def lastrowid(self) -> Optional[int]:
+        if self._last_rowid is not None:
+            return self._last_rowid
         if self.last_res and self.last_res.last_insert_rowid is not None:
             try:
                 return int(self.last_res.last_insert_rowid)

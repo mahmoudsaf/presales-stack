@@ -2382,7 +2382,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <div class="d-flex align-items-center ms-lg-2 ps-lg-2 border-start border-secondary">
                     <div class="text-end" style="line-height: 1.2;">
                         <span class="badge bg-success-subtle text-success border border-success-subtle fw-bold px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem;" title="Deployed Release Version">
-                            <i class="bi bi-tag-fill"></i> v1.3.2 - Staged Review
+                            <i class="bi bi-tag-fill"></i> v1.3.2 - Disaggregate Deals from Content
                         </span>
                         <div class="small text-secondary mt-1" style="font-size: 0.70rem; font-family: monospace;" title="Deployment Date">
                             <i class="bi bi-calendar-event me-1"></i>2026-11-25

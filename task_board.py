@@ -1787,6 +1787,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <a href="/dashboard" class="btn btn-sm btn-outline-primary d-flex align-items-center gap-1" title="Executive Visual Analytics & Metrics Dashboard">
                     <i class="bi bi-bar-chart-line-fill"></i> 📊 Visual Dashboard
                 </a>
+                <a href="/voice" class="btn btn-sm btn-outline-secondary d-flex align-items-center gap-1" title="Voice Operations AI Agent">
+                    <i class="bi bi-soundwave text-warning"></i> Voice Agent
+                </a>
                 <a href="/docs" target="_blank" class="btn btn-sm btn-outline-secondary">
                     <i class="bi bi-file-earmark-code me-1"></i>Swagger Docs
                 </a>

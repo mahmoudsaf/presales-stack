@@ -1993,7 +1993,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                                     <h6 class="fw-bold mb-0 text-dark"><i class="bi bi-kanban-fill text-success me-2"></i>Task Execution & Deliverable Status</h6>
                                     <div class="text-muted small">Breakdown of operational tasks and RFP deliverables</div>
                                 </div>
-                                <a href="http://127.0.0.1:8001" target="_blank" class="btn btn-sm btn-outline-secondary">Open Board <i class="bi bi-box-arrow-up-right ms-1"></i></a>
+                                <a href="/tasks" target="_blank" class="btn btn-sm btn-outline-secondary">Open Board <i class="bi bi-box-arrow-up-right ms-1"></i></a>
                             </div>
                             <div style="position: relative; height: 270px;" class="d-flex align-items-center justify-content-center">
                                 <canvas id="taskStatusChart"></canvas>

@@ -46,6 +46,10 @@ def is_port_in_use(port: int) -> bool:
 
 def start_internal_services():
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    env = os.environ.copy()
+    if "RENDER_EXTERNAL_URL" in os.environ and "PUBLIC_URL" not in env:
+        env["PUBLIC_URL"] = os.environ["RENDER_EXTERNAL_URL"]
+
     for svc in INTERNAL_SERVICES:
         if is_port_in_use(svc["port"]):
             print(f"Service {svc['name']} is already active on 127.0.0.1:{svc['port']}.")
@@ -57,6 +61,7 @@ def start_internal_services():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             creationflags=flags,
+            env=env,
         )
         processes.append((proc, svc))
     time.sleep(2.5)

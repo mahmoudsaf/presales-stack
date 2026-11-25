@@ -162,6 +162,26 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest"]
 
 
+def get_public_base_url() -> str:
+    """Returns the external public URL if running on Render or if PUBLIC_URL is configured."""
+    return (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
+
+
+def format_public_endpoint(internal_url: str) -> str:
+    """
+    Transforms internal loopback URLs (e.g. http://127.0.0.1:8000/api/deals)
+    into clean public endpoints (e.g. https://presales-stack.onrender.com/api/deals
+    or /api/deals) for professional display in client logs.
+    """
+    clean_path = re.sub(r"^https?://(?:127\.0\.0\.1|localhost):\d+", "", internal_url)
+    if not clean_path.startswith("/"):
+        clean_path = "/" + clean_path
+    public_base = get_public_base_url()
+    if public_base:
+        return f"{public_base}{clean_path}"
+    return clean_path
+
+
 def generate_with_model_fallback(client: genai.Client, contents: Any, **kwargs):
     """Attempts generation with primary model and falls back if model is deprecated/404."""
     models_to_try = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
@@ -1287,7 +1307,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     sync_logs.append({
                         "target": "CRM",
                         "method": "PUT",
-                        "endpoint": url,
+                        "endpoint": format_public_endpoint(url),
                         "status_code": res.status_code,
                         "success": success,
                         "detail": detail,
@@ -1300,7 +1320,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     sync_logs.append({
                         "target": "CRM",
                         "method": "POST",
-                        "endpoint": url,
+                        "endpoint": format_public_endpoint(url),
                         "status_code": res.status_code,
                         "success": success,
                         "detail": detail,
@@ -1311,7 +1331,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                 sync_logs.append({
                     "target": "CRM",
                     "method": method,
-                    "endpoint": f"{CRM_API_URL}/deals/{deal_id or ''}",
+                    "endpoint": format_public_endpoint(f"{CRM_API_URL}/deals/{deal_id or ''}"),
                     "status_code": 500,
                     "success": False,
                     "detail": str(e),
@@ -1355,7 +1375,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     sync_logs.append({
                         "target": "TASKS",
                         "method": "PUT",
-                        "endpoint": url,
+                        "endpoint": format_public_endpoint(url),
                         "status_code": res.status_code,
                         "success": res.status_code in (200, 201),
                         "detail": res.json() if res.status_code in (200, 201) else res.text,
@@ -1366,7 +1386,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                     sync_logs.append({
                         "target": "TASKS",
                         "method": "POST",
-                        "endpoint": url,
+                        "endpoint": format_public_endpoint(url),
                         "status_code": res.status_code,
                         "success": res.status_code in (200, 201),
                         "detail": res.json() if res.status_code in (200, 201) else res.text,
@@ -1375,7 +1395,7 @@ async def execute_api_sync(crm_updates: List[Dict[str, Any]], task_updates: List
                 sync_logs.append({
                     "target": "TASKS",
                     "method": method,
-                    "endpoint": f"{TASKS_API_URL}/tasks/{task_id or ''}",
+                    "endpoint": format_public_endpoint(f"{TASKS_API_URL}/tasks/{task_id or ''}"),
                     "status_code": 500,
                     "success": False,
                     "detail": str(e),
@@ -1412,8 +1432,8 @@ async def health_check():
         "gemini_api_key_configured": has_key,
         "gemini_api_key_masked": masked,
         "gemini_model": GEMINI_MODEL,
-        "crm_api": {"url": CRM_API_URL, "connected": baseline["crm_healthy"], "deals_count": len(baseline["deals"])},
-        "tasks_api": {"url": TASKS_API_URL, "connected": baseline["tasks_healthy"], "tasks_count": len(baseline["tasks"])},
+        "crm_api": {"url": format_public_endpoint(CRM_API_URL), "connected": baseline["crm_healthy"], "deals_count": len(baseline["deals"])},
+        "tasks_api": {"url": format_public_endpoint(TASKS_API_URL), "connected": baseline["tasks_healthy"], "tasks_count": len(baseline["tasks"])},
     }
 
 
@@ -2245,30 +2265,47 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 </div>
                 <div>
                     <h5 class="fw-bold mb-0 text-white">Voice Operations AI Agent</h5>
-                    <div class="small text-muted">Bilingual Standup Multimodal Processor & API Sync (Port 8002)</div>
+                    <div class="small text-muted">Bilingual Standup Multimodal Processor & Cloud Sync</div>
                 </div>
             </div>
 
-            <!-- Health Status Indicators & API Key Button -->
+            <!-- Health Status Indicators, Navigation Buttons & Release Info -->
             <div class="d-flex flex-wrap align-items-center gap-2">
-                <span class="badge bg-dark border border-secondary border-opacity-50 px-2 py-2 d-flex align-items-center gap-2">
+                <a href="/dashboard" class="btn btn-sm btn-outline-info d-flex align-items-center gap-1" title="CRM Deals & Analytics Dashboard">
+                    <i class="bi bi-bar-chart-line-fill"></i> CRM Dashboard
+                </a>
+                <a href="/tasks" class="btn btn-sm btn-outline-secondary text-light d-flex align-items-center gap-1" title="Monday.com Task & Workstream Board">
+                    <i class="bi bi-kanban text-info"></i> Task Board
+                </a>
+                <span class="badge bg-dark border border-secondary border-opacity-50 px-2 py-2 d-flex align-items-center gap-2" title="CRM API Connection Status">
                     <span class="status-dot dot-green" id="crmDot"></span>
-                    <span>CRM API (8000)</span>
+                    <span>CRM API</span>
                 </span>
-                <span class="badge bg-dark border border-secondary border-opacity-50 px-2 py-2 d-flex align-items-center gap-2">
+                <span class="badge bg-dark border border-secondary border-opacity-50 px-2 py-2 d-flex align-items-center gap-2" title="Tasks API Connection Status">
                     <span class="status-dot dot-green" id="tasksDot"></span>
-                    <span>Tasks API (8001)</span>
+                    <span>Tasks API</span>
+                </span>
+                <span class="badge bg-info-subtle text-info-emphasis border px-2 py-2">
+                    <i class="bi bi-cloud-check-fill text-primary me-1"></i>Turso Cloud DB
                 </span>
                 <span class="badge bg-primary-subtle text-primary border px-2 py-2">
                     <i class="bi bi-cpu me-1"></i>Gemini Flash
                 </span>
-                <a href="http://127.0.0.1:8000/dashboard" target="_blank" class="btn btn-sm btn-outline-info d-flex align-items-center gap-1">
-                    <i class="bi bi-bar-chart-line-fill"></i> 📊 Visual Dashboard
-                </a>
                 <button class="btn btn-sm btn-outline-light d-flex align-items-center gap-1" id="apiKeyBtn" onclick="openApiKeyModal()">
                     <i class="bi bi-key-fill text-warning"></i>
                     <span id="apiKeyBtnText">Configure Gemini Key</span>
                 </button>
+                <!-- Deployed Release Version & Date -->
+                <div class="d-flex align-items-center ms-lg-2 ps-lg-2 border-start border-secondary">
+                    <div class="text-end" style="line-height: 1.2;">
+                        <span class="badge bg-success-subtle text-success border border-success-subtle fw-bold px-2 py-1 d-inline-flex align-items-center gap-1" style="font-size: 0.78rem;" title="Deployed Release Version">
+                            <i class="bi bi-tag-fill"></i> v1.3.1 - Turso
+                        </span>
+                        <div class="small text-secondary mt-1" style="font-size: 0.70rem; font-family: monospace;" title="Deployment Date">
+                            <i class="bi bi-calendar-event me-1"></i>2026-11-25
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </header>
@@ -3074,11 +3111,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                     const methodBadge = isNew
                         ? '<span class="badge" style="background-color:#16a34a;color:#fff;">POST • NEW (Green)</span>'
                         : `<span class="badge" style="background-color:#ea580c;color:#fff;">${l.method} • MODIFIED (Orange)</span>`;
+
+                    // Format endpoint to ensure it always displays the clean public online URL of current host
+                    let endpointUrl = l.endpoint || '';
+                    try {
+                        const parsed = new URL(endpointUrl, window.location.origin);
+                        endpointUrl = `${window.location.origin}${parsed.pathname}`;
+                    } catch (e) {
+                        // Keep as is if unparseable
+                    }
+
                     return `
                     <tr style="${rowStyle}">
                         <td><span class="badge ${l.target === 'CRM' ? 'bg-primary' : 'bg-info'}">${l.target}</span></td>
                         <td>${methodBadge}</td>
-                        <td class="small text-light text-truncate" style="max-width: 250px;">${l.endpoint}</td>
+                        <td class="small text-light text-truncate" style="max-width: 320px;" title="${endpointUrl}">
+                            <code class="text-info">${endpointUrl}</code>
+                        </td>
                         <td>
                             <span class="badge ${l.success ? 'bg-success' : 'bg-danger'}">
                                 ${l.success ? '200 Synced' : 'Failed'}

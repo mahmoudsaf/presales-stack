@@ -909,7 +909,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
             bd_id = bt.get("related_deal_id")
             bt_id = bt.get("task_id")
             if bd_id and bt_id:
-                if bd_id not in deal_latest_task_ids or bt_id > deal_latest_task_ids[bd_id]:
+                if bd_id not in deal_latest_task_ids or (deal_latest_task_ids[bd_id] is not None and bt_id > deal_latest_task_ids[bd_id]):
                     deal_latest_task_ids[bd_id] = bt_id
 
     # If any task in task_updates is being marked 'Completed', record for chaining
@@ -1018,6 +1018,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                 for v, ar in [("huawei", "هواوي"), ("cisco", "سيسكو"), ("micro focus", "ميكروفوكس"), ("incorta", "انكورت"), ("dell", "ديل"), ("hpe", "اتش بي"), ("veeam", "فيم"), ("nutanix", "نيوتانكس"), ("vmware", "فيموير")]:
                     if (v in p_vendors or ar in p_vendors) and (v in t_low or ar in t_norm):
                         scope_score += 3
+                matching_deals.append((scope_score, d_id, d_name, c_name, c_id, d_cat, c_date))
 
         # Fallback: if no match found via customer/deal name, check if text matches a unique vendor
         # in newly discussed/updated deals from the same meeting
@@ -1037,7 +1038,7 @@ def reconcile_tasks_from_conversation(ai_data: Dict[str, Any], baseline_deals: L
                         break
 
         if matching_deals:
-            matching_deals.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            matching_deals.sort(key=lambda x: (x[0], x[1] if isinstance(x[1], int) else -1), reverse=True)
             best = matching_deals[0]
             return best[1], best[2], best[3], best[4], best[5], best[6]
 

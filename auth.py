@@ -6,7 +6,7 @@ import os
 import re
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import Request
 import db
 
@@ -80,16 +80,16 @@ def init_users_table():
         password_hash TEXT NOT NULL,
         full_name TEXT,
         role TEXT DEFAULT 'presales',
-        is_active INTEGER DEFAULT 1,
+        is_active INTEGER DEFAULT 0,
         created_at TEXT,
         last_login TEXT
     );
     """)
     conn.commit()
 
-    # Ensure Admin account 'msafia' exists with password 'Asdasdf1@'
+    # Ensure Admin account 'msafia' exists and is active with password 'Asdasdf1@'
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-    cur.execute("SELECT id, username, password_hash, role FROM users WHERE username = 'msafia' OR email = 'msafia@presales.internal'")
+    cur.execute("SELECT id, username, password_hash, role, is_active FROM users WHERE username = 'msafia' OR email = 'msafia@presales.internal'")
     admin = cur.fetchone()
 
     if not admin:
@@ -99,44 +99,69 @@ def init_users_table():
         VALUES (?, ?, ?, ?, ?, 1, ?)
         """, ("msafia", "msafia@presales.internal", pw_hash, "Mahmoud Safia", "admin", now_str))
         conn.commit()
-        print("[Auth] Created admin user 'msafia' with role 'admin'.")
+        print("[Auth] Created admin user 'msafia' with role 'admin' and active status.")
     else:
-        # Check if password needs re-hashing or role needs admin
-        if not verify_password(admin["password_hash"], "Asdasdf1@") or admin.get("role") != "admin":
+        # Check if password needs re-hashing or role needs admin or is_active needs 1
+        if not verify_password(admin["password_hash"], "Asdasdf1@") or admin.get("role") != "admin" or not admin.get("is_active"):
             pw_hash = hash_password("Asdasdf1@")
-            cur.execute("UPDATE users SET password_hash = ?, role = 'admin' WHERE id = ?", (pw_hash, admin["id"]))
+            cur.execute("UPDATE users SET password_hash = ?, role = 'admin', is_active = 1 WHERE id = ?", (pw_hash, admin["id"]))
             conn.commit()
-            print("[Auth] Updated admin user 'msafia' password and role.")
+            print("[Auth] Updated admin user 'msafia' password, role, and active status.")
 
 
-def get_user_by_username_or_email(identifier: str) -> Optional[Dict[str, Any]]:
-    """Looks up active user by username or email."""
+def get_user_by_username_or_email(identifier: str, only_active: bool = False) -> Optional[Dict[str, Any]]:
+    """Looks up user by username or email."""
     if not identifier:
         return None
     ident = identifier.strip().lower()
     conn = db.get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE (LOWER(username) = ? OR LOWER(email) = ?) AND is_active = 1", (ident, ident))
+    if only_active:
+        cur.execute("SELECT * FROM users WHERE (LOWER(username) = ? OR LOWER(email) = ?) AND is_active = 1", (ident, ident))
+    else:
+        cur.execute("SELECT * FROM users WHERE (LOWER(username) = ? OR LOWER(email) = ?)", (ident, ident))
     row = cur.fetchone()
     return dict(row) if row else None
 
 
 def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    """Looks up active user by ID."""
+    """Looks up user by ID."""
     conn = db.get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id = ? AND is_active = 1", (user_id,))
+    cur.execute("SELECT id, username, email, full_name, role, is_active, created_at, last_login FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
     return dict(row) if row else None
 
 
-def authenticate_user(username_or_email: str, password: str) -> Optional[Dict[str, Any]]:
-    """Authenticates user credentials and records last_login timestamp."""
-    user = get_user_by_username_or_email(username_or_email)
+def authenticate_user(username_or_email: str, password: str) -> Dict[str, Any]:
+    """
+    Authenticates user credentials.
+    Returns:
+      {"success": True, "user": user} if valid and active.
+      {"success": False, "status": "pending_approval", "message": "..."} if valid credentials but pending approval.
+      {"success": False, "status": "invalid_credentials", "message": "..."} if wrong username/password.
+    """
+    user = get_user_by_username_or_email(username_or_email, only_active=False)
     if not user:
-        return None
+        return {
+            "success": False,
+            "status": "invalid_credentials",
+            "message": "اسم المستخدم أو كلمة المرور غير صحيحة (Invalid credentials).",
+        }
+
     if not verify_password(user["password_hash"], password):
-        return None
+        return {
+            "success": False,
+            "status": "invalid_credentials",
+            "message": "اسم المستخدم أو كلمة المرور غير صحيحة (Invalid credentials).",
+        }
+
+    if not user.get("is_active"):
+        return {
+            "success": False,
+            "status": "pending_approval",
+            "message": "حسابك قيد المراجعة وبانتظار موافقة مسؤول النظام (Admin) قبل تفعيله. يرجى التواصل مع المسؤول لاعتماد حسابك.",
+        }
 
     # Update last login
     try:
@@ -148,11 +173,11 @@ def authenticate_user(username_or_email: str, password: str) -> Optional[Dict[st
     except Exception as e:
         print(f"[Auth Error] Failed to update last_login: {e}")
 
-    return user
+    return {"success": True, "user": user}
 
 
-def create_user(username: str, email: str, password: str, full_name: Optional[str] = None, role: str = "presales") -> Dict[str, Any]:
-    """Registers a new user in the system."""
+def create_user(username: str, email: str, password: str, full_name: Optional[str] = None, role: str = "presales", is_active: int = 0) -> Dict[str, Any]:
+    """Registers a new user in the system with is_active=0 (pending admin approval)."""
     username_clean = username.strip().lower()
     email_clean = email.strip().lower()
 
@@ -180,8 +205,8 @@ def create_user(username: str, email: str, password: str, full_name: Optional[st
     pw_hash = hash_password(password)
     cur.execute("""
     INSERT INTO users (username, email, password_hash, full_name, role, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, 1, ?)
-    """, (username_clean, email_clean, pw_hash, full_name or username_clean, role, now_str))
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (username_clean, email_clean, pw_hash, full_name or username_clean, role, is_active, now_str))
     conn.commit()
 
     new_id = cur.lastrowid
@@ -191,6 +216,7 @@ def create_user(username: str, email: str, password: str, full_name: Optional[st
         "email": email_clean,
         "full_name": full_name or username_clean,
         "role": role,
+        "is_active": is_active,
         "created_at": now_str,
     }
 
@@ -213,3 +239,71 @@ def get_current_user_from_request(request: Request) -> Optional[Dict[str, Any]]:
 
     payload = verify_session_token(token)
     return payload
+
+
+# -----------------------------------------------------------------------------
+# Admin Management Operations
+# -----------------------------------------------------------------------------
+def list_users() -> Dict[str, Any]:
+    """Lists all pending and active users for admin management."""
+    conn = db.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, email, full_name, role, is_active, created_at, last_login FROM users ORDER BY id DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    pending = [r for r in rows if not r.get("is_active")]
+    active = [r for r in rows if r.get("is_active")]
+    return {
+        "pending": pending,
+        "active": active,
+        "pending_count": len(pending),
+        "total_count": len(rows),
+    }
+
+
+def approve_user(user_id: int) -> bool:
+    """Activates a user account (approves registration request)."""
+    conn = db.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+    if not cur.fetchone():
+        return False
+    cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (user_id,))
+    conn.commit()
+    return True
+
+
+def deactivate_user(user_id: int) -> bool:
+    """Deactivates a user account (except admin msafia)."""
+    conn = db.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username FROM users WHERE id = ?", (user_id,))
+    user = cur.fetchone()
+    if not user or user["username"] == "msafia":
+        return False
+    cur.execute("UPDATE users SET is_active = 0 WHERE id = ?", (user_id,))
+    conn.commit()
+    return True
+
+
+def delete_user(user_id: int) -> bool:
+    """Deletes a user account / rejects registration request (except admin msafia)."""
+    conn = db.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username FROM users WHERE id = ?", (user_id,))
+    user = cur.fetchone()
+    if not user or user["username"] == "msafia":
+        return False
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    return True
+
+
+def set_user_role(user_id: int, role: str) -> bool:
+    """Updates user role ('admin' or 'presales')."""
+    if role not in ("admin", "presales"):
+        raise ValueError("Role must be 'admin' or 'presales'")
+    conn = db.get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    conn.commit()
+    return cur.rowcount > 0
